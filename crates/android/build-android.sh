@@ -60,8 +60,8 @@ set -euo pipefail
 
 # --- configuration ----------------------------------------------------------
 
-# Only arm64-v8a is supported, by decision (docs.old/android.md §1): there is no
-# x86_64 build for emulators. Adding an ABI here means adding it in three
+# Only arm64-v8a is supported, by decision (docs/code/android/build.md §4): there
+# is no x86_64 build for emulators. Adding an ABI here means adding it in three
 # places — here, `abiFilters` in android/app/build.gradle.kts, and the jniLibs
 # directory the Gradle build picks up.
 ABI="arm64-v8a"
@@ -223,8 +223,9 @@ echo "krkr-rs android: ndk=$NDK"
 #
 # The crate graph is selected by `-p android`; the video backend is chosen by
 # `crates/app`, which this crate depends on. Android has no system FFmpeg, so
-# that choice must resolve to `media`'s MediaCodec backend (docs.old/android.md
-# §6) and the desktop FFmpeg feature must not reach this target.
+# that choice must resolve to `media`'s MediaCodec backend
+# (docs/code/platform/media.md §6) and the desktop FFmpeg feature must not reach
+# this target.
 cd "$ROOT"
 cargo "$MODE" "${CARGO_PROFILE_ARGS[@]}" --target "$RUST_TARGET" -p "$CRATE"
 

@@ -1,9 +1,12 @@
 # krkr-rs — Android frontend
 
-Experimental. The current code map is **[`docs/code/android/`](../docs/code/android/README.md)**;
-the archived **[`docs.old/android.md`](../docs.old/android.md)** carries the full design,
-the reasoning behind each decision, the milestones and the open questions. This
-README is just how to build it.
+Experimental. The code map is **[`docs/code/android/`](../docs/code/android/README.md)**:
+one page per module — the composition root, the build, the launcher, the host,
+the settings, the input and the gesture bridge. There is no separate design
+document in this tree: the rules the engine is bound by are stated in
+[`docs/rules/arch_rules.md`](../docs/rules/arch_rules.md) (§12 the platform and
+backend selection, §13 the decisions), and the open Android work is in
+[`TODO.md`](../TODO.md) §14. This README is just how to build it.
 
 ## What this is
 
@@ -20,8 +23,9 @@ The engine is Rust. It is **not** built by Gradle: `cargo ndk` produces
 `app/src/main/jniLibs/arm64-v8a/` and loaded by `KrkrGameActivity`.
 
 The library of picked folders is persisted as JSON in the app's private files
-directory (`filesDir/games.json`) — see `GameLibrary.kt` and `docs.old/android.md`
-§3.1. It exists so a folder only ever has to be found once.
+directory (`filesDir/games.json`) — see `GameLibrary.kt` and the library write
+contract in [`docs/code/android/ui.md`](../docs/code/android/ui.md) §4. It
+exists so a folder only ever has to be found once.
 
 This is **Android-app state only**. The engine itself takes a game directory and
 nothing else, and the desktop build stays a plain CLI — `krkr-rs run <dir>` —
@@ -31,7 +35,8 @@ app is simply a UI in front of the same "run this directory" entry point.
 
 **`arm64-v8a` only** — by decision, so there is no emulator (x86_64) build.
 **Landscape-locked**, and storage uses `MANAGE_EXTERNAL_STORAGE` because the app
-is side loaded (docs.old/android.md §4).
+is side loaded; the launcher reconciles that grant on every resume
+([`docs/code/android/ui.md`](../docs/code/android/ui.md) §2).
 
 ## Building
 
@@ -55,11 +60,12 @@ same check runs on the finished APK:
 ./crates/android/check-jni-libs.sh android/app/build/outputs/apk/release/app-release.apk
 ```
 
-> **Rebuilt composition root.** `crates/android` is again the `krkr_android`
-> cdylib (`android_main` plus its `build-android.sh`); it drives the shared
+> **The composition root.** `crates/android` is the `krkr_android` cdylib
+> (`android_main` plus its `build-android.sh`); it drives the shared
 > `app::Host`/`app::GameHost` from the `android-activity` `GameActivity` loop
-> (`docs.old/android.md` §2.1). The commands above still require the Android SDK
-> and NDK, which are not part of the desktop build.
+> ([`docs/code/android/README.md`](../docs/code/android/README.md) §1, §4). The
+> commands above still require the Android SDK and NDK, which are not part of
+> the desktop build.
 
 `gradle assembleDebug` rather than `./gradlew`: the repository has no Gradle
 wrapper yet (its jar is a binary), so CI installs a pinned Gradle instead.
@@ -101,21 +107,22 @@ inherited from the old Bevy architecture and partially rebuilt:
 |---|---|
 | Compose M3 launcher + SAF picker + JSON library (`games.json`) | present (inherited); not compiled on this branch |
 | Engine composition root (`crates/android`, cdylib + `android_main`) | **present** — reads the Activity's JNI fields, writes `krkr_state.json`, drives the host |
-| Android event loop | driven by `crates/android` through `android-activity`; `platform::run` stays the desktop (winit) driver (`docs.old/android.md` §2.1) |
-| L1 Android window (`platform::PlatformWindow`) | real `ANativeWindow` wrapper + raw handle + size/density; compiles for `aarch64-linux-android` (`docs.old/android.md` §2.1) |
+| Android event loop | driven by `crates/android` through `android-activity`; `platform::run` stays the desktop (winit) driver ([`docs/code/android/README.md`](../docs/code/android/README.md) §4) |
+| L1 Android window (`platform::PlatformWindow`) | real `ANativeWindow` wrapper + raw handle + size/density; compiles for `aarch64-linux-android` ([`docs/code/platform/platform.md`](../docs/code/platform/platform.md) §4) |
 | Android input translation (`PhysicalKey`/`TouchPhase`/`MouseButton`) | implemented and host-tested in `crates/platform/platform/src/android.rs`, consumed by the composition root's loop |
 | MediaCodec video backend | `crates/platform/media` has a compile-checked backend; never run on a device |
 | Gradle `assembleDebug` verified locally | not on this branch |
 | CI workflow (`.github/workflows/release.yml`) | builds the APK on `v*` tags in parallel with the Linux binary; the static gate is a local pre-tag check |
 
-Known unverified pieces are listed honestly in `docs.old/android.md` §2 and §6 rather
-than assumed to work.
+Known unverified pieces are listed honestly in
+[`docs/code/android/build.md`](../docs/code/android/build.md) §9 (the engine)
+and [`docs/code/android/ui.md`](../docs/code/android/ui.md) §8 (the launcher)
+rather than assumed to work.
 
 ## Permissions
 
 `MANAGE_EXTERNAL_STORAGE` is declared because the engine's storage layer is
 path-based and the games live in shared storage, while SAF hands out
-`content://` URIs. This is option A in `docs.old/android.md` §4 and is the **decided**
-approach, since the app is side loaded and Google Play's policy on that
-permission does not apply. All URI→path logic lives in `SafPaths.kt` so the
-resolution behaviour is in one place.
+`content://` URIs. This is the **decided** approach, since the app is side
+loaded and Google Play's policy on that permission does not apply. All URI→path
+logic lives in `SafPaths.kt` so the resolution behaviour is in one place.
