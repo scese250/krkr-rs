@@ -1702,3 +1702,70 @@ the step after it: the source's cache read, the way the reference reads it.
 **Open:** the route has to reach the settings page before the scene change
 can be measured, and the measurement has to be repeated on the real scene
 before it means anything against the target.
+
+## 12. The motion player's draw list on the GPU: what the measurement says
+
+The pose is a per-frame draw list the engine owns
+(`crates/engine/src/layer_ops.rs`: `DrawOp`, `draw_ops_scene`). The CPU
+path draws it with an affine resample that costs **3.38 ns per destination
+pixel**; the pose's magnified destination area is 163,533,764 pixels over a
+3,600-frame run, so the CPU path pays about 553 ms for the pose alone. The GPU
+has roughly two orders of magnitude more fragment throughput, so the pose is
+the workload the GPU is meant for.
+
+The first GPU implementation kept the pose's pixels in the layer's CPU-side
+image, which is the engine's truth for `getPixel` and `saveLayerImage` and
+the source of the layer's texture upload. The pose's pixels therefore travelled
+three times per frame: CPU to GPU (the seed), GPU to CPU (the read-back), and
+CPU to GPU (the layer upload). The CPU path makes one trip.
+
+Measured on the real game with an RTX 5070, per call, averaged over 60 calls:
+
+| phase | cost |
+|---|---|
+| the seed (the CPU premultiply of the region) | 0.4-3.3 ms |
+| the upload (the sources, the surface, the seed texture) | 0.4-1.1 ms |
+| the render (the GPU draw) | 0.14-0.3 ms |
+| the read-back (GPU to CPU, synchronous) | 1.2-13 ms |
+| the un-premultiply (the CPU) | 0.16-2.1 ms |
+| the write (the CPU copy into the layer's image) | 0.05-0.38 ms |
+
+The engine's own work per frame was **1.54 ms** with the GPU path and **0.53 ms**
+with the CPU path, so the GPU path lost by about 3x. The render itself is the
+cheapest phase: the round trips, not the rasterization, are the cost.
+
+Two defects hid the result further:
+
+* the compatibility layer drew the pose on the CPU while the engine drew the
+  same list on the GPU, so the pose was drawn **twice** (the engine's work was
+  18.00 ms per frame). The compatibility layer now leaves the list to the host
+  that draws it;
+* the offscreen surface was destroyed and recreated whenever the pose's
+  bounding region changed size, and the pose animates, so the surface was
+  recreated every frame.
+
+The shape that removes the round trips is a **GPU-resident pose**: the pose
+accumulates on a persistent per-layer surface, the surface is part of the
+layer's render tree so the presentation draws it and no read-back is needed per
+frame, the surface is re-seeded from the layer's content only when that
+content changed, and the layer's CPU image is refreshed only when a script
+reads the layer's pixels. The per-frame cost then becomes the source uploads
+plus the draw, and the answer to the question the pose raises - whether game
+code can force pixel data through system RAM in a pipeline whose composed frame
+never returns to RAM - is: `getPixel` and `saveLayerImage` do, and only when
+a script asks.
+
+### 12.1 The recalculation region belongs to the content, not to the cache count
+
+The region that marks the stale part of a layer's composited content was kept
+while the layer's **cache count** was non-zero. The count is the transition's
+consumer count, not "the layer holds a composite": a layer that never ran a
+transition still holds a content, and clearing its region left the composite
+reconstructing a part of it and leaving the rest stale.
+
+The condition is now the layer's own content: a layer that holds no content has
+nothing to reconstruct, so it keeps no region, and the region goes with the
+content when the cache is released. The cost of the old condition was large:
+the engine's own work was **18.00 ms** per frame with it and **0.40 ms**
+without, and the worst frame was **about 165 ms** with it and **35.90 ms**
+without.

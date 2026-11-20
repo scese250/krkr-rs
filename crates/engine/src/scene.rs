@@ -1696,7 +1696,25 @@ impl Scene {
             // keep. A change to the pixels a layer draws is a change to the
             // content every layer above it holds, so those keep their region
             // whether they cache or not.
-            let keeps_region = scope == ChangeScope::Content || layer.cache_enabled_count != 0;
+            // The region belongs to the layer's own cached content: it marks
+            // the part of that content a change makes stale. A layer that
+            // holds neither a composited content nor a cache has nothing to
+            // reconstruct, so it keeps no region, and a region left from when
+            // it had one is stale: the composite would reconstruct that part
+            // alone and leave the rest of the content as it was.
+            //
+            // The cache count is the transition's consumer count: the
+            // reference keeps the recalculation region while the caching is
+            // enabled
+            // (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`),
+            // and the transition holds the count for as long as it runs
+            // (`:7869-7876`). The content is the other half of the test: a
+            // layer that never ran a transition still holds a composited
+            // content, and clearing its region left the composite
+            // reconstructing a part of it and leaving the rest stale.
+            let keeps_region = scope == ChangeScope::Content
+                || layer.cache_content.is_some()
+                || layer.cache_enabled_count != 0;
             let own = Rect::new(0, 0, layer.rect.w, layer.rect.h);
             let Some(clipped) = area.intersection(&own) else {
                 // The rectangle left the layer's own area: the rest of the
