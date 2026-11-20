@@ -42,9 +42,12 @@ const DEFAULT_FRAMES: usize = 6000;
 
 /// The frame gap at which a frame is reported as slow, in milliseconds.
 ///
-/// The budget of a 30 fps target is 33.3 ms, so the threshold is that: a
-/// run that measures the tail wants to see every frame that missed it.
-const SLOW_FRAME_MS: u64 = 34;
+/// The default is the application's own (250 ms), so a plain measurement is
+/// not perturbed by the reports: a report's own cost lands in the frame after
+/// it, and the tail is what the report is for. A run that measures the tail
+/// asks for the budget of its target instead - 34 ms is the 30 fps budget - and
+/// says so in the output.
+const SLOW_FRAME_MS: u64 = 250;
 
 /// The frames per second the run paces at when the command line does not say.
 const DEFAULT_FPS: u32 = 60;
@@ -671,6 +674,7 @@ fn main() {
     let mut click_y = 360.0f32;
     let mut scene_name = "scenario".to_owned();
     let mut slow_frame_ms = SLOW_FRAME_MS;
+    let mut vm_report = false;
     let mut vulkan = true;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -718,6 +722,7 @@ fn main() {
             "--frame-delay-ms" => {
                 frame_delay_ms = number(&mut args, "frame delay", 0);
             }
+            "--vm-report" => vm_report = true,
             "--slow-frame-ms" => {
                 slow_frame_ms = number(&mut args, "slow frame threshold", SLOW_FRAME_MS);
             }
@@ -760,6 +765,9 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+    if vm_report {
+        compat::set_compile_stats_enabled(true);
     }
     // The frame interval paces the frames. Zero means the frames are driven
     // as fast as the host runs them, so the gap is the engine's cost and not
@@ -872,6 +880,9 @@ fn main() {
     report("the frame gap", &shared.gaps[1..]);
     report("the engine's own work", &shared.steps[1..]);
     report("the platform's wait", &shared.polls[1..]);
+    if vm_report {
+        println!("{}", app::vm_report(&compat::compile_stats()));
+    }
     // The slowest frames: the frames the run spent its time in.
     let mut order: Vec<usize> = (0..shared.steps.len()).collect();
     order.sort_by(|left, right| shared.steps[*right].total_cmp(&shared.steps[*left]));

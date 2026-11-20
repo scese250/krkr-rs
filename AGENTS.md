@@ -83,7 +83,10 @@ change is made the way it is; these say *what* you owe the next person.
 
 6. **The gate, the builds and the test suites are yours** (§0.4), run one at
    a time and on a quiet machine. A load average above about four invalidates
-   a measurement, so a number taken under load is not a result.
+   a measurement, so a number taken under load is not a result. **P0 — the
+   machine** ("the machine") says what "one at a time" means in practice: one
+   heavy job in flight, no second job queued behind the lock, and no
+   measurement while anything else runs.
 7. **Review the patch, not only the report** (§0.3), and **commit in stages**:
    a reviewed stage is a commit of its own, never one large commit at the end.
 8. **Freeing disk space is a surgical act, never a blanket delete.** When
@@ -104,6 +107,28 @@ change is made the way it is; these say *what* you owe the next person.
 One integrator owns a change end to end, and may build it in parallel with
 workers on disjoint scopes. The rules below are how this repository is worked
 on, whoever does the work.
+
+### P0 — the machine
+
+**The machine is shared with the user's own work. One heavy job at a time. This
+overrides the wish to parallelize.**
+
+* **A heavy job is a build, a test suite, a gate run or a measurement.** Only
+  one may run at a time. The shared lock serializes the *cargo* processes, but
+  a second job started while the first runs still takes a slot, adds
+  contention and makes both slower — **do not queue a second heavy job behind
+  the lock.** Wait for the first one's completion notification, then start the
+  next.
+* **A measurement never runs while anything else runs.** A build, a suite or a
+  second measurement on the machine makes the numbers meaningless: the load
+  shows up in the frame times. Take the measurement on a quiet machine, and
+  report the load average with it.
+* **Do not poll with `sleep`.** A job's completion notification is the trigger;
+  the result is read once, when it lands. A `sleep` in a command is a wait
+  that burns the machine and hides a stalled job.
+* **The release harness is heavy too.** A 3,600-frame Vulkan run is a
+  measurement, not a smoke test: it is started alone, and its result is used
+  only if the machine was quiet.
 
 ### 0.1 Roles — the integrator and the workers
 
