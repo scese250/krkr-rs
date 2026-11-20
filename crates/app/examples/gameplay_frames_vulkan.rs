@@ -137,6 +137,73 @@ struct Shared {
     failure: Option<String>,
 }
 
+/// A place the run can click.
+///
+/// The position is in the window's device pixels: the title screen's buttons
+/// are a column on the left of the window, and their rows are 65 pixels
+/// apart.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClickTarget {
+    /// The horizontal position, in device pixels.
+    x: f32,
+    /// The vertical position, in device pixels.
+    y: f32,
+}
+
+/// The scene the run drives.
+///
+/// The title page is a KAG scene with a column of buttons on the left of the
+/// window; each of them opens another scene. The run drives one of them, so
+/// the run crosses a scene boundary — the case that costs the most in the
+/// game, and the one a text-advancing run never reaches.
+///
+/// The positions are the ones the game answered to: the click at
+/// `(165, 1095)` opens the settings page (`option.ks`), the one at
+/// `(165, 992)` opens the extra scene (`extra.ks`), and the one at
+/// `(165, 732)` opens the save-data screen (`load.ks`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scene {
+    /// The scenario: a click in the middle of the screen advances the text.
+    Scenario,
+    /// The title page's settings button: it opens the settings page
+    /// (`option.ks`).
+    Settings,
+    /// The title page's extra button: it opens the extra scene
+    /// (`extra.ks`).
+    Extra,
+    /// The title page's load button: it opens the save-data screen
+    /// (`load.ks`).
+    Load,
+}
+
+impl Scene {
+    /// The click position of the scene.
+    fn target(self) -> ClickTarget {
+        match self {
+            // The middle of the screen: the message window's own area.
+            Self::Scenario => ClickTarget { x: 640.0, y: 360.0 },
+            // The title page's button column.
+            Self::Settings => ClickTarget {
+                x: 165.0,
+                y: 1095.0,
+            },
+            Self::Extra => ClickTarget { x: 165.0, y: 992.0 },
+            Self::Load => ClickTarget { x: 165.0, y: 732.0 },
+        }
+    }
+
+    /// The scene a name names.
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "scenario" => Some(Self::Scenario),
+            "settings" => Some(Self::Settings),
+            "extra" => Some(Self::Extra),
+            "load" => Some(Self::Load),
+            _ => None,
+        }
+    }
+}
+
 /// The click schedule: when the next click is due.
 ///
 /// The schedule is either in frames (the `gameplay_frames` harness's
@@ -569,6 +636,7 @@ fn main() {
     let mut frame_delay_ms = 0u64;
     let mut click_x = 640.0f32;
     let mut click_y = 360.0f32;
+    let mut scene_name = "scenario".to_owned();
     let mut vulkan = true;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -585,8 +653,30 @@ fn main() {
             "--first-click" => {
                 first_click = number(&mut args, "first click frame", FIRST_CLICK_FRAME);
             }
+            "--scene" => {
+                let value = match args.next() {
+                    Some(value) => value,
+                    None => {
+                        eprintln!("--scene needs a value");
+                        std::process::exit(2);
+                    }
+                };
+                match Scene::parse(&value) {
+                    Some(scene) => {
+                        let target = scene.target();
+                        click_x = target.x;
+                        click_y = target.y;
+                        scene_name = value;
+                    }
+                    None => {
+                        eprintln!("unknown scene: {value}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--click-x" => {
                 click_x = number(&mut args, "click x", 640.0);
+                scene_name = "explicit".to_owned();
             }
             "--click-y" => {
                 click_y = number(&mut args, "click y", 360.0);
@@ -723,6 +813,7 @@ fn main() {
             first_click_ms, click_ms
         );
     }
+    println!("the scene: {scene_name}, the click at ({click_x}, {click_y})");
     println!("the frame delay: {frame_delay_ms} ms");
     println!(
         "the clock: {}",

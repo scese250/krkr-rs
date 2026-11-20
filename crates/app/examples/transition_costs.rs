@@ -129,9 +129,9 @@ fn composite_cost(scene: &mut Scene, root: u32, rounds: usize) -> f64 {
             .map(|layer| layer.children.clone())
             .unwrap_or_default();
         for id in contributors {
-            if let Some(layer) = scene.layer_mut(id) {
-                layer.content_epoch = layer.content_epoch.wrapping_add(1);
-            }
+            // The content the last composite wrote is stale now: the tree
+            // moved. The region names what has to be reconstructed.
+            scene.invalidate_layer_content(id);
         }
         let started = Instant::now();
         engine::layer_ops::render_layer_subtree(scene, root);
