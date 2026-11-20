@@ -170,11 +170,11 @@ impl ResourceResolver {
 
     /// Maps the font value `key` to the pre-rendered font `storage`.
     ///
-    /// The storage is resolved and its header validated now; the glyph body is
-    /// read on first use. The reference reads and holds the whole file but
-    /// validates only the header here too, so deferring the body (and the
-    /// index-bounds check the reference leaves unchecked) is not
-    /// script-observable (`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`).
+    /// The storage is resolved and the whole file is read now; its header is
+    /// validated now and the glyph body is parsed on first use. The file
+    /// image is in place before the first draw, so a draw never waits for the
+    /// file; the parse stays deferred because the header is all that is
+    /// validated at the map, and the index bounds are not checked there.
     pub(crate) fn map_prerendered(
         &mut self,
         ctx: &CompatCtx,
@@ -462,7 +462,7 @@ pub(crate) fn draw_text_into_bitmap(
         angle: angle_tenths.round() as i32,
     };
     if let Some(prerendered) = resolver.prerendered_for(&key) {
-        let body = prerendered.ensure_body(ctx)?;
+        let body = prerendered.ensure_body()?;
         return draw_prerendered_text(
             service,
             bitmap,
@@ -869,7 +869,7 @@ pub(crate) struct PrerenderedBody {
     /// Offset of the character descriptors inside `image`.
     index_offset: usize,
     /// The whole file, indexed by a descriptor's `offset`.
-    image: Vec<u8>,
+    image: Rc<Vec<u8>>,
 }
 
 impl PrerenderedBody {
@@ -883,7 +883,7 @@ impl PrerenderedBody {
     /// bounds at map time; failing here is the first-use analogue of the
     /// reference's unchecked reads.
     pub(crate) fn parse(
-        bytes: Vec<u8>,
+        image: Rc<Vec<u8>>,
         header: &PrerenderedHeader,
     ) -> Result<Self, PrerenderedFontError> {
         let index_count = header.index_count;
@@ -902,7 +902,7 @@ impl PrerenderedBody {
         let index_end = index_offset
             .checked_add(index_len)
             .ok_or(PrerenderedFontError::Read)?;
-        if ch_index_end > bytes.len() || index_end > bytes.len() {
+        if ch_index_end > image.len() || index_end > image.len() {
             return Err(PrerenderedFontError::Read);
         }
 
@@ -911,7 +911,7 @@ impl PrerenderedBody {
             index_count,
             ch_index_offset,
             index_offset,
-            image: bytes,
+            image,
         })
     }
 
@@ -1042,75 +1042,62 @@ impl PrerenderedBody {
 
 /// A mapped pre-rendered font.
 ///
-/// The fixed header is validated when the mapping is created; the whole file
-/// is read and its index bounds checked on first use. The reference reads the
-/// whole file at map time and holds it; here only the resolved storage name
-/// and the header are kept until a glyph is requested. The divergence is not
-/// observable through the script surface because the reference validates only
-/// the header at map time, and the index bounds we defer are unchecked reads
-/// there.
+/// The whole file is read when the mapping is created and the fixed header is
+/// validated there; the index bounds are checked when a glyph is requested.
+/// The file image is in place before the first draw, so a draw never waits for
+/// the file, and the header is all that is validated at the map.
 pub(crate) struct PrerenderedFont {
-    /// The bare storage name, used for the first-use read.
-    storage: String,
+    /// The whole file, read at map time.
+    image: Rc<Vec<u8>>,
     /// The header validated at map time.
     header: PrerenderedHeader,
-    /// The whole file, read once on first use.
+    /// The parsed body, built on the first use.
     body: RefCell<Option<Rc<PrerenderedBody>>>,
 }
 
 impl PrerenderedFont {
-    /// Reads and validates the fixed header of `storage` through `store`.
+    /// Reads the whole file of `storage` through `store` and validates its
+    /// fixed header.
+    ///
+    /// The file is read here, at the map, so the first draw finds the image
+    /// in place and never waits for the storage.
     ///
     /// # Errors
     ///
-    /// The [`Storage::stat`]/[`Storage::read_prefix`] error as a string, the
-    /// header [`PrerenderedFontError`]s, or `Cannot find storage` when the
-    /// name does not resolve (`TVPSearchPlacedPath`,
-    /// `reference/cpp/core/base/StorageIntf.cpp:1111-1115`).
+    /// The [`Storage::read`] error as a string, the header
+    /// [`PrerenderedFontError`]s, or `Cannot find storage` when the name does
+    /// not resolve.
     pub(crate) fn map(store: &Storage, storage: &str) -> Result<Self, String> {
         // The media prefix is L3 syntax; the L2 namespace resolves the bare name.
         let lookup = strip_file_media(storage);
-        let Some(meta) = store.stat(lookup).map_err(|error| error.to_string())? else {
-            return Err(format!("Cannot find storage {storage}"));
+        let bytes = match store.read(lookup) {
+            Ok(bytes) => bytes,
+            Err(StorageReadError::NotFound(_)) => {
+                return Err(format!("Cannot find storage {storage}"));
+            }
+            Err(error) => return Err(error.to_string()),
         };
-        if meta.size == 0 {
-            return Err(PrerenderedFontError::ZeroSize.to_string());
-        }
-        let prefix = store
-            .read_prefix(lookup, PRERENDERED_HEADER_LEN)
-            .map_err(|error| error.to_string())?;
-        let header = validate_header(&prefix).map_err(|error| error.to_string())?;
+        let header = validate_header(&bytes).map_err(|error| error.to_string())?;
         Ok(Self {
-            storage: lookup.to_string(),
+            image: Rc::new(bytes),
             header,
             body: RefCell::new(None),
         })
     }
 
-    /// Reads and validates the whole file on first use, returning the cached
-    /// body.
+    /// Parses the file image on the first use, returning the cached body.
     ///
     /// # Errors
     ///
-    /// The storage error as a string when the file cannot be re-read, or the
-    /// index [`PrerenderedFontError`] when the deferred bounds check fails.
-    pub(crate) fn ensure_body(&self, ctx: &CompatCtx) -> Result<Rc<PrerenderedBody>, String> {
+    /// The index [`PrerenderedFontError`] when the deferred bounds check
+    /// fails.
+    pub(crate) fn ensure_body(&self) -> Result<Rc<PrerenderedBody>, String> {
         if let Some(body) = self.body.borrow().as_ref() {
             return Ok(Rc::clone(body));
         }
-        // SAFETY: the caller resolved `ctx` from the installed binding.
-        let services = unsafe { ctx.services() };
-        let Some(store) = services.storage() else {
-            return Err(format!("Cannot find storage {}", self.storage));
-        };
-        // SAFETY: the host keeps the attached storage alive for the binding's
-        // lifetime (the `attach_storage` contract).
-        let store = unsafe { &*store };
-        let bytes = store
-            .read(&self.storage)
-            .map_err(|error| error.to_string())?;
         let body = Rc::new(
-            PrerenderedBody::parse(bytes, &self.header).map_err(|error| error.to_string())?,
+            PrerenderedBody::parse(Rc::clone(&self.image), &self.header)
+                .map_err(|error| error.to_string())?,
         );
         *self.body.borrow_mut() = Some(Rc::clone(&body));
         Ok(body)
@@ -1176,7 +1163,7 @@ mod prerendered_tests {
     /// does at map time and first use.
     fn body_of(bytes: Vec<u8>) -> PrerenderedBody {
         let header = validate_header(&bytes[..PRERENDERED_HEADER_LEN]).expect("header");
-        PrerenderedBody::parse(bytes, &header).expect("parse")
+        PrerenderedBody::parse(Rc::new(bytes), &header).expect("parse")
     }
 
     /// Reference: the header, sorted `ChIndex` binary search and the version-1
@@ -1214,13 +1201,21 @@ mod prerendered_tests {
     /// Reference: `tTVPPrerenderedFont` keeps `ChIndex`/`Index` as pointers
     /// into the mapped file (`reference/cpp/core/visual/PrerenderedFont.cpp:60-62`),
     /// so a descriptor read reflects an edit to the file image.
+    ///
+    /// The image is shared between the mapped font and the parsed body, so
+    /// the edit goes through the body's own handle: the body holds the only
+    /// reference, and the descriptor is read from the image and not from a
+    /// copy of it.
     #[test]
     fn reads_the_descriptor_from_the_file_image() {
         let mut font = body_of(build_tft(&[0x41, 0x42], 7));
         assert_eq!(font.find_code_unit(0x42).expect("B is indexed").inc, 7);
         // B's descriptor is the second 20-byte entry; `inc` sits at +16.
         let at = font.index_offset + PRERENDERED_ITEM_LEN + 16;
-        font.image[at..at + 2].copy_from_slice(&9i16.to_le_bytes());
+        {
+            let image = Rc::get_mut(&mut font.image).expect("the body owns the image");
+            image[at..at + 2].copy_from_slice(&9i16.to_le_bytes());
+        }
         assert_eq!(font.find_code_unit(0x42).expect("B is indexed").inc, 9);
     }
 
@@ -1295,7 +1290,7 @@ mod prerendered_tests {
         let header =
             validate_header(&build_tft(&[0x41], 7)[..PRERENDERED_HEADER_LEN]).expect("header");
         let font = Rc::new(PrerenderedFont {
-            storage: "sample.tft".to_string(),
+            image: Rc::new(Vec::new()),
             header,
             body: RefCell::new(None),
         });

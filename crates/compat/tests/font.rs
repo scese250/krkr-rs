@@ -265,6 +265,13 @@ fn font_get_text_height_is_the_font_height() {
 /// Reference: `tTJSNI_Font::GetTextHeight` returns `abs(Font.Height)` without
 /// reading the font's data (`reference/cpp/core/visual/LayerIntf.cpp:11724-11731`),
 /// so the height is reported even where the width cannot be measured.
+///
+/// The pre-rendered file is read at the map and the image is held
+/// (`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`, `:60-62`), so a
+/// mapped font measures its width even after its file is gone: the width
+/// needs the *data*, and the data is in memory. The height needs no data at
+/// all, and it is reported where the width cannot be measured at all — where
+/// the pre-rendered body cannot be parsed.
 #[test]
 fn font_get_text_height_does_not_read_the_font_data() {
     let _lock = vm_lock();
@@ -276,26 +283,53 @@ fn font_get_text_height_does_not_read_the_font_data() {
     let game_dir = env.game_dir().expect("game dir").clone();
     std::fs::write(game_dir.join("Pre"), &font_bytes).expect("write face");
     std::fs::write(game_dir.join("sample.tft"), build_tft(&[b'A' as u16], 7)).expect("write tft");
+    // A file whose header is valid but whose character index points outside
+    // it: the map accepts it, and the body cannot be parsed.
+    let mut broken = build_tft(&[b'A' as u16], 7);
+    broken[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(game_dir.join("broken.tft"), &broken).expect("write broken tft");
     env.run(
         "var w = new Window(); \
          var l = new Layer(w, null); \
+         var l2 = new Layer(w, null); \
          var f = new Font('Pre', 12, 0); \
          f.mapPrerenderedFont('sample.tft'); \
+         var g = new Font('Pre2', 12, 0); \
+         g.mapPrerenderedFont('broken.tft'); \
          l.font.face = 'Pre'; \
          l.font.height = 12; \
          l.font.bold = false; \
          l.font.italic = false; \
-         l.font.angle = 0;",
+         l.font.angle = 0; \
+         l2.font.face = 'Pre2'; \
+         l2.font.height = 12; \
+         l2.font.bold = false; \
+         l2.font.italic = false; \
+         l2.font.angle = 0;",
     );
-    // The pre-rendered body is read on first use, so removing it makes the
-    // width unreadable.
+    // The map read the whole file and holds it, so the width measures after
+    // the file is gone.
     std::fs::remove_file(game_dir.join("sample.tft")).expect("remove the tft");
-    assert!(
-        env.eval("l.font.getTextWidth('AB')").is_err(),
-        "the width needs the pre-rendered data"
+    assert_eq!(
+        env.eval_int("l.font.getTextWidth('A')"),
+        7,
+        "the mapped `.tft` measures its own `Inc`"
     );
     // The height is the font's own height and needs no data at all.
     assert_eq!(env.eval_int("l.font.getTextHeight('AB')"), 12);
+
+    // A font whose pre-rendered body cannot be parsed raises on the width:
+    // the width needs the data, and the height does not.
+    let message = env.error("l2.font.getTextWidth('A')");
+    assert!(
+        message.contains("File read error"),
+        "unexpected message: {message}"
+    );
+    assert_eq!(
+        env.eval_int("l2.font.getTextHeight('AB')"),
+        12,
+        "the height must be reported where the width cannot be measured"
+    );
 }
 
 /// Reference: `tTJSNI_Font::GetTextWidthDirect` measures a run one character
@@ -664,8 +698,8 @@ fn font_map_prerendered_font_raises_the_reference_header_errors() {
 /// `GetTextSize` sums them
 /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:1435-1473`). Mapping
 /// many fonts in one run must serve every one of them, so this maps 24 fonts
-/// and asserts each one measures its own `Inc`. The port reads the glyph body
-/// lazily where the reference reads the whole file at map time
+/// and asserts each one measures its own `Inc`. The file is read at the map
+/// and the glyph body is parsed on the first use
 /// (`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`), so only the
 /// retrievable metric is pinned — a lazy reader that never loaded a glyph no
 /// longer passes.
@@ -704,6 +738,62 @@ fn font_prerendered_map_serves_each_mapped_font() {
             "font {i} should measure the `Inc` from its own `.tft`"
         );
     }
+}
+
+/// Reference: `tTVPPrerenderedFont` reads the whole file in its constructor
+/// and keeps the file image, so the glyph descriptors are read from the image
+/// and the storage is not read again
+/// (`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`, `:60-62`). The file
+/// is therefore read at the map, and a measurement reads nothing: the first
+/// text operation of a run does not wait for the file.
+///
+/// The storage's read counter is the evidence: the map reads the whole file,
+/// and the measurement that follows reads no byte.
+#[test]
+fn font_prerendered_reads_its_file_at_the_map() {
+    let _lock = vm_lock();
+    let Some((font_dir, font_name)) = test_font() else {
+        return;
+    };
+    let font_bytes = std::fs::read(font_dir.join(&font_name)).expect("read test font");
+    let env = common::Env::with_storage();
+    let game_dir = env.game_dir().expect("game dir").clone();
+    std::fs::write(game_dir.join("Pre.ttf"), &font_bytes).expect("write face");
+    let bytes = build_tft(&[b'A' as u16], 42);
+    std::fs::write(game_dir.join("mapped.tft"), &bytes).expect("write tft");
+    env.run("var w = new Window(); var l = new Layer(w, null);");
+    // The face is registered, so the measurement resolves it without reading
+    // the storage: the counter shows the pre-rendered font's own reads.
+    common::link_plugin(env.engine(), "addFont.dll");
+    env.run("System.addFont('Pre.ttf');");
+
+    let storage = env.storage().expect("storage");
+    let before = storage.read_bytes();
+    env.run("var f = new Font('Pre.ttf', 16, 0); f.mapPrerenderedFont('mapped.tft');");
+    let after_map = storage.read_bytes();
+    assert_eq!(
+        after_map - before,
+        bytes.len() as u64,
+        "the map must read the whole file"
+    );
+
+    env.run(
+        "l.font.face = 'Pre.ttf'; \
+         l.font.height = 16; \
+         l.font.bold = false; \
+         l.font.italic = false; \
+         l.font.angle = 0;",
+    );
+    assert_eq!(
+        env.eval_int("l.font.getTextWidth('A')"),
+        42,
+        "the measurement must use the mapped `.tft`'s `Inc`"
+    );
+    assert_eq!(
+        storage.read_bytes(),
+        after_map,
+        "the measurement must not read the file again"
+    );
 }
 
 /// Reference: `TVPMapPrerenderedFont` reuses the `tTVPPrerenderedFont` already

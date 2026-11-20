@@ -201,6 +201,25 @@ still running. The scan's report ("system fonts: N faces from M directories")
 is printed where the faces are used, so the log says the same thing at the
 same point as before.
 
+**The scan is not on the first text operation's critical path.** The scan
+reads the host's whole font directory — every font file, with every face of
+every collection — and it costs hundreds of milliseconds of CPU on its own
+thread (measured on the reference host: 233 ms in a debug build at a load of
+80, 703 ms at a load of 107). The scan starts when the host selects its
+roles, so it runs while the game starts up; the first text use waits for it
+only when it is still running, and the measured wait at the first text use
+was **0.7 ms** (the scan had finished 4.4 s earlier).
+
+The enumeration is the shape that is left open: the reference enumerates the
+host's fonts once, on the first font query
+(`reference/cpp/core/visual/FontImpl.cpp:178-190`), and its enumeration
+touches a handful of files, while the port enumerates the host's whole
+directory — and the host's directory list overlaps the locations the font
+database scans on its own, so a file can be read twice. Making the
+enumeration cheap needs the host's font *files* rather than its font
+*directories* (a per-family lookup the composition root would supply), which
+the text service's current protocol does not carry.
+
 A scan reads the directories it was started with, so a new directory list
 starts a new scan. A text service whose host selected no roles has no scan:
 the request that needs a host face reads the font directories itself, on its
@@ -221,6 +240,21 @@ designates it. A face the rasterizer cannot load, or that the shaping
 database cannot register, is passed over, so a host that carries one unusable
 face still gets a coverage face from the next face that carries the
 character. A registry that already designated a coverage face keeps it.
+
+### The pre-rendered font's file
+
+A font mapped with `mapPrerenderedFont` is a **file image**, and the image is
+read when the mapping is created: the reference's constructor reads the whole
+file and holds it (`reference/cpp/core/visual/PrerenderedFont.cpp:9-76`), so
+the glyph descriptors are read from the image and the storage is not read
+again (`:60-62`). The header is validated at the map and the glyph body is
+parsed on the first use, because the index bounds are not checked at the map.
+
+The consequence for the frame times: the first text operation of a run does
+not wait for the file. A 6.6 MB pre-rendered font read through the storage's
+read pool costs about 30 ms in a debug build (measured on the reference
+host) and it is a *wait* on a worker, so it grows with the machine's load;
+reading it at the map moves it to the mapping, where the reference reads it.
 
 ### The glyph atlas
 
@@ -386,6 +420,9 @@ destination rectangle that received ink, or `None`.
 * `crates/engine/tests/text_render.rs` — the atlas, the projection and the
   CPU composite.
 * `crates/engine/src/text.rs` `mod tests` — the unit-level invariants.
+* `crates/compat/tests/font.rs` — the script-visible text surface: the
+  measurement, the pre-rendered font's mapping (the file is read at the map)
+  and the registered faces.
 
 ---
 

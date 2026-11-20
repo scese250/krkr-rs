@@ -171,7 +171,7 @@ fn measure_text_with(
         angle: font.angle.round() as i32,
     };
     if use_prerendered && let Some(prerendered) = resolver.prerendered_for(&key) {
-        let body = prerendered.ensure_body(&ctx)?;
+        let body = prerendered.ensure_body()?;
         let width = prerendered_text_width(service, id, &body, text, &style)
             .map_err(|error| format!("{error_prefix}: text layout failed: {error}"))?;
         return Ok((width, font.height));
