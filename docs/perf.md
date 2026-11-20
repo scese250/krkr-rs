@@ -506,6 +506,72 @@ still pays the quadratic. The reference's own async graphic loader does the
 read and the decode on a worker, so its tile reads overlap where ours now
 do too.
 
+### 3.8 The scene change in the real game: where the time goes
+
+**Method.** The gameplay harness (`crates/app/examples/gameplay_frames.rs`)
+drives the real title into a scenario and drives the frames as fast as the
+host runs them. One 6 000-frame run, 2026-11-13, release build, the game's
+own directory, the null backend. The run's own slow-frame report is the
+instrument; the tree's own slow-step reports are the second one.
+
+Of the run's 2 941 slow frames, 2 919 are the run idling at the end (every
+phase zero). **Two did real work**, and both are a scene change — the
+`title.ks` scenario and the `custom.ks` scenario after it:
+
+| the frame | the script (the async poll) | the pool's decodes | the upload | the host |
+|---|---:|---:|---:|---:|
+| 72 | **168.5 ms** | 6 jobs / 12.8 ms | 1.9 ms | 1.9 ms |
+| 73 | **210.0 ms** | 2 jobs / 10.7 ms | 3.6 ms | 3.6 ms |
+
+**What the scene change is not.** Three things a reader would guess, and the
+run's own reports say otherwise:
+
+* **the PSB container's parse and the root dictionary's build.** The plugin's
+  slow-step report names both — `psb: the load of … took … ms
+  (storage_read=… parse=…)` and `psb: the root dictionary of … took … ms` —
+  and **neither line appears in the run's 6 121 lines.** Both steps are below
+  the report's 50 ms threshold, so the container is not the scene change's
+  cost.
+* **the image decodes.** The pool's own counters name its work: six jobs and
+  two jobs, 12.8 ms and 10.7 ms of pool time, in frames whose script ran
+  168.5 ms and 210.0 ms. The decodes run concurrently on the pool's workers,
+  so they are a small part of the frame, not the frame.
+* **the pools' limits.** No `the decode pool refused` and no `the read pool
+  refused` line appears in the run: neither the queue limit nor the memory
+  limit turned a burst into work on the frame's thread.
+
+The upload is 1.9 ms and 3.6 ms in the two frames (the null backend; the
+Vulkan path's upload is the same batch, over the same bitmaps).
+
+**What it is.** The scene change is the script's own work: the scenario's
+read and parse, the walk that hands every tag to the script as an object, and
+the game's own TJS. The reference does the same work in the same place — its
+`tTJSNI_KAGParser::LoadScenario` reads the scenario through `TVPGetScenario`,
+which parses it once and caches it, and the walk hands each tag to the script
+— so this half cannot be skipped; only the engine's share of it can be made
+cheaper.
+
+**Two shapes in the engine's share, and what changed.**
+
+* **The container's chunk lookup.** A chunk is asked for by its reference, and
+  the conversion asks for one per resource node. The document found one by
+  walking its chunk table, so the conversion was quadratic in the number of
+  chunks. **The container holds the index of its chunks now**, built once when
+  the container is, and a chunk is a hash hit. The reference holds the bytes
+  in the tree node itself (`PSBResource::data`), so its conversion is linear;
+  the index is the port's way of reaching the same shape. The document and
+  the index have one owner: the container the media holds is the one the
+  instance converts.
+* **The storage's read.** The pool produced the bytes and the caller copied
+  them (`payload.as_ref().clone()`), so every entry a scene change read was
+  copied on the frame's thread — the scenario and every image. **The bytes
+  move out of the pool's result now** when the caller is its last owner, and
+  are copied only when the pool still holds a reference to them.
+
+**What is left, and it is not in this layer.** The upload's volume — a scene
+change's bitmaps are uploaded at the frame's end, in one batch — and the
+scenario's parse and walk, which are the KAG's own work.
+
 ---
 
 ## 4. The reports that name a slow step
@@ -1562,3 +1628,73 @@ the default is the game's logical resolution.
 The plane the composite redraws is now 2.25x the area it was, which is what
 makes the region worth landing: a whole-plane redraw at 1920x1080 is exactly
 what the region removes.
+
+### 11.8 The scene change: the route, the cost, and the shape behind it
+
+**The measurements so far never crossed a scene boundary**, and the scene
+change is the case the game is worst at. The harness now drives the route:
+the title page is a KAG scene with a column of buttons on the left of the
+window, and the game answered to the clicks at x = 165 with the rows 65
+pixels apart:
+
+| the click | the scenario the game loaded |
+|---|---|
+| `(165, 1095)` | `option.ks` - the settings page |
+| `(165, 992)` | `extra.ks` - the extra scene |
+| `(165, 732)` | `load.ks` - the save-data screen |
+
+The harness's `--scene` option names those three and the text-advancing one
+(`scenario`, the middle of the screen), so a run crosses the boundary the
+text-advancing run never reaches.
+
+**The measurement (the Vulkan backend, the 60 fps pacing, the delta clock,
+the real game, 3 600 frames, the click at 12 000 ms and then every 1 000 ms).**
+The load during the run was **max 0.32, mean 0.27** - a quiet machine, so
+the numbers are trustworthy. The scenarios the game loaded:
+`autoskipmark.asd -> first.ks -> custom.ks -> title.ks -> custom.ks ->
+title.ks -> option.ks`.
+
+| the measure | p50 | p90 | p99 | the 1% low | the worst |
+|---|---:|---:|---:|---:|---:|
+| the frame gap | 16.70 ms | 16.79 ms | 17.58 ms | **316.27 ms (3.2 fps)** | 4 016.11 ms |
+| the engine's own work | 2.45 ms | 2.56 ms | 6.46 ms | **312.07 ms (3.2 fps)** | 4 004.14 ms |
+
+26 frames took over 33 ms and 10 took over 100 ms; those frames carry
+11 951 ms and 10 996 ms in total. **This is a debug build, so it is the
+shape's cost and not a shipping number**; the release run is the one that
+counts against the target. What it settles is the route: the text-advancing
+run of the same harness has a p99 of 38.69 ms and a worst of 2 008.71 ms,
+so **the scene boundary is the worst case, and the tail is the engine's own
+work** (the engine's 1% low tracks the frame gap's).
+
+**The cost is the transition step.** The slow-frame report's `frame_tail`
+is the frame body's own phase, and it names the transition:
+
+| the frame | the gap | the async poll | the frame tail |
+|---|---:|---:|---:|
+| 724 | 1 624.7 ms | 110.9 ms | **1 510.7 ms** |
+| 725 | 1 140.0 ms | 1 082.2 ms | 0.0 ms |
+| 740 | - | 3 427.1 ms | **512.1 ms** |
+
+**The shape behind it.** The transition resolves its two endpoints on the
+CPU before the backend is consulted: `transition_sources_subtree`
+(`crates/compat/src/natives/visual/layer/transitions.rs:1535`) calls
+`render_layer_subtree` for the destination and for the source - the whole
+subtree of each, composited into a content bitmap - and only then asks for
+the effect draw. So a transition of two ticks runs **four endpoint
+composites**, and the composite is about **74 times** the cost of the blend
+(868.48 ms against 11.75 ms, in the debug build).
+
+The reference does not do this. The destination is drawn live into the
+transition's drawable (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7148-7149`),
+and the source is the source layer's **cache**, read through
+`Complete(destrect)` (`:8186-8199`) - the incrementally maintained cache,
+which reconstructs only the changed region (`:7673-7748`). The reference's
+per-tick transition cost is therefore the blend alone, and the GPU path
+moves the *drawing*, not the blend
+(`reference/krkr2/cpp/core/visual/TransIntf.cpp:584-612`).
+
+Our engine's endpoint composite is the work the reference avoids. The
+region's shape is what makes it a cache hit instead of a full composite,
+and the transition's source is the next step after it: the source's cache
+read, the way the reference reads it.
