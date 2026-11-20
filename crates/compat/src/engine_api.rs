@@ -99,21 +99,20 @@ pub(crate) use engine::shader::EffectDraw;
 /// Rasterization primitives compat composes directly.
 pub(crate) mod raster {
     pub(crate) use engine::raster::{
-        blend_pixel, fill_polygon, fill_rect_replace, flatten_arc, flatten_cubic, hatch_foreground,
+        blend_pixel, fill_rect_replace, flatten_arc, flatten_cubic, hatch_foreground,
     };
 }
 
 /// Layer composition and pixel-region operations compat composes directly.
 pub(crate) mod layer_ops {
     pub(crate) use engine::layer_ops::{
-        AffineBlit, BlitOptions, BlitSource, COPY_MAIN, COPY_MASK, GammaAdjust, RectI,
-        adjust_gamma, affine_blit, affine_blit_clipped, affine_blit_clipped_on,
+        AffineBlit, BlitOptions, BlitSource, COPY_MAIN, COPY_MASK, CompositeDraw, DrawOp, FillDraw,
+        GammaAdjust, ImageDraw, RectI, adjust_gamma, affine_blit_clipped, affine_blit_clipped_on,
         affine_blit_clipped_pixel_center_on, blit_copy, blit_over, blit_plane,
         blur_bitmap_in_place, clip_rect, convert_add_alpha_to_alpha, convert_alpha_to_add_alpha,
         copy_9patch, do_gray_scale, ensure_transition_display, ensure_transition_self_image,
         fill_color_hold_alpha, fill_color_on_add_alpha, fill_color_on_alpha, fill_mask, flip_lr,
-        flip_ud, gaussian_blur, intersect, intersect_rect, light_contrast, operate_rect,
-        operate_rect_on, remove_const_opacity, render_layer_subtree, stretch_blit_on,
-        stretch_blit_plane,
+        flip_ud, gaussian_blur, intersect, intersect_rect, light_contrast, operate_rect_on,
+        remove_const_opacity, render_layer_subtree, stretch_blit_on, stretch_blit_plane,
     };
 }

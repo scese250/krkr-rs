@@ -23,6 +23,8 @@
 //! effect rebases its buffer on the clip), so the callers pass the
 //! already-clipped region.
 
+use std::sync::Arc;
+
 use api::blend::{BlendMode, DstBlend};
 use api::geometry::PixelRegion;
 use render::blend::PhotoshopBlend;
@@ -64,6 +66,221 @@ pub struct BlitOptions {
     /// operation-mode alpha blend reads the destination's alpha and loses a
     /// level on an opaque source.
     pub source_over: bool,
+}
+
+/// One textured draw: a source rectangle placed on the destination by an
+/// affine map and composited with the draw's own opacity and blend.
+///
+/// The draw is the generic form of a pose: a run of textured draws a caller
+/// composites onto a bitmap. The engine renders a list of them with
+/// [`draw_ops`]; a backend that can draw the list draws it instead, and the
+/// two draw the same picture.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageDraw {
+    /// The id of the source the draw reads.
+    pub source: u32,
+    /// The rectangle of the source the draw reads.
+    pub rect: RectI,
+    /// The three corners of the mapped rectangle: the origin, the origin's
+    /// neighbour on the first axis and the origin's neighbour on the second.
+    ///
+    /// The map is the one the affine blit takes: the source rectangle's
+    /// corner maps to the origin, its far corner on the first axis to the
+    /// first neighbour and its far corner on the second axis to the second.
+    pub corners: [(f64, f64); 3],
+    /// The draw's opacity, `0..=255`.
+    pub opacity: u8,
+    /// The operation mode the draw composites with.
+    pub mode: i64,
+    /// Whether the draw is the plain source-over.
+    pub source_over: bool,
+}
+
+/// A source rectangle composited onto the destination at a position.
+///
+/// The source is a surface the caller rendered on its own: a clip leaf or a
+/// composed group. The composite is the one draw that places a surface, so it
+/// carries the opacity and the blend the surface is composited with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompositeDraw {
+    /// The id of the source the draw reads.
+    pub source: u32,
+    /// The rectangle of the source the draw reads.
+    pub rect: RectI,
+    /// The destination position of the source's rectangle.
+    pub x: i32,
+    /// The destination position of the source's rectangle.
+    pub y: i32,
+    /// The composite's opacity, `0..=255`.
+    pub opacity: u8,
+    /// The operation mode the composite uses.
+    pub mode: i64,
+    /// Whether the composite is the plain source-over.
+    pub source_over: bool,
+}
+
+/// A polygon filled with one colour.
+///
+/// The fill is the plain one the rasterizer draws: the colour is composited
+/// over the destination with the colour's own alpha.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FillDraw {
+    /// The polygon's points, in destination pixels.
+    pub points: Vec<(f64, f64)>,
+    /// The colour the polygon is filled with, `[r, g, b, a]`.
+    pub color: [u8; 4],
+}
+
+/// One step of a draw list.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DrawOp {
+    /// An affine textured quad composited onto the destination.
+    Image(ImageDraw),
+    /// A source rectangle composited onto the destination at a position.
+    Composite(CompositeDraw),
+    /// A polygon filled with one colour.
+    Fill(FillDraw),
+}
+
+impl DrawOp {
+    /// The source the draw reads, or `None` for a fill.
+    pub fn source(&self) -> Option<u32> {
+        match self {
+            Self::Image(draw) => Some(draw.source),
+            Self::Composite(draw) => Some(draw.source),
+            Self::Fill(_) => None,
+        }
+    }
+}
+
+/// The sources a draw list reads, by id.
+pub type DrawSources = Map<u32, Arc<BitmapState>>;
+
+/// Draws a list of draw operations onto `dst`, in order.
+///
+/// The list is drawn the way the calls it replaces drew: an affine textured
+/// quad is placed by its own map and composited with its own opacity and
+/// blend, a source rectangle is composited at its own position, and a polygon
+/// is filled with its own colour. A draw whose source is missing is skipped:
+/// the source was released before the list was drawn.
+pub fn draw_ops(dst: &mut BitmapState, ops: &[DrawOp], sources: &DrawSources) {
+    for op in ops {
+        match op {
+            DrawOp::Image(draw) => {
+                let Some(source) = sources.get(&draw.source) else {
+                    continue;
+                };
+                draw_image(dst, draw, source);
+            }
+            DrawOp::Composite(draw) => {
+                let Some(source) = sources.get(&draw.source) else {
+                    continue;
+                };
+                operate_rect(
+                    dst,
+                    draw.x,
+                    draw.y,
+                    BlitSource {
+                        bitmap: source,
+                        rect: draw.rect,
+                    },
+                    BlitOptions {
+                        mode: draw.mode,
+                        opa: draw.opacity,
+                        treat_as_opaque: false,
+                        hold_alpha: false,
+                        source_over: draw.source_over,
+                    },
+                );
+            }
+            DrawOp::Fill(draw) => {
+                crate::raster::fill_polygon(dst, &draw.points, draw.color);
+            }
+        }
+    }
+}
+
+/// Draws one affine textured quad onto `dst`.
+///
+/// An axis-aligned, unit-scale, whole-pixel placement maps source texels onto
+/// destination pixels one to one, so it takes the direct blit path. Every
+/// other placement keeps the inverse-mapped affine resampler.
+pub fn draw_image(dst: &mut BitmapState, draw: &ImageDraw, source: &BitmapState) {
+    let width = draw.rect.2 - draw.rect.0;
+    let height = draw.rect.3 - draw.rect.1;
+    if let Some((x, y)) = unit_axis_aligned_origin(draw.corners, width, height) {
+        // The unit axis-aligned placement blends with the draw's operation
+        // mode, so the same kernel as the affine pass applies.
+        operate_rect(
+            dst,
+            x,
+            y,
+            BlitSource {
+                bitmap: source,
+                rect: draw.rect,
+            },
+            BlitOptions {
+                mode: draw.mode,
+                opa: draw.opacity,
+                treat_as_opaque: false,
+                hold_alpha: false,
+                source_over: draw.source_over,
+            },
+        );
+        return;
+    }
+    affine_blit(
+        dst,
+        AffineBlit {
+            corners: draw.corners,
+            // The nearest texel of the source is sampled.
+            stretch_type: 0,
+            clear: false,
+            clear_color: [0, 0, 0, 0],
+        },
+        BlitSource {
+            bitmap: source,
+            rect: draw.rect,
+        },
+        BlitOptions {
+            mode: draw.mode,
+            opa: draw.opacity,
+            treat_as_opaque: false,
+            hold_alpha: false,
+            source_over: draw.source_over,
+        },
+    );
+}
+
+/// The destination origin of a unit-scale, axis-aligned, whole-pixel
+/// placement, or `None` for a placement the affine resampler must handle.
+fn unit_axis_aligned_origin(
+    corners: [(f64, f64); 3],
+    width: i32,
+    height: i32,
+) -> Option<(i32, i32)> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let [origin, right, down] = corners;
+    // The quad spans exactly its own size, runs along the axes and starts on a
+    // whole pixel.
+    if right.0 - origin.0 != f64::from(width)
+        || down.1 - origin.1 != f64::from(height)
+        || right.1 != origin.1
+        || down.0 != origin.0
+        || origin.0.fract() != 0.0
+        || origin.1.fract() != 0.0
+    {
+        return None;
+    }
+    let (x, y) = (origin.0, origin.1);
+    if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&x)
+        || !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&y)
+    {
+        return None;
+    }
+    Some((x as i32, y as i32))
 }
 
 /// The corner map, resampler and background of [`affine_blit`].
@@ -7362,5 +7579,221 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A scaled placement samples the nearest texel, not a bilinear blend
+    /// (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:455-456`).
+    #[test]
+    fn a_scaled_placement_samples_the_nearest_texel() {
+        let source = BitmapState::new(
+            2,
+            2,
+            vec![
+                10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+            ],
+        );
+        // The 2x2 source is placed on a 4x4 quad at (1, 1), so every source
+        // texel covers a 2x2 block of the destination.
+        let corners = [(1.0, 1.0), (5.0, 1.0), (1.0, 5.0)];
+        let mut bitmap = BitmapState::new(8, 8, vec![0u8; 8 * 8 * 4]);
+        draw_image(
+            &mut bitmap,
+            &ImageDraw {
+                source: 0,
+                rect: (0, 0, 2, 2),
+                corners,
+                opacity: 255,
+                mode: 2,
+                source_over: true,
+            },
+            &source,
+        );
+        let texel = |x: usize, y: usize| {
+            let offset = (y * 8 + x) * 4;
+            [
+                bitmap.rgba[offset],
+                bitmap.rgba[offset + 1],
+                bitmap.rgba[offset + 2],
+                bitmap.rgba[offset + 3],
+            ]
+        };
+        assert_eq!(texel(1, 1), [10, 20, 30, 255], "the first texel");
+        assert_eq!(texel(2, 1), [10, 20, 30, 255], "the first texel is 2 wide");
+        assert_eq!(texel(3, 1), [40, 50, 60, 255], "the second texel");
+        assert_eq!(texel(1, 3), [70, 80, 90, 255], "the third texel");
+        assert_eq!(texel(3, 3), [100, 110, 120, 255], "the fourth texel");
+        // The quad covers four by four pixels, so the texel next to it is
+        // untouched.
+        assert_eq!(texel(5, 1), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_unit_axis_aligned_placement_matches_the_affine_path_exactly() {
+        // The reference resumes every leaf with `stNearest`
+        // (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:456-472`,
+        // `:934-940`). A whole-pixel unit placement maps one source texel to
+        // one destination pixel, so the direct blit and the affine sampler
+        // must agree pixel for pixel.
+        let source = BitmapState::new(
+            2,
+            2,
+            vec![
+                10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+            ],
+        );
+        let corners = [(2.0, 3.0), (4.0, 3.0), (2.0, 5.0)];
+        assert_eq!(unit_axis_aligned_origin(corners, 2, 2), Some((2, 3)));
+        let mut fast = BitmapState::new(6, 6, vec![0u8; 6 * 6 * 4]);
+        let mut affine = BitmapState::new(6, 6, vec![0u8; 6 * 6 * 4]);
+        draw_image(
+            &mut fast,
+            &ImageDraw {
+                source: 0,
+                rect: (0, 0, 2, 2),
+                corners,
+                opacity: 255,
+                mode: 2,
+                source_over: true,
+            },
+            &source,
+        );
+        affine_blit(
+            &mut affine,
+            AffineBlit {
+                corners,
+                stretch_type: 0,
+                clear: false,
+                clear_color: [0, 0, 0, 0],
+            },
+            BlitSource {
+                bitmap: &source,
+                rect: (0, 0, 2, 2),
+            },
+            BlitOptions {
+                mode: 2,
+                opa: 255,
+                treat_as_opaque: false,
+                hold_alpha: false,
+                source_over: true,
+            },
+        );
+        assert_eq!(fast.rgba, affine.rgba);
+        let texel = |bitmap: &BitmapState, x: usize, y: usize| {
+            let offset = (y * 6 + x) * 4;
+            [
+                bitmap.rgba[offset],
+                bitmap.rgba[offset + 1],
+                bitmap.rgba[offset + 2],
+                bitmap.rgba[offset + 3],
+            ]
+        };
+        assert_eq!(texel(&fast, 2, 3), [10, 20, 30, 255]);
+        assert_eq!(texel(&fast, 3, 4), [100, 110, 120, 255]);
+        // A rotation or a fractional origin is not a whole-pixel placement.
+        assert_eq!(
+            unit_axis_aligned_origin([(2.0, 3.0), (3.0, 4.0), (1.0, 4.0)], 2, 2),
+            None
+        );
+        assert_eq!(
+            unit_axis_aligned_origin([(2.5, 3.0), (4.5, 3.0), (2.5, 5.0)], 2, 2),
+            None
+        );
+    }
+
+    /// The draw list draws the pixels the calls it replaces drew.
+    ///
+    /// The list is the pose: the engine renders it, and a backend that can
+    /// draw the list draws it instead. The two must draw the same picture,
+    /// so the list is compared against the calls it stands for, pixel for
+    /// pixel.
+    #[test]
+    fn the_draw_list_draws_the_pixels_the_calls_drew() {
+        let source = BitmapState::new(
+            4,
+            4,
+            vec![
+                10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255, 130, 140,
+                150, 255, 160, 170, 180, 255, 190, 200, 210, 255, 220, 230, 240, 255, 250, 5, 15,
+                255,
+            ],
+        );
+        let leaf = BitmapState::new(6, 6, vec![0u8; 6 * 6 * 4]);
+        let mut sources: DrawSources = crate::hasher::map();
+        sources.insert(0, Arc::new(source.clone()));
+        sources.insert(1, Arc::new(leaf.clone()));
+        // The first draw is a scaled placement, the second a whole-pixel one,
+        // the third a surface composited at a position.
+        let ops = vec![
+            DrawOp::Image(ImageDraw {
+                source: 0,
+                rect: (0, 0, 4, 4),
+                corners: [(1.0, 1.0), (7.0, 1.0), (1.0, 7.0)],
+                opacity: 255,
+                mode: 2,
+                source_over: true,
+            }),
+            DrawOp::Image(ImageDraw {
+                source: 0,
+                rect: (0, 0, 4, 4),
+                corners: [(10.0, 2.0), (14.0, 2.0), (10.0, 6.0)],
+                opacity: 200,
+                mode: 2,
+                source_over: true,
+            }),
+            DrawOp::Composite(CompositeDraw {
+                source: 1,
+                rect: (0, 0, 6, 6),
+                x: 20,
+                y: 3,
+                opacity: 128,
+                mode: 2,
+                source_over: true,
+            }),
+        ];
+        let mut listed = BitmapState::new(32, 16, vec![0u8; 32 * 16 * 4]);
+        draw_ops(&mut listed, &ops, &sources);
+        // The same picture, drawn with the calls the list stands for.
+        let mut called = BitmapState::new(32, 16, vec![0u8; 32 * 16 * 4]);
+        draw_image(
+            &mut called,
+            &ImageDraw {
+                source: 0,
+                rect: (0, 0, 4, 4),
+                corners: [(1.0, 1.0), (7.0, 1.0), (1.0, 7.0)],
+                opacity: 255,
+                mode: 2,
+                source_over: true,
+            },
+            &source,
+        );
+        draw_image(
+            &mut called,
+            &ImageDraw {
+                source: 0,
+                rect: (0, 0, 4, 4),
+                corners: [(10.0, 2.0), (14.0, 2.0), (10.0, 6.0)],
+                opacity: 200,
+                mode: 2,
+                source_over: true,
+            },
+            &source,
+        );
+        operate_rect(
+            &mut called,
+            20,
+            3,
+            BlitSource {
+                bitmap: &leaf,
+                rect: (0, 0, 6, 6),
+            },
+            BlitOptions {
+                mode: 2,
+                opa: 128,
+                treat_as_opaque: false,
+                hold_alpha: false,
+                source_over: true,
+            },
+        );
+        assert_eq!(listed.rgba, called.rgba);
     }
 }

@@ -243,6 +243,15 @@ pub struct LayerState {
     /// the transition costs no per-tick pixel work. `None` while no such
     /// transition runs ([`Scene::set_effect`]).
     pub effect: Option<EffectDraw>,
+    /// The draw list the layer's image is composed from.
+    ///
+    /// The list is the pose the layer shows: the textured draws, the
+    /// surfaces and the fills that make it up, in the order they are
+    /// composited. The list is per-frame content: the caller that composes
+    /// a pose replaces it, and the renderer draws it once.
+    ///
+    /// The list is empty while the layer shows only its own image.
+    pub draws: Vec<crate::layer_ops::DrawOp>,
     /// The region of the layer's own composited content that must be
     /// reconstructed, in the layer's own coordinate space.
     ///
@@ -948,6 +957,15 @@ pub struct Scene {
     /// The engine drops the texture of every bitmap named here, so the prune
     /// does not walk the texture table to find the stale ones.
     removed_bitmaps: BTreeSet<u32>,
+    /// The sources the draw lists read, by id.
+    ///
+    /// A source is a bitmap a draw list reads but no layer shows: the tinted
+    /// icon a pose draws, or the surface a pose composited on its own. The
+    /// table owns them, so a list that names a source keeps it alive and a
+    /// backend that draws the list has the pixels to draw from.
+    draw_sources: crate::layer_ops::DrawSources,
+    /// The id the next registered source receives.
+    next_draw_source: u32,
 }
 
 impl Default for Scene {
@@ -976,6 +994,8 @@ impl Default for Scene {
             dirty_bitmaps: BTreeSet::new(),
             pending_bitmaps: BTreeSet::new(),
             removed_bitmaps: BTreeSet::new(),
+            draw_sources: crate::hasher::map(),
+            next_draw_source: 0,
         }
     }
 }
@@ -1221,6 +1241,7 @@ impl Scene {
             transition_self: None,
             transition_frame: None,
             effect: None,
+            draws: Vec::new(),
             content_region: None,
             hint: String::new(),
             show_parent_hint: false,
@@ -1544,13 +1565,22 @@ impl Scene {
     /// Look up a layer by id. Uses the id→index map, falling back to a
     /// linear scan if callers edited [`Scene::layers`] directly.
     pub fn layer(&self, id: u32) -> Option<&LayerState> {
+        let index = self.layer_position(id)?;
+        self.layers.get(index)
+    }
+
+    /// The index of the layer `id` names, or `None` when there is none.
+    ///
+    /// The id→index map answers the common case; a caller that edited
+    /// [`Scene::layers`] directly is answered by a linear scan.
+    fn layer_position(&self, id: u32) -> Option<usize> {
         if let Some(index) = self.layer_index.get(&id).copied()
             && let Some(layer) = self.layers.get(index)
             && layer.id == id
         {
-            return Some(layer);
+            return Some(index);
         }
-        self.layers.iter().find(|l| l.id == id)
+        self.layers.iter().position(|l| l.id == id)
     }
 
     /// Whether `id` is the primary layer of its window (the root layer the
@@ -1673,13 +1703,11 @@ impl Scene {
                 // chain holds nothing of it.
                 break;
             };
-            if keeps_region {
-                if let Some(layer) = self.layer_mut_untracked(cid) {
-                    layer.content_region = Some(match layer.content_region {
-                        Some(current) => current.union(&clipped),
-                        None => clipped,
-                    });
-                }
+            if keeps_region && let Some(layer) = self.layer_mut_untracked(cid) {
+                layer.content_region = Some(match layer.content_region {
+                    Some(current) => current.union(&clipped),
+                    None => clipped,
+                });
             }
             area = clipped;
         }
@@ -4243,6 +4271,88 @@ impl Scene {
                 }
             }
         }
+    }
+
+    /// Registers a source a draw list reads and returns its id.
+    ///
+    /// The scene owns the source: a list that names it keeps its pixels
+    /// alive, and a backend that draws the list has them to draw from. The
+    /// source is not a layer image, so the frame does not upload it; a
+    /// backend that draws a list uploads the sources it draws from.
+    pub fn add_draw_source(&mut self, pixels: std::sync::Arc<BitmapState>) -> u32 {
+        let id = self.next_draw_source;
+        self.next_draw_source += 1;
+        self.draw_sources.insert(id, pixels);
+        id
+    }
+
+    /// Releases a source no draw list reads any more.
+    ///
+    /// Returns whether the source was there.
+    pub fn release_draw_source(&mut self, id: u32) -> bool {
+        self.draw_sources.remove(&id).is_some()
+    }
+
+    /// Releases every source the `keep` list does not name.
+    ///
+    /// The sources a pose registers are per-frame content: the tinted icons
+    /// the cache holds and the surfaces the pose composited. The caller
+    /// passes the ids that are still live, and the rest of the table goes.
+    pub fn prune_draw_sources(&mut self, keep: &[u32]) {
+        self.draw_sources.retain(|id, _| keep.contains(id));
+    }
+
+    /// Replaces the draw list the layer's image is composed from.
+    ///
+    /// The list is per-frame content: the pose that was composed replaces
+    /// the one before it, and the renderer draws the list once.
+    pub fn set_layer_draws(&mut self, layer_id: u32, draws: Vec<crate::layer_ops::DrawOp>) {
+        if let Some(layer) = self.layer_mut_untracked(layer_id) {
+            layer.draws = draws;
+        }
+    }
+
+    /// The draw list the layer's image is composed from.
+    pub fn layer_draws(&self, layer_id: u32) -> &[crate::layer_ops::DrawOp] {
+        match self.layer_position(layer_id) {
+            Some(index) => &self.layers[index].draws,
+            None => &[],
+        }
+    }
+
+    /// Draws a list of draw operations onto `dst`.
+    ///
+    /// The destination is the caller's own bitmap and the sources are the
+    /// scene's, so the two are borrowed at once.
+    pub fn draw_ops_into(&self, dst: &mut BitmapState, ops: &[crate::layer_ops::DrawOp]) {
+        crate::layer_ops::draw_ops(dst, ops, &self.draw_sources);
+    }
+
+    /// Draws the layer's draw list into the layer's own image.
+    ///
+    /// The list is the pose the layer shows, and the image is what the pose
+    /// is composited onto: the image keeps the pixels the earlier frames
+    /// left there, so the pose accumulates frame to frame. Returns whether
+    /// the list was drawn.
+    pub fn draw_layer_draws(&mut self, layer_id: u32) -> bool {
+        let Some(bitmap) = self.layer(layer_id).and_then(|layer| layer.bitmap) else {
+            return false;
+        };
+        let Some(index) = self.bitmap_position(bitmap) else {
+            return false;
+        };
+        let Some(layer_index) = self.layer_position(layer_id) else {
+            return false;
+        };
+        self.mark_bitmap_layers_changed(bitmap);
+        self.dirty_bitmaps.insert(bitmap);
+        // The destination, the list and the sources are three different
+        // fields of the scene, so all three are borrowed at once.
+        let destination = &mut self.bitmaps[index];
+        let ops = &self.layers[layer_index].draws;
+        let sources = &self.draw_sources;
+        crate::layer_ops::draw_ops(destination, ops, sources);
+        true
     }
 
     /// The custom-shader draw a transition composites at its current phase,

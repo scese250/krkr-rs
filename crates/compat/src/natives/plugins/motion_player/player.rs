@@ -32,8 +32,7 @@ use super::resource::{MotionStore, ResourceInst};
 use super::texture::{ChannelOrder, ChunkRequest, IconChunks, Pixels, pixel_offset, pixel_size};
 use crate::collections::Map;
 use crate::engine_api::layer_ops::{
-    AffineBlit, BlitOptions, BlitSource, RectI, affine_blit, fill_mask, intersect_rect,
-    operate_rect,
+    CompositeDraw, DrawOp, FillDraw, ImageDraw, RectI, fill_mask, intersect_rect,
 };
 use crate::engine_api::{BitmapState, DecodePool, Scene, Storage};
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
@@ -92,7 +91,11 @@ pub(crate) struct TintKey {
 /// The tinted icon sources the player draws, keyed by source, colour and the
 /// decoded atlas they were cropped from. The entries are dropped when the
 /// bound motion changes.
-pub(crate) type TintedSources = Map<TintKey, Arc<BitmapState>>;
+///
+/// The value is the id of the scene's draw source the tinted pixels live in:
+/// the scene owns the pixels, so a draw list that names the source keeps
+/// them alive.
+pub(crate) type TintedSources = Map<TintKey, u32>;
 
 /// `Player` instance payload.
 pub(crate) struct PlayerInst {
@@ -1710,15 +1713,14 @@ impl PlayerInst {
         let affine = self.affine;
         let nodes = &self.nodes;
         let mut tinted = std::mem::take(&mut self.tinted);
-        // A draw leaves the destination's image in place unless the route
-        // asked for a clear; the pixels outside the drawn items survive.
-        if let Some(clear) = clear {
-            for pixel in bitmap.rgba.as_chunks_mut::<4>().0.iter_mut() {
-                pixel.copy_from_slice(&clear);
-            }
-        }
+        // The pose is built as a draw list: the draws that are composited
+        // onto the target, in the order they are composited. The list is
+        // built before the target is drawn, so the sources it names are
+        // registered while the scene is free to take them.
+        let mut ops = Vec::new();
         let missing = composite_pose(
-            bitmap,
+            &mut ops,
+            scene,
             nodes,
             DrawFrame {
                 snapshot: snapshot.as_deref(),
@@ -1736,7 +1738,31 @@ impl PlayerInst {
             bounds,
         );
         self.tinted = tinted;
-        bitmap.mark_dirty();
+        // A draw leaves the destination's image in place unless the route
+        // asked for a clear; the pixels outside the drawn items survive.
+        if let Some(clear) = clear
+            && let Some(bitmap) = scene.bitmap_mut(bitmap_id)
+        {
+            for pixel in bitmap.rgba.as_chunks_mut::<4>().0.iter_mut() {
+                pixel.copy_from_slice(&clear);
+            }
+            bitmap.mark_dirty();
+        }
+        // The list is the pose the layer shows, and the layer's image is what
+        // the pose is composited onto: the image keeps the pixels the
+        // earlier frames left there, so the pose accumulates frame to frame.
+        let mut live: Vec<u32> = self.tinted.values().copied().collect();
+        for op in &ops {
+            if let Some(source) = op.source() {
+                live.push(source);
+            }
+        }
+        scene.set_layer_draws(layer_id, ops);
+        scene.draw_layer_draws(layer_id);
+        // The sources the pose registered are per-frame content: the tinted
+        // icons the cache holds and the surfaces this pose composited. The
+        // rest of the table goes.
+        scene.prune_draw_sources(&live);
         // The pose changed the target's pixels, not the layer tree: setting
         // `imageModified` must not invalidate the cached layer subtree or the
         // whole render scene is rebuilt on every motion frame.
@@ -1821,10 +1847,15 @@ struct DrawFrame<'a> {
     pool: Option<&'a mut DecodePool>,
 }
 
-/// Paint the pose over `bitmap` in node order, returning the icon sources
+/// Build the pose's draw list in node order, returning the icon sources
 /// that had no readable texture.
+///
+/// The list is the pose: the draws that are composited onto the target, in
+/// the order they are composited. The engine draws it onto the target's
+/// image.
 fn composite_pose(
-    bitmap: &mut BitmapState,
+    ops: &mut Vec<DrawOp>,
+    scene: &mut Scene,
     nodes: &[MotionNode],
     mut frame: DrawFrame<'_>,
     bounds: (i32, i32, i32, i32),
@@ -1841,13 +1872,13 @@ fn composite_pose(
             continue;
         }
         if is_composite_group(&nodes[index]) {
-            draw_group(bitmap, (0, 0), bounds, nodes, index, &mut frame, 1.0);
+            draw_group(ops, scene, (0, 0), bounds, nodes, index, &mut frame, 1.0);
             continue;
         }
         if node_drawable(&nodes[index]) {
             let opacity = nodes[index].accumulated.opacity;
             let blend = node_blend(nodes[index].accumulated.blend_mode);
-            draw_clipped_item(bitmap, (0, 0), nodes, index, &mut frame, opacity, blend);
+            draw_clipped_item(ops, scene, (0, 0), nodes, index, &mut frame, opacity, blend);
         }
     }
     std::mem::take(&mut frame.missing)
@@ -2104,7 +2135,8 @@ fn group_paint_box(
 /// composite, and a child's opacity is divided by the group's so the group
 /// factor is not applied twice.
 fn draw_group(
-    target: &mut BitmapState,
+    ops: &mut Vec<DrawOp>,
+    scene: &mut Scene,
     target_origin: (i32, i32),
     target_bounds: (i32, i32, i32, i32),
     nodes: &[MotionNode],
@@ -2152,11 +2184,15 @@ fn draw_group(
     let origin = (left, top);
     let offset = (-origin.0, -origin.1);
     let group_opacity = nodes[group].accumulated.opacity.clamp(0.0, 1.0);
+    // The group's own draws are rendered into the group's surface, and the
+    // surface is composited onto the target once.
+    let mut surface_ops = Vec::new();
     if node_drawable(&nodes[group]) {
         // The group's own source is painted source-over; the group's blend
         // mode is applied when the completed group is composited.
         draw_node(
-            &mut offscreen,
+            &mut surface_ops,
+            scene,
             nodes,
             group,
             frame,
@@ -2175,7 +2211,8 @@ fn draw_group(
         }
         if is_composite_group(node) {
             draw_group(
-                &mut offscreen,
+                &mut surface_ops,
+                scene,
                 origin,
                 (left, top, right, bottom),
                 nodes,
@@ -2194,7 +2231,8 @@ fn draw_group(
             0.0
         };
         draw_clipped_item(
-            &mut offscreen,
+            &mut surface_ops,
+            scene,
             origin,
             nodes,
             index,
@@ -2203,6 +2241,7 @@ fn draw_group(
             node_blend(node.accumulated.blend_mode),
         );
     }
+    scene.draw_ops_into(&mut offscreen, &surface_ops);
     // A stencil group's mask layers change the composed group's alpha in the
     // mask's region once, before the group is composited.
     if !nodes[group].mask_layers.is_empty() {
@@ -2221,8 +2260,10 @@ fn draw_group(
                 height,
                 vec![0u8; width as usize * height as usize * 4],
             );
+            let mut mask_ops = Vec::new();
             draw_node(
-                &mut mask_bitmap,
+                &mut mask_ops,
+                scene,
                 nodes,
                 mask_index,
                 frame,
@@ -2230,6 +2271,7 @@ fn draw_group(
                 SOURCE_OVER,
                 offset,
             );
+            scene.draw_ops_into(&mut mask_bitmap, &mask_ops);
             let rect = (
                 mask_box.0 as i32 - origin.0,
                 mask_box.1 as i32 - origin.1,
@@ -2253,22 +2295,16 @@ fn draw_group(
         return;
     }
     let blend = node_blend(nodes[group].accumulated.blend_mode);
-    operate_rect(
-        target,
-        origin.0 - target_origin.0,
-        origin.1 - target_origin.1,
-        BlitSource {
-            bitmap: &offscreen,
-            rect: (0, 0, right - left, bottom - top),
-        },
-        BlitOptions {
-            mode: blend.mode,
-            opa,
-            treat_as_opaque: false,
-            hold_alpha: false,
-            source_over: blend.source_over,
-        },
-    );
+    let source = scene.add_draw_source(Arc::new(offscreen));
+    ops.push(DrawOp::Composite(CompositeDraw {
+        source,
+        rect: (0, 0, right - left, bottom - top),
+        x: origin.0 - target_origin.0,
+        y: origin.1 - target_origin.1,
+        opacity: opa,
+        mode: blend.mode,
+        source_over: blend.source_over,
+    }));
 }
 
 /// Apply a mask layer's alpha to a composed group: `item_flags` selects the
@@ -2350,7 +2386,8 @@ fn apply_alpha_mask(
 /// the nearest enclosing shape. A clip that trims the item renders it into an
 /// offscreen the size of the clip and composites that once.
 fn draw_clipped_item(
-    out: &mut BitmapState,
+    ops: &mut Vec<DrawOp>,
+    scene: &mut Scene,
     out_origin: (i32, i32),
     nodes: &[MotionNode],
     index: usize,
@@ -2361,7 +2398,7 @@ fn draw_clipped_item(
     let offset = (-out_origin.0, -out_origin.1);
     let node = &nodes[index];
     let Some(viewport) = node_viewport(nodes, node, frame) else {
-        draw_node(out, nodes, index, frame, opacity, blend, offset);
+        draw_node(ops, scene, nodes, index, frame, opacity, blend, offset);
         return;
     };
     let Some(paint) = node_paint_box(node, frame) else {
@@ -2381,7 +2418,7 @@ fn draw_clipped_item(
         return;
     }
     if paint.0 >= clip.0 && paint.1 >= clip.1 && paint.2 <= clip.2 && paint.3 <= clip.3 {
-        draw_node(out, nodes, index, frame, opacity, blend, offset);
+        draw_node(ops, scene, nodes, index, frame, opacity, blend, offset);
         return;
     }
     let Ok(width) = u32::try_from(right - left) else {
@@ -2394,13 +2431,17 @@ fn draw_clipped_item(
     if opa == 0 {
         return;
     }
+    // The clipped item is rendered into a leaf the size of the clip and
+    // composited once: the leaf is a transparent surface of its own.
     let mut offscreen = BitmapState::new(
         width,
         height,
         vec![0u8; width as usize * height as usize * 4],
     );
+    let mut leaf_ops = Vec::new();
     draw_node(
-        &mut offscreen,
+        &mut leaf_ops,
+        scene,
         nodes,
         index,
         frame,
@@ -2408,22 +2449,17 @@ fn draw_clipped_item(
         SOURCE_OVER,
         (-left, -top),
     );
-    operate_rect(
-        out,
-        left - out_origin.0,
-        top - out_origin.1,
-        BlitSource {
-            bitmap: &offscreen,
-            rect: (0, 0, right - left, bottom - top),
-        },
-        BlitOptions {
-            mode: blend.mode,
-            opa,
-            treat_as_opaque: false,
-            hold_alpha: false,
-            source_over: blend.source_over,
-        },
-    );
+    scene.draw_ops_into(&mut offscreen, &leaf_ops);
+    let source = scene.add_draw_source(Arc::new(offscreen));
+    ops.push(DrawOp::Composite(CompositeDraw {
+        source,
+        rect: (0, 0, right - left, bottom - top),
+        x: left - out_origin.0,
+        y: top - out_origin.1,
+        opacity: opa,
+        mode: blend.mode,
+        source_over: blend.source_over,
+    }));
 }
 
 /// The world-space top-left corner of the icon quad a node draws.
@@ -2497,7 +2533,8 @@ fn node_drawn_box(node: &MotionNode, frame: &DrawFrame<'_>) -> Option<(f64, f64,
 /// A shape node draws the placeholder quad instead, and a node whose icon has
 /// no readable texture draws nothing and is reported through `missing`.
 fn draw_node(
-    bitmap: &mut BitmapState,
+    ops: &mut Vec<DrawOp>,
+    scene: &mut Scene,
     nodes: &[MotionNode],
     index: usize,
     frame: &mut DrawFrame<'_>,
@@ -2511,14 +2548,13 @@ fn draw_node(
         .and_then(|snapshot| snapshot.icons.get(&node.local.src));
     let (Some(icon), Some(_)) = (icon, frame.storage) else {
         if node.shape > 0 {
-            fill_placeholder_quad_offset(
-                bitmap,
+            ops.push(DrawOp::Fill(fill_placeholder_quad(
                 node,
                 compose_tint(node.accumulated.colors, frame.settings.color)[0],
                 frame.settings.affine,
                 opacity,
                 offset,
-            );
+            )));
         } else if node.local.src.starts_with("src/") {
             // Only a `src/<group>/<name>` source names an icon; the layout and
             // blank sources of container and mask nodes draw nothing.
@@ -2536,6 +2572,7 @@ fn draw_node(
         return;
     }
     let Some(source) = tinted_source(
+        scene,
         frame,
         node.accumulated.colors,
         node.accumulated.blend_mode,
@@ -2587,36 +2624,30 @@ fn draw_node(
             for gx in 0..div_x - 1 {
                 let left = source_edge(gx, width, div_x - 1);
                 let right = source_edge(gx + 1, width, div_x - 1).max(left + 1);
-                affine_blit(
-                    bitmap,
-                    AffineBlit {
-                        corners: [point(gx, gy), point(gx + 1, gy), point(gx, gy + 1)],
-                        stretch_type: 0,
-                        clear: false,
-                        clear_color: [0, 0, 0, 0],
-                    },
-                    BlitSource {
-                        bitmap: &source,
-                        rect: (left, top, right.min(width), bottom.min(height)),
-                    },
-                    BlitOptions {
-                        mode: blend.mode,
-                        opa,
-                        treat_as_opaque: false,
-                        hold_alpha: false,
-                        source_over: blend.source_over,
-                    },
-                );
+                ops.push(DrawOp::Image(ImageDraw {
+                    source,
+                    rect: (left, top, right.min(width), bottom.min(height)),
+                    corners: [point(gx, gy), point(gx + 1, gy), point(gx, gy + 1)],
+                    opacity: opa,
+                    mode: blend.mode,
+                    source_over: blend.source_over,
+                }));
             }
         }
         return;
     }
-    let corners = [
-        corner(0.0, 0.0),
-        corner(f64::from(width), 0.0),
-        corner(0.0, f64::from(height)),
-    ];
-    draw_icon(bitmap, &source, width, height, corners, opa, blend);
+    ops.push(DrawOp::Image(ImageDraw {
+        source,
+        rect: (0, 0, width, height),
+        corners: [
+            corner(0.0, 0.0),
+            corner(f64::from(width), 0.0),
+            corner(0.0, f64::from(height)),
+        ],
+        opacity: opa,
+        mode: blend.mode,
+        source_over: blend.source_over,
+    }));
 }
 
 /// The node's four vertex colours composed with the player's diffuse colour.
@@ -2657,13 +2688,18 @@ fn scene_color(color: [u8; 4]) -> [u8; 4] {
 
 /// The cropped icon source tinted by the node colours, from the cache or
 /// freshly built.
+///
+/// The source is registered with the scene, which owns its pixels: a draw
+/// list that names the source keeps them alive, and a backend that draws the
+/// list has them to draw from.
 fn tinted_source(
+    scene: &mut Scene,
     frame: &mut DrawFrame<'_>,
     node_colors: [[u8; 4]; 4],
     blend_mode: i32,
     pixels: &Arc<Pixels>,
     crop: RectI,
-) -> Option<Arc<BitmapState>> {
+) -> Option<u32> {
     // The node's own colour decides whether the per-node half-alpha divisor
     // applies; the default half-gray and opaque white have no node tint.
     let neutral =
@@ -2677,11 +2713,12 @@ fn tinted_source(
         pixels: Arc::as_ptr(pixels) as usize,
     };
     if let Some(source) = frame.tinted.get(&key) {
-        return Some(source.clone());
+        return Some(*source);
     }
     let source = Arc::new(tint_crop(pixels, crop, colors, half_alpha)?);
-    frame.tinted.insert(key, source.clone());
-    Some(source)
+    let id = scene.add_draw_source(source);
+    frame.tinted.insert(key, id);
+    Some(id)
 }
 
 /// Crop `pixels` to `crop` and scale each channel by the bilinearly
@@ -2847,96 +2884,6 @@ impl ColorRamp {
     }
 }
 
-/// Composite a cropped icon onto its quad.
-///
-/// An axis-aligned, unit-scale, whole-pixel placement maps source texels onto
-/// destination pixels one to one, so it takes the direct blit path. Every
-/// other placement keeps the inverse-mapped affine resampler.
-fn draw_icon(
-    bitmap: &mut BitmapState,
-    source: &BitmapState,
-    width: i32,
-    height: i32,
-    corners: [(f64, f64); 3],
-    opa: u8,
-    blend: NodeBlend,
-) {
-    let rect = (0, 0, width, height);
-    if let Some((x, y)) = unit_axis_aligned_origin(corners, width, height) {
-        // The unit axis-aligned placement blends with the node's operation
-        // mode, so the same kernel as the affine pass applies.
-        operate_rect(
-            bitmap,
-            x,
-            y,
-            BlitSource {
-                bitmap: source,
-                rect,
-            },
-            BlitOptions {
-                mode: blend.mode,
-                opa,
-                treat_as_opaque: false,
-                hold_alpha: false,
-                source_over: blend.source_over,
-            },
-        );
-        return;
-    }
-    affine_blit(
-        bitmap,
-        AffineBlit {
-            corners,
-            // The nearest texel of the source is sampled.
-            stretch_type: 0,
-            clear: false,
-            clear_color: [0, 0, 0, 0],
-        },
-        BlitSource {
-            bitmap: source,
-            rect,
-        },
-        BlitOptions {
-            mode: blend.mode,
-            opa,
-            treat_as_opaque: false,
-            hold_alpha: false,
-            source_over: blend.source_over,
-        },
-    );
-}
-
-/// The destination origin of a unit-scale, axis-aligned, whole-pixel
-/// placement, or `None` for a placement the affine resampler must handle.
-fn unit_axis_aligned_origin(
-    corners: [(f64, f64); 3],
-    width: i32,
-    height: i32,
-) -> Option<(i32, i32)> {
-    if width <= 0 || height <= 0 {
-        return None;
-    }
-    let [origin, right, down] = corners;
-    // The quad spans exactly its own size, runs along the axes and starts on a
-    // whole pixel.
-    if right.0 - origin.0 != f64::from(width)
-        || down.1 - origin.1 != f64::from(height)
-        || right.1 != origin.1
-        || down.0 != origin.0
-        || origin.0.fract() != 0.0
-        || origin.1.fract() != 0.0
-    {
-        return None;
-    }
-    let (x, y) = (origin.0, origin.1);
-    if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&x)
-        || !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&y)
-    {
-        return None;
-    }
-    Some((x as i32, y as i32))
-}
-
 /// Map a node point through the player's draw affine.
 fn draw_point(affine: [f64; 6], x: f64, y: f64) -> (f64, f64) {
     (
@@ -2945,15 +2892,14 @@ fn draw_point(affine: [f64; 6], x: f64, y: f64) -> (f64, f64) {
     )
 }
 
-/// Draw the fixed-size solid quad a shape node approximates to.
-fn fill_placeholder_quad_offset(
-    bitmap: &mut BitmapState,
+/// The fixed-size solid quad a shape node approximates to.
+fn fill_placeholder_quad(
     node: &MotionNode,
     color: [u8; 4],
     affine: [f64; 6],
     opacity: f64,
     offset: (i32, i32),
-) {
+) -> FillDraw {
     let matrix = node.matrix;
     let corner = |local_x: f64, local_y: f64| {
         let (x, y) = draw_point(
@@ -2963,14 +2909,17 @@ fn fill_placeholder_quad_offset(
         );
         (x + f64::from(offset.0), y + f64::from(offset.1))
     };
-    let points = [
+    let points = vec![
         corner(-32.0, -32.0),
         corner(32.0, -32.0),
         corner(32.0, 32.0),
         corner(-32.0, 32.0),
     ];
     let alpha = (f64::from(color[3]) * opacity.clamp(0.0, 1.0)) as u8;
-    crate::engine_api::raster::fill_polygon(bitmap, &points, [color[0], color[1], color[2], alpha]);
+    FillDraw {
+        points,
+        color: [color[0], color[1], color[2], alpha],
+    }
 }
 
 /// Read and decode the pixels `icon` draws from, and the sub-rectangle of them
@@ -4384,12 +4333,11 @@ mod tests {
     use super::local_matrix;
     use super::{
         BitmapState, DEFAULT_NODE_COLORS, DrawFrame, DrawSettings, MotionNode, MotionSnapshot,
-        NodeBlend, PlayerInst, RetainedValue, SOURCE_OVER, TimelineState, TjsValue,
-        build_node_tree, composite_pose, draw_icon, draw_point, evaluate_frames, inherited_parent,
-        inherited_transform, node_drawable, prime_timelines, unit_axis_aligned_origin,
+        PlayerInst, RetainedValue, TimelineState, TjsValue, build_node_tree, composite_pose,
+        draw_point, evaluate_frames, inherited_parent, inherited_transform, node_drawable,
+        prime_timelines,
     };
     use crate::engine_api::Storage;
-    use crate::engine_api::layer_ops::{AffineBlit, BlitOptions, BlitSource, affine_blit};
     use crate::natives::plugins::psb_file::container::{PsbDocument, PsbValue};
     use crate::natives::plugins::psb_file::media::fixture::{chunk, container, media_storage};
     use crate::{CompatCtx, CompatServices};
@@ -4526,17 +4474,36 @@ mod tests {
         }
     }
 
-    fn composite(player: &mut PlayerInst) -> BitmapState {
+    fn composite(scene: &mut Scene, player: &mut PlayerInst) -> BitmapState {
         let mut bitmap = BitmapState::new(800, 1080, vec![0u8; 800 * 1080 * 4]);
+        let missing = composite_into(scene, player, &mut bitmap, None, (0, 0, 800, 1080));
+        assert!(missing.is_empty(), "synthetic shapes need no texture");
+        bitmap
+    }
+
+    /// The pose of `player` composited into `bitmap`, with the storage that
+    /// serves the icon chunks.
+    ///
+    /// The scene owns the pose's sources, so it outlives the call: the
+    /// player's cache names the sources it registered.
+    fn composite_into(
+        scene: &mut Scene,
+        player: &mut PlayerInst,
+        bitmap: &mut BitmapState,
+        storage: Option<&Storage>,
+        bounds: (i32, i32, i32, i32),
+    ) -> Vec<String> {
+        let mut ops = Vec::new();
         let snapshot = player.snapshot.clone();
         let color = color_bytes(player.color.bytes);
         let affine = player.affine;
         let missing = composite_pose(
-            &mut bitmap,
+            &mut ops,
+            scene,
             &player.nodes,
             DrawFrame {
                 snapshot: snapshot.as_deref(),
-                storage: None,
+                storage,
                 settings: DrawSettings {
                     color,
                     affine,
@@ -4547,10 +4514,10 @@ mod tests {
                 missing: Vec::new(),
                 pool: None,
             },
-            (0, 0, 800, 1080),
+            bounds,
         );
-        assert!(missing.is_empty(), "synthetic shapes need no texture");
-        bitmap
+        scene.draw_ops_into(bitmap, &ops);
+        missing
     }
 
     fn alpha(bitmap: &BitmapState, x: usize, y: usize) -> u8 {
@@ -4559,29 +4526,13 @@ mod tests {
 
     /// The pose of `player` composited into a fresh target, with the storage
     /// that serves the icon chunks.
-    fn composite_with_storage(player: &mut PlayerInst, storage: &Storage) -> BitmapState {
+    fn composite_with_storage(
+        scene: &mut Scene,
+        player: &mut PlayerInst,
+        storage: &Storage,
+    ) -> BitmapState {
         let mut bitmap = BitmapState::new(800, 1080, vec![0u8; 800 * 1080 * 4]);
-        let snapshot = player.snapshot.clone();
-        let color = color_bytes(player.color.bytes);
-        let affine = player.affine;
-        let missing = composite_pose(
-            &mut bitmap,
-            &player.nodes,
-            DrawFrame {
-                snapshot: snapshot.as_deref(),
-                storage: Some(storage),
-                settings: DrawSettings {
-                    color,
-                    affine,
-                    preview: player.preview,
-                    mask_mode: player.mask_mode,
-                },
-                tinted: &mut player.tinted,
-                missing: Vec::new(),
-                pool: None,
-            },
-            (0, 0, 800, 1080),
-        );
+        let missing = composite_into(scene, player, &mut bitmap, Some(storage), (0, 0, 800, 1080));
         assert!(missing.is_empty(), "the synthetic icon needs no texture");
         bitmap
     }
@@ -4776,7 +4727,8 @@ mod tests {
         // The idle clip is one frame long; the intro reached its 120-frame
         // end. The evaluation clock is the idle timeline's own zero
         // (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:869-871`).
-        let bitmap = composite(&mut player);
+        let mut scene = Scene::default();
+        let bitmap = composite(&mut scene, &mut player);
         assert_eq!(alpha(&bitmap, 300, 300), 255, "idle t=0 shape is drawn");
         assert_eq!(alpha(&bitmap, 600, 600), 0, "the intro shape is gone");
     }
@@ -4909,44 +4861,10 @@ mod tests {
         // (`reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:238`,
         // `:396-403`).
         assert!((player.nodes[1].local.x - 100.0).abs() < 1e-9);
-        let bitmap = composite(&mut player);
+        let mut scene = Scene::default();
+        let bitmap = composite(&mut scene, &mut player);
         assert_eq!(alpha(&bitmap, 100, 100), 255);
         assert_eq!(alpha(&bitmap, 600, 600), 0);
-    }
-
-    /// A scaled placement samples the nearest texel, not a bilinear blend
-    /// (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:455-456`).
-    #[test]
-    fn a_scaled_placement_samples_the_nearest_texel() {
-        let source = BitmapState::new(
-            2,
-            2,
-            vec![
-                10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
-            ],
-        );
-        // The 2x2 source is placed on a 4x4 quad at (1, 1), so every source
-        // texel covers a 2x2 block of the destination.
-        let corners = [(1.0, 1.0), (5.0, 1.0), (1.0, 5.0)];
-        let mut bitmap = BitmapState::new(8, 8, vec![0u8; 8 * 8 * 4]);
-        draw_icon(&mut bitmap, &source, 2, 2, corners, 255, SOURCE_OVER);
-        let texel = |x: usize, y: usize| {
-            let offset = (y * 8 + x) * 4;
-            [
-                bitmap.rgba[offset],
-                bitmap.rgba[offset + 1],
-                bitmap.rgba[offset + 2],
-                bitmap.rgba[offset + 3],
-            ]
-        };
-        assert_eq!(texel(1, 1), [10, 20, 30, 255], "the first texel");
-        assert_eq!(texel(2, 1), [10, 20, 30, 255], "the first texel is 2 wide");
-        assert_eq!(texel(3, 1), [40, 50, 60, 255], "the second texel");
-        assert_eq!(texel(1, 3), [70, 80, 90, 255], "the third texel");
-        assert_eq!(texel(3, 3), [100, 110, 120, 255], "the fourth texel");
-        // The quad covers four by four pixels, so the texel next to it is
-        // untouched.
-        assert_eq!(texel(5, 1), [0, 0, 0, 0]);
     }
 
     /// A child motion exists from the player's start, so it draws its first
@@ -5981,79 +5899,6 @@ mod tests {
         assert_eq!(super::draw_point(affine, 960.0, 540.0), (1920.0, 1080.0));
     }
 
-    #[test]
-    fn a_unit_axis_aligned_placement_matches_the_affine_path_exactly() {
-        // The reference resumes every leaf with `stNearest`
-        // (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:456-472`,
-        // `:934-940`). A whole-pixel unit placement maps one source texel to
-        // one destination pixel, so the direct blit and the affine sampler
-        // must agree pixel for pixel.
-        let source = BitmapState::new(
-            2,
-            2,
-            vec![
-                10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
-            ],
-        );
-        let corners = [(2.0, 3.0), (4.0, 3.0), (2.0, 5.0)];
-        assert_eq!(unit_axis_aligned_origin(corners, 2, 2), Some((2, 3)));
-        let mut fast = BitmapState::new(6, 6, vec![0u8; 6 * 6 * 4]);
-        let mut affine = BitmapState::new(6, 6, vec![0u8; 6 * 6 * 4]);
-        draw_icon(
-            &mut fast,
-            &source,
-            2,
-            2,
-            corners,
-            255,
-            NodeBlend {
-                mode: 2,
-                source_over: true,
-            },
-        );
-        affine_blit(
-            &mut affine,
-            AffineBlit {
-                corners,
-                stretch_type: 0,
-                clear: false,
-                clear_color: [0, 0, 0, 0],
-            },
-            BlitSource {
-                bitmap: &source,
-                rect: (0, 0, 2, 2),
-            },
-            BlitOptions {
-                mode: 2,
-                opa: 255,
-                treat_as_opaque: false,
-                hold_alpha: false,
-                source_over: true,
-            },
-        );
-        assert_eq!(fast.rgba, affine.rgba);
-        let texel = |bitmap: &BitmapState, x: usize, y: usize| {
-            let offset = (y * 6 + x) * 4;
-            [
-                bitmap.rgba[offset],
-                bitmap.rgba[offset + 1],
-                bitmap.rgba[offset + 2],
-                bitmap.rgba[offset + 3],
-            ]
-        };
-        assert_eq!(texel(&fast, 2, 3), [10, 20, 30, 255]);
-        assert_eq!(texel(&fast, 3, 4), [100, 110, 120, 255]);
-        // A rotation or a fractional origin is not a whole-pixel placement.
-        assert_eq!(
-            unit_axis_aligned_origin([(2.0, 3.0), (3.0, 4.0), (1.0, 4.0)], 2, 2),
-            None
-        );
-        assert_eq!(
-            unit_axis_aligned_origin([(2.5, 3.0), (4.5, 3.0), (2.5, 5.0)], 2, 2),
-            None
-        );
-    }
-
     /// A label that several nodes share is reported once, and the lookup
     /// answers with the last node that wrote it
     /// (`reference/cpp/plugins/motionplayer/PlayerLayerQuery.cpp:101-116`,
@@ -6126,28 +5971,17 @@ mod tests {
             node.accumulated.opacity = 1.0;
             node.accumulated.blend_mode = blend_mode;
             let mut player = PlayerInst {
+                snapshot: Some(std::sync::Arc::new(snapshot.clone())),
                 nodes: vec![MotionNode::new(0, String::new()), node],
                 ..PlayerInst::default()
             };
-            let color = color_bytes(player.color.bytes);
-            let affine = player.affine;
             let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
-            let missing = composite_pose(
+            let mut scene = Scene::default();
+            let missing = composite_into(
+                &mut scene,
+                &mut player,
                 &mut bitmap,
-                &player.nodes,
-                DrawFrame {
-                    snapshot: Some(&snapshot),
-                    storage: Some(&storage),
-                    settings: DrawSettings {
-                        color,
-                        affine,
-                        preview: player.preview,
-                        mask_mode: player.mask_mode,
-                    },
-                    tinted: &mut player.tinted,
-                    missing: Vec::new(),
-                    pool: None,
-                },
+                Some(&storage),
                 (0, 0, 4, 4),
             );
             assert!(missing.is_empty());
@@ -6190,28 +6024,17 @@ mod tests {
             node.accumulated.blend_mode = blend_mode;
             node.accumulated.colors = colors;
             let mut player = PlayerInst {
+                snapshot: Some(std::sync::Arc::new(snapshot.clone())),
                 nodes: vec![MotionNode::new(0, String::new()), node],
                 ..PlayerInst::default()
             };
-            let color = color_bytes(player.color.bytes);
-            let affine = player.affine;
             let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
-            let missing = composite_pose(
+            let mut scene = Scene::default();
+            let missing = composite_into(
+                &mut scene,
+                &mut player,
                 &mut bitmap,
-                &player.nodes,
-                DrawFrame {
-                    snapshot: Some(&snapshot),
-                    storage: Some(&storage),
-                    settings: DrawSettings {
-                        color,
-                        affine,
-                        preview: player.preview,
-                        mask_mode: player.mask_mode,
-                    },
-                    tinted: &mut player.tinted,
-                    missing: Vec::new(),
-                    pool: None,
-                },
+                Some(&storage),
                 (0, 0, 4, 4),
             );
             assert!(missing.is_empty());
@@ -6247,28 +6070,17 @@ mod tests {
             node.accumulated.opacity = opacity;
             node.accumulated.blend_mode = blend_mode;
             let mut player = PlayerInst {
+                snapshot: Some(std::sync::Arc::new(snapshot.clone())),
                 nodes: vec![MotionNode::new(0, String::new()), node],
                 ..PlayerInst::default()
             };
-            let color = color_bytes(player.color.bytes);
-            let affine = player.affine;
             let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
-            let missing = composite_pose(
+            let mut scene = Scene::default();
+            let missing = composite_into(
+                &mut scene,
+                &mut player,
                 &mut bitmap,
-                &player.nodes,
-                DrawFrame {
-                    snapshot: Some(&snapshot),
-                    storage: Some(&storage),
-                    settings: DrawSettings {
-                        color,
-                        affine,
-                        preview: player.preview,
-                        mask_mode: player.mask_mode,
-                    },
-                    tinted: &mut player.tinted,
-                    missing: Vec::new(),
-                    pool: None,
-                },
+                Some(&storage),
                 (0, 0, 4, 4),
             );
             assert!(missing.is_empty());
@@ -6311,28 +6123,9 @@ mod tests {
             ..PlayerInst::default()
         };
         let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
-        let draw = |player: &mut PlayerInst, bitmap: &mut BitmapState| {
-            let snapshot = player.snapshot.clone();
-            let color = color_bytes(player.color.bytes);
-            let affine = player.affine;
-            composite_pose(
-                bitmap,
-                &player.nodes,
-                DrawFrame {
-                    snapshot: snapshot.as_deref(),
-                    storage: Some(&storage),
-                    settings: DrawSettings {
-                        color,
-                        affine,
-                        preview: player.preview,
-                        mask_mode: player.mask_mode,
-                    },
-                    tinted: &mut player.tinted,
-                    missing: Vec::new(),
-                    pool: None,
-                },
-                (0, 0, 4, 4),
-            )
+        let mut scene = Scene::default();
+        let mut draw = |player: &mut PlayerInst, bitmap: &mut BitmapState| {
+            composite_into(&mut scene, player, bitmap, Some(&storage), (0, 0, 4, 4))
         };
         draw(&mut player, &mut bitmap);
         let read = storage.read_bytes();
@@ -6368,28 +6161,18 @@ mod tests {
         node.local.src = "src/group/art".to_string();
         node.accumulated.opacity = 1.0;
         let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot)),
             nodes: vec![MotionNode::new(0, String::new()), node],
             ..PlayerInst::default()
         };
         player.color.bytes = [1.0, 128.0 / 255.0, 64.0 / 255.0, 1.0];
-        let color = color_bytes(player.color.bytes);
         let mut bitmap = BitmapState::new(4, 4, vec![0u8; 4 * 4 * 4]);
-        let missing = composite_pose(
+        let mut scene = Scene::default();
+        let missing = composite_into(
+            &mut scene,
+            &mut player,
             &mut bitmap,
-            &player.nodes,
-            DrawFrame {
-                snapshot: Some(&snapshot),
-                storage: Some(&storage),
-                settings: DrawSettings {
-                    color,
-                    affine: player.affine,
-                    preview: player.preview,
-                    mask_mode: player.mask_mode,
-                },
-                tinted: &mut player.tinted,
-                missing: Vec::new(),
-                pool: None,
-            },
+            Some(&storage),
             (0, 0, 4, 4),
         );
         assert!(missing.is_empty());
@@ -6401,22 +6184,11 @@ mod tests {
             .next()
             .expect("the tinted source is cached")
             .clone();
-        let missing = composite_pose(
+        let missing = composite_into(
+            &mut scene,
+            &mut player,
             &mut bitmap,
-            &player.nodes,
-            DrawFrame {
-                snapshot: Some(&snapshot),
-                storage: Some(&storage),
-                settings: DrawSettings {
-                    color,
-                    affine: player.affine,
-                    preview: player.preview,
-                    mask_mode: player.mask_mode,
-                },
-                tinted: &mut player.tinted,
-                missing: Vec::new(),
-                pool: None,
-            },
+            Some(&storage),
             (0, 0, 4, 4),
         );
         assert!(missing.is_empty());
@@ -6426,7 +6198,7 @@ mod tests {
             .values()
             .next()
             .expect("the tinted source is cached");
-        assert!(std::sync::Arc::ptr_eq(&cached, reused));
+        assert_eq!(cached, *reused, "the second draw reuses the source");
         player.clear_source_cache();
         assert!(player.tinted.is_empty(), "the cache has a clear path");
     }
@@ -6576,7 +6348,8 @@ mod tests {
         player.play("", 0, &ctx).expect("play the keyed clip");
         player.update_layers();
         assert_eq!(player.nodes[1].label, "back_white");
-        let bitmap = composite(&mut player);
+        let mut scene = Scene::default();
+        let bitmap = composite(&mut scene, &mut player);
         assert_eq!(alpha(&bitmap, 200, 100), 255, "back_white is drawn");
         assert_eq!(alpha(&bitmap, 100, 100), 0, "back_black is not");
         // The bound key follows a named play call.
@@ -6775,7 +6548,8 @@ mod tests {
             vec![shape_layer("outer", 400, 400)],
         );
         let mut player = group_player(&snapshot);
-        let bitmap = composite(&mut player);
+        let mut scene = Scene::default();
+        let bitmap = composite(&mut scene, &mut player);
         assert_eq!(
             alpha(&bitmap, 100, 100),
             128,
@@ -6849,7 +6623,8 @@ mod tests {
             "group_clip.psb",
         );
         let mut player = group_player(&snapshot);
-        let bitmap = composite(&mut player);
+        let mut scene = Scene::default();
+        let bitmap = composite(&mut scene, &mut player);
         assert_eq!(
             alpha(&bitmap, 100, 100),
             128,
@@ -7082,23 +6857,12 @@ mod tests {
             player.nodes = build_node_tree(&snapshot, snapshot.clip("main"));
             player.update_layers();
             let mut bitmap = BitmapState::new(800, 1080, vec![0u8; 800 * 1080 * 4]);
-            let color = color_bytes(player.color.bytes);
-            let missing = composite_pose(
+            let mut scene = Scene::default();
+            let missing = composite_into(
+                &mut scene,
+                &mut player,
                 &mut bitmap,
-                &player.nodes,
-                DrawFrame {
-                    snapshot: player.snapshot.as_deref(),
-                    storage: Some(&storage),
-                    settings: DrawSettings {
-                        color,
-                        affine: player.affine,
-                        preview: player.preview,
-                        mask_mode,
-                    },
-                    tinted: &mut player.tinted,
-                    missing: Vec::new(),
-                    pool: None,
-                },
+                Some(&storage),
                 (0, 0, 800, 1080),
             );
             assert!(missing.is_empty());
@@ -7160,7 +6924,8 @@ mod tests {
         prime_timelines(&snapshot, &mut player.timelines);
         player.nodes = build_node_tree(&snapshot, snapshot.clip("intro"));
         player.update_layers();
-        let bitmap = composite_with_storage(&mut player, &storage);
+        let mut scene = Scene::default();
+        let bitmap = composite_with_storage(&mut scene, &mut player, &storage);
         let offset = (100 * 800 + 100) * 4;
         assert_eq!(
             &bitmap.rgba[offset..offset + 4],
@@ -7189,7 +6954,8 @@ mod tests {
         prime_timelines(&snapshot, &mut player.timelines);
         player.nodes = build_node_tree(&snapshot, snapshot.clip("intro"));
         player.update_layers();
-        let bitmap = composite_with_storage(&mut player, &storage);
+        let mut scene = Scene::default();
+        let bitmap = composite_with_storage(&mut scene, &mut player, &storage);
         let offset = (100 * 800 + 100) * 4;
         assert_eq!(
             &bitmap.rgba[offset..offset + 4],
