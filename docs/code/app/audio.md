@@ -41,9 +41,12 @@ first backend that decodes it:
 On the desktop the FFmpeg backend comes first: it reconstructs the SBR band
 of an AAC track with the SBR extension, so such a track decodes at the rate
 the container declares — the built-in decoder reports that track instead of
-playing it at the wrong speed. The FFmpeg path **materializes the whole
-track**, so playback seeks by frame without decoding again; the spec, the
-loop information and the frame seek stay intact.
+playing it at the wrong speed. The FFmpeg path **streams**: it opens the
+container and reads the header when the sound is opened, and the frames are
+pulled as playback asks for them, so the open waits on no decoder. Playback
+still seeks by frame — the seek reopens the container and drops the frames
+before the target — and the spec, the loop information and the frame seek
+stay intact.
 
 The built-in decoder stays in the chain because it **streams**: the container
 is probed when the sound is opened (sample rate, channels, total frames) and

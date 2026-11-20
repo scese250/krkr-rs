@@ -20,8 +20,9 @@
 //! * **Audio** — symphonia whole-file/streaming decode (wav, pcm, ogg,
 //!   vorbis, flac, mp3, mp4/aac) plus the Ogg Opus adapter, with header-only
 //!   probing and an explicit caller-owned [`AudioDecoderState`]. The desktop
-//!   build links FFmpeg as well, and [`decode_audio_ffmpeg`] decodes a whole
-//!   track with it — the desktop build's first choice, ahead of the built-in
+//!   build links FFmpeg as well, and [`open_audio_ffmpeg`] / [`read_audio_ffmpeg`]
+//!   / [`seek_audio_ffmpeg`] stream a track with it — the desktop build's
+//!   first choice, ahead of the built-in
 //!   decoder, which has no SBR synthesis and therefore reports an AAC track
 //!   with the SBR extension instead of decoding it at the rate the
 //!   container declares. The Android build links no FFmpeg; there the
@@ -59,7 +60,9 @@ pub mod yuv;
 
 pub use audio::{AudioDecoderState, decode_audio, open_audio, probe_audio, read_audio, seek_audio};
 #[cfg(feature = "video-ffmpeg")]
-pub use audio_ffmpeg::decode_audio_ffmpeg;
+pub use audio_ffmpeg::{
+    FfmpegAudioState, decode_audio_ffmpeg, open_audio_ffmpeg, read_audio_ffmpeg, seek_audio_ffmpeg,
+};
 pub use image_decode::{decode_image, decode_index_plane, probe_image};
 pub use image_encode::encode_image;
 #[cfg(feature = "video-mediacodec")]

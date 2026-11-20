@@ -7,7 +7,7 @@ use media::{Media, decode_audio, open_audio, probe_audio, read_audio, seek_audio
 use testkit::tiny_wav_mono;
 
 #[cfg(feature = "video-ffmpeg")]
-use media::decode_audio_ffmpeg;
+use media::{decode_audio_ffmpeg, open_audio_ffmpeg, read_audio_ffmpeg, seek_audio_ffmpeg};
 
 /// The committed OGG Vorbis fixture: an `ffmpeg -c:a libvorbis` encode of a
 /// 440 Hz sine tone, 0.2 s long, 44.1 kHz mono
@@ -363,6 +363,102 @@ fn the_ffmpeg_backend_decodes_a_container_the_builtin_decoder_has_no_reader_for(
     assert_eq!(decoded.spec.sample_rate, 8_000);
     assert_eq!(decoded.spec.channels, 1);
     assert_eq!(decoded.frame_count(), 800);
+}
+
+/// The FFmpeg backend streams the track: the open reads the container and
+/// its header, and the samples it hands out are the ones the whole-file
+/// decode produces.
+///
+/// The reference opens the container and reads its header at the open
+/// (`reference/krkr2/cpp/core/sound/win32/WaveImpl.cpp:3036,3043`), and its
+/// FFmpeg decoder pulls the packets on demand
+/// (`reference/krkr2/cpp/core/sound/FFWaveDecoder.cpp:100,277`).
+#[cfg(feature = "video-ffmpeg")]
+#[test]
+fn the_ffmpeg_backend_streams_the_samples_the_whole_file_decode_produces() {
+    let media = Media::new();
+    let whole = decode_audio_ffmpeg(&media, Arc::from(OGG_SINE), Some("tone.ogg"))
+        .expect("the ffmpeg backend decodes the track");
+    let (spec, mut state) =
+        open_audio_ffmpeg(&media, Arc::from(OGG_SINE), Some("tone.ogg")).expect("open the stream");
+    assert_eq!(spec.sample_rate, whole.spec.sample_rate);
+    assert_eq!(spec.channels, whole.spec.channels);
+
+    let mut all = Vec::new();
+    let mut chunk = vec![0.0f32; 256];
+    loop {
+        match read_audio_ffmpeg(&media, &mut state, &mut chunk) {
+            Ok(0) => break,
+            Ok(written) => all.extend_from_slice(&chunk[..written]),
+            Err(MediaError::EndOfStream) => break,
+            Err(error) => panic!("stream read failed: {error}"),
+        }
+    }
+    assert_eq!(all.len(), whole.interleaved.len());
+    assert!(
+        all.iter()
+            .zip(whole.interleaved.iter())
+            .all(|(streamed, whole)| streamed == whole),
+        "the streamed samples are the ones the whole-file decode produces"
+    );
+}
+
+/// The FFmpeg backend's seek lands on the frame the whole-file decode
+/// produces there.
+///
+/// The reference's decoder repositions the stream and the samples are pulled
+/// from there
+/// (`reference/krkr2/cpp/core/sound/FFWaveDecoder.cpp:100,277`).
+#[cfg(feature = "video-ffmpeg")]
+#[test]
+fn the_ffmpeg_backend_seeks_to_the_frame_the_whole_file_decode_produces() {
+    let media = Media::new();
+    let whole = decode_audio_ffmpeg(&media, Arc::from(OGG_SINE), Some("tone.ogg"))
+        .expect("the ffmpeg backend decodes the track");
+    let (_spec, mut state) =
+        open_audio_ffmpeg(&media, Arc::from(OGG_SINE), Some("tone.ogg")).expect("open the stream");
+    let mut chunk = vec![0.0f32; 256];
+    read_audio_ffmpeg(&media, &mut state, &mut chunk).expect("the first read");
+
+    seek_audio_ffmpeg(&media, &mut state, 1_000).expect("seek");
+    let mut all = Vec::new();
+    loop {
+        match read_audio_ffmpeg(&media, &mut state, &mut chunk) {
+            Ok(0) => break,
+            Ok(written) => all.extend_from_slice(&chunk[..written]),
+            Err(MediaError::EndOfStream) => break,
+            Err(error) => panic!("the read after the seek failed: {error}"),
+        }
+    }
+    // The fixture is mono, so one frame is one sample.
+    let expected = &whole.interleaved[1_000..];
+    assert_eq!(all.len(), expected.len());
+    assert!(
+        all.iter()
+            .zip(expected.iter())
+            .all(|(read, expected)| read == expected),
+        "the samples after the seek are the ones the whole-file decode produces"
+    );
+}
+
+/// The FFmpeg backend's open reports the length the container declares.
+///
+/// The container's own length is the header's number, so the track's
+/// duration is known without decoding the track
+/// (`reference/krkr2/cpp/core/sound/win32/WaveImpl.cpp:3036,3043`).
+#[cfg(feature = "video-ffmpeg")]
+#[test]
+fn the_ffmpeg_backend_reports_the_length_the_container_declares() {
+    let media = Media::new();
+    let (spec, _state) = open_audio_ffmpeg(&media, Arc::from(au_tone(8_000, 800)), Some("tone.au"))
+        .expect("open the stream");
+    assert_eq!(spec.sample_rate, 8_000);
+    assert_eq!(spec.channels, 1);
+    assert_eq!(
+        spec.total_frames,
+        Some(800),
+        "the container declares the track's length"
+    );
 }
 
 /// A Sun/NeXT AU file with 16-bit linear PCM.

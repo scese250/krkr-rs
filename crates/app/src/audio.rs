@@ -30,12 +30,11 @@
 //! track would play at the wrong speed. FFmpeg's AAC decoder reconstructs
 //! the SBR band, so such a track decodes at the rate the container declares.
 //!
-//! The built-in decoder stays in the chain because it **streams**: the
-//! container is probed at the open and the samples are decoded as playback
-//! reads them, so a track the FFmpeg backend cannot read still plays without
-//! holding the whole track in memory. The FFmpeg path materializes the whole
-//! track, which costs the memory a whole-file decode costs and is paid once
-//! per sound.
+//! The built-in decoder stays in the chain because it reads the containers
+//! the FFmpeg backend cannot. Both backends **stream**: the container is
+//! opened at the open and the samples are decoded as playback reads them,
+//! so a track is never held in memory as a whole and the open never waits on
+//! the decoder.
 //!
 //! When every backend in the chain fails, the error names each of them and
 //! the reason it gave, so neither is lost.
@@ -43,9 +42,9 @@
 //! # The spec the script sees
 //!
 //! The spec is the **container's**, whichever backend decodes the samples.
-//! The desktop path probes the bytes with the built-in probe before it
-//! decodes them with FFmpeg, so the rate, the channel count and the frame
-//! count the container states are the ones the script reads (`Frequency`,
+//! The desktop path probes the bytes with the built-in probe before it opens
+//! them with FFmpeg, so the rate, the channel count and the frame count the
+//! container states are the ones the script reads (`Frequency`,
 //! `Channels`, `TotalTime`) — the same values the built-in path reported.
 //! The samples are FFmpeg's.
 //!
@@ -116,6 +115,9 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+use std::sync::{Mutex, MutexGuard};
+
 use api::error::{AudioError, MediaError};
 use api::media::AudioSpec;
 use compat::{
@@ -127,12 +129,12 @@ use media::{AudioDecoderState, Media, open_audio, read_audio, seek_audio};
 use platform::{AudioDevice, AudioHealth, AudioOutputState, PlatformError};
 use vm::VmHost;
 
-#[cfg(target_os = "linux")]
-use media::decode_audio_ffmpeg;
 #[cfg(target_os = "android")]
 use media::decode_audio_mediacodec;
 #[cfg(target_os = "linux")]
 use media::probe_audio;
+#[cfg(target_os = "linux")]
+use media::{FfmpegAudioState, open_audio_ffmpeg, read_audio_ffmpeg, seek_audio_ffmpeg};
 
 use crate::GameError;
 use crate::startup::StartupStats;
@@ -246,26 +248,26 @@ impl AudioEpisodes {
     }
 }
 
-/// One game audio stream over the bottom decoder.
+/// One game audio stream over a bottom decoder.
 ///
-/// `open_audio` probes the container without decoding; this value decodes and
-/// reseeks on demand as [`SoundSource::frame`] drives it.
-struct MediaAudioStream {
+/// The decoder opens the container without decoding the track; this value
+/// decodes and reseeks on demand as [`SoundSource::frame`] drives it.
+struct MediaAudioStream<D: StreamDecoder> {
     /// The stateless decode backend.
     media: Media,
     /// The decoder state this stream owns across reads and seeks.
-    state: AudioDecoderState,
+    state: D::State,
     /// The container format reported at open.
     spec: AudioSpec,
 }
 
-impl AudioStream for MediaAudioStream {
+impl<D: StreamDecoder> AudioStream for MediaAudioStream<D> {
     fn spec(&self) -> AudioSpec {
         self.spec
     }
 
     fn read(&mut self, out: &mut [f32]) -> Result<usize, SoundError> {
-        match read_audio(&self.media, &mut self.state, out) {
+        match D::read(&self.media, &mut self.state, out) {
             Ok(written) => Ok(written),
             // The decoder reports the end as `EndOfStream`; a zero-sample
             // read is the end-of-window signal.
@@ -277,10 +279,100 @@ impl AudioStream for MediaAudioStream {
     }
 
     fn seek(&mut self, frame: u64) -> Result<(), SoundError> {
-        seek_audio(&self.media, &mut self.state, frame).map_err(|error| SoundError::Decode {
+        D::seek(&self.media, &mut self.state, frame).map_err(|error| SoundError::Decode {
             message: error.to_string(),
         })
     }
+}
+
+/// One streaming decoder the app opens, reads and seeks.
+///
+/// The built-in decoder and the FFmpeg backend expose the same three calls;
+/// this trait is the shape both are wrapped in, so the app has one stream
+/// type instead of one per backend.
+trait StreamDecoder {
+    /// The decoder state the backend owns across the calls.
+    type State: Send + Sync;
+
+    /// Opens the container and returns its format and the decoder state.
+    fn open(
+        media: &Media,
+        bytes: Arc<[u8]>,
+        hint: Option<&str>,
+    ) -> Result<(AudioSpec, Self::State), MediaError>;
+
+    /// Decodes the next samples into `out`, returning how many were written.
+    fn read(media: &Media, state: &mut Self::State, out: &mut [f32]) -> Result<usize, MediaError>;
+
+    /// Seeks the stream so the next read starts at `frame`.
+    fn seek(media: &Media, state: &mut Self::State, frame: u64) -> Result<(), MediaError>;
+}
+
+/// The built-in decoder.
+struct BuiltinDecoder;
+
+impl StreamDecoder for BuiltinDecoder {
+    type State = AudioDecoderState;
+
+    fn open(
+        media: &Media,
+        bytes: Arc<[u8]>,
+        hint: Option<&str>,
+    ) -> Result<(AudioSpec, Self::State), MediaError> {
+        open_audio(media, bytes, hint)
+    }
+
+    fn read(media: &Media, state: &mut Self::State, out: &mut [f32]) -> Result<usize, MediaError> {
+        read_audio(media, state, out)
+    }
+
+    fn seek(media: &Media, state: &mut Self::State, frame: u64) -> Result<(), MediaError> {
+        seek_audio(media, state, frame)
+    }
+}
+
+/// The FFmpeg backend.
+#[cfg(target_os = "linux")]
+struct FfmpegDecoder;
+
+#[cfg(target_os = "linux")]
+impl StreamDecoder for FfmpegDecoder {
+    /// The FFmpeg contexts are not shareable on their own, so the decoder
+    /// state travels behind a lock.
+    type State = Mutex<FfmpegAudioState>;
+
+    fn open(
+        media: &Media,
+        bytes: Arc<[u8]>,
+        hint: Option<&str>,
+    ) -> Result<(AudioSpec, Self::State), MediaError> {
+        let (spec, state) = open_audio_ffmpeg(media, bytes, hint)?;
+        Ok((spec, Mutex::new(state)))
+    }
+
+    fn read(media: &Media, state: &mut Self::State, out: &mut [f32]) -> Result<usize, MediaError> {
+        let mut guard = lock_ffmpeg(state)?;
+        read_audio_ffmpeg(media, &mut guard, out)
+    }
+
+    fn seek(media: &Media, state: &mut Self::State, frame: u64) -> Result<(), MediaError> {
+        let mut guard = lock_ffmpeg(state)?;
+        seek_audio_ffmpeg(media, &mut guard, frame)
+    }
+}
+
+/// Locks the FFmpeg decoder state.
+///
+/// A poisoned lock means a thread panicked while it was held; the state is
+/// reported rather than recovered from, so a decode that failed is never
+/// mistaken for a decode that worked.
+#[cfg(target_os = "linux")]
+fn lock_ffmpeg(
+    state: &Mutex<FfmpegAudioState>,
+) -> Result<MutexGuard<'_, FfmpegAudioState>, MediaError> {
+    state.lock().map_err(|error| MediaError::InvalidState {
+        message: format!("the audio decoder state is poisoned: {error}"),
+    })
 }
 
 /// One decode attempt in the chain the audio decoder walks.
@@ -304,9 +396,8 @@ type DecodeFn =
 /// The FFmpeg backend comes first: it decodes the tracks the built-in
 /// decoder cannot (an AAC track with the SBR extension, whose decoder has
 /// no SBR synthesis) and it decodes them at the rate the container declares.
-/// The built-in decoder is the fallback: it streams, so a track the FFmpeg
-/// backend cannot read still plays without holding the whole track in
-/// memory.
+/// The built-in decoder is the fallback: it reads the containers the FFmpeg
+/// backend cannot.
 #[cfg(target_os = "linux")]
 fn decode_attempts() -> Vec<DecodeAttempt> {
     vec![
@@ -371,7 +462,7 @@ fn decode_with_attempts(
 
 /// Decodes a track with the built-in decoder, streaming it.
 ///
-/// The container is probed at the open and the samples are decoded as
+/// The container is opened at the open and the samples are decoded as
 /// playback reads them, so the track is never held in memory as a whole.
 fn decode_with_builtin(
     media: &Media,
@@ -379,8 +470,9 @@ fn decode_with_builtin(
     hint: Option<&str>,
     loops: Option<LoopInfo>,
 ) -> Result<Arc<SoundSource>, String> {
-    let (spec, state) = open_audio(media, bytes, hint).map_err(|error| error.to_string())?;
-    let stream = MediaAudioStream {
+    let (spec, state) =
+        BuiltinDecoder::open(media, bytes, hint).map_err(|error| error.to_string())?;
+    let stream = MediaAudioStream::<BuiltinDecoder> {
         media: *media,
         state,
         spec,
@@ -398,8 +490,9 @@ fn decode_with_builtin(
 /// wrong speed. FFmpeg's AAC decoder reconstructs the SBR band, so such a
 /// track decodes at the rate the container declares.
 ///
-/// The whole track is materialized: the source holds every decoded sample,
-/// so playback seeks by frame without decoding again.
+/// The track is streamed: the container is opened at the open and the samples
+/// are decoded as playback reads them, so the open never waits on the
+/// decoder and the track is never held in memory as a whole.
 #[cfg(target_os = "linux")]
 fn decode_with_ffmpeg(
     media: &Media,
@@ -412,15 +505,21 @@ fn decode_with_ffmpeg(
     // `TotalTime` identical to the built-in path when the container declares
     // a different frame count than the decoder produces (AAC priming).
     let probed = probe_audio(media, &bytes, hint).ok();
-    let mut decoded = decode_audio_ffmpeg(media, bytes, hint).map_err(|error| error.to_string())?;
+    let (mut spec, state) =
+        FfmpegDecoder::open(media, bytes, hint).map_err(|error| error.to_string())?;
     if let Some(probed) = probed
-        && let Some(audio) = Arc::get_mut(&mut decoded)
-        && probed.sample_rate == audio.spec.sample_rate
-        && probed.channels == audio.spec.channels
+        && probed.sample_rate == spec.sample_rate
+        && probed.channels == spec.channels
+        && let Some(frames) = probed.total_frames
     {
-        audio.spec.total_frames = probed.total_frames;
+        spec.total_frames = Some(frames);
     }
-    SoundSource::with_loops(decoded, loops)
+    let stream = MediaAudioStream::<FfmpegDecoder> {
+        media: *media,
+        state,
+        spec,
+    };
+    SoundSource::streaming(spec, Box::new(stream), loops)
         .map(Arc::new)
         .map_err(|error| error.to_string())
 }
@@ -818,17 +917,17 @@ mod tests {
         let source = decoder(&au_tone(8_000, 800), None, Some("tone.au"))
             .expect("the ffmpeg backend decodes the track");
         assert!(
-            !source.is_streaming(),
-            "the ffmpeg backend materializes the whole track"
+            source.is_streaming(),
+            "the ffmpeg backend streams the track"
         );
         assert_eq!(source.sample_rate(), 8_000);
         assert_eq!(source.channels(), 1);
         assert_eq!(source.frames(), 800);
     }
 
-    /// The desktop chain decodes with the FFmpeg backend first, so a track
-    /// both backends can read comes back materialized: the FFmpeg path holds
-    /// every decoded sample, while the built-in decoder streams the track.
+    /// The desktop chain decodes with the FFmpeg backend first, and the
+    /// backend streams the track: the container is opened at the open and
+    /// the samples are decoded as playback reads them.
     #[test]
     #[cfg(target_os = "linux")]
     fn the_desktop_chain_decodes_an_ogg_track_with_the_ffmpeg_backend() {
@@ -837,8 +936,8 @@ mod tests {
         let source = decoder(OGG_SINE, None, Some("tone.ogg"))
             .expect("the ffmpeg backend decodes the track");
         assert!(
-            !source.is_streaming(),
-            "the ffmpeg backend materializes the whole track"
+            source.is_streaming(),
+            "the ffmpeg backend streams the track"
         );
         assert_eq!(
             source.sample_rate(),
@@ -857,7 +956,7 @@ mod tests {
         );
     }
 
-    /// The desktop path decodes the samples with FFmpeg, but the spec the
+    /// The desktop path streams the samples with FFmpeg, but the spec the
     /// script sees is the container's: the frame count is the one the
     /// container states, not the number of samples the decoder produced.
     ///
@@ -894,6 +993,40 @@ mod tests {
             source.frames(),
             raw.frame_count(),
             "the decoder's own frame count is not the container's"
+        );
+    }
+
+    /// The desktop path streams the samples with FFmpeg, and the samples it
+    /// plays are the ones the whole-file decode produces: it is the same
+    /// decoder, only the moment the samples are produced differs.
+    ///
+    /// The reference opens the container and reads its header at the open
+    /// (`reference/krkr2/cpp/core/sound/win32/WaveImpl.cpp:3036,3043`), and
+    /// its FFmpeg decoder pulls the packets on demand
+    /// (`reference/krkr2/cpp/core/sound/FFWaveDecoder.cpp:100,277`).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_ffmpeg_path_streams_the_samples_the_whole_file_decode_produces() {
+        let media = Media::new();
+        let whole = decode_audio_ffmpeg(&media, Arc::from(OGG_SINE), Some("tone.ogg"))
+            .expect("the ffmpeg backend decodes the track");
+        let source = decode_with_ffmpeg(&media, Arc::from(OGG_SINE), Some("tone.ogg"), None)
+            .expect("the ffmpeg backend opens the track");
+        assert!(
+            source.is_streaming(),
+            "the ffmpeg backend streams the track"
+        );
+        let streamed = source
+            .decode_entire()
+            .expect("the stream decodes the whole track");
+        assert_eq!(streamed.interleaved.len(), whole.interleaved.len());
+        assert!(
+            streamed
+                .interleaved
+                .iter()
+                .zip(whole.interleaved.iter())
+                .all(|(streamed, whole)| streamed == whole),
+            "the streamed samples are the ones the whole-file decode produces"
         );
     }
 
