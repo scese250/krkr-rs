@@ -85,3 +85,12 @@ ffmpeg-next = { version = "9", default-features = false, features = [
 lto = "thin"
 strip = "symbols"
 codegen-units = 1
+
+# The Android library is built with its own profile, so the desktop release
+# profile — the one the performance work measures — stays exactly as it is.
+# It inherits the release profile and changes one thing: the whole program is
+# optimized as a single module instead of per crate, which is the largest
+# size-only lever the linker offers. It changes no behaviour and no pixel.
+[profile.android-release]
+inherits = "release"
+lto = "fat"

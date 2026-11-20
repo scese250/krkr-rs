@@ -51,6 +51,11 @@
 # `strip = "symbols"`, `codegen-units = 1`) produces a library in the tens of
 # megabytes. `--debug` exists only for on-device debugging with a debugger
 # attached.
+#
+# The release build uses the workspace's `android-release` profile, not
+# `release`: that profile inherits the release profile and adds the size-only
+# settings, so the desktop release profile — the one the performance work
+# measures — is left exactly as it is.
 set -euo pipefail
 
 # --- configuration ----------------------------------------------------------
@@ -79,8 +84,11 @@ JNI_LIBS="$ROOT/android/app/src/main/jniLibs/$ABI"
 
 NDK="${ANDROID_NDK_HOME:-}"
 MODE="build"
-# Release unless `--debug` is given; see the usage note above for why.
-PROFILE="release"
+# Release unless `--debug` is given; see the usage note above for why. The
+# release build uses the workspace's `android-release` profile: it inherits the
+# release profile and turns on the size-only settings, and the desktop release
+# profile is not touched.
+PROFILE="android-release"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -93,10 +101,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# cargo's profile flag and the output directory it implies.
+# cargo's profile flag and the output directory it implies. A custom profile
+# keeps its own name in the output directory, so the library is found under
+# `target/<triple>/android-release/`.
 CARGO_PROFILE_ARGS=()
-if [[ "$PROFILE" == "release" ]]; then
-    CARGO_PROFILE_ARGS+=(--release)
+if [[ "$PROFILE" == "android-release" ]]; then
+    CARGO_PROFILE_ARGS+=(--profile "$PROFILE")
 fi
 
 if [[ -z "$NDK" ]]; then
