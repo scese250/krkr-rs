@@ -1620,12 +1620,19 @@ an allowlist exemption.
   word shape.
 * **The references into `docs.old/` are known-unreachable and stay.** The
   superseded design record and the read-only audits are not part of this
-  repository, so every reference to that directory resolves to nothing: 141
-  mentions across 59 tracked Markdown files, and 32 more in production
+  repository, so every reference to that directory resolves to nothing: 183
+  mentions across 50 tracked Markdown files, and 13 more in production
   comments (Rust, Kotlin, Gradle, the manifest, CI). That is accepted: the
   directory is obsolete and untracked, and the references are the record of
   where a statement came from. Do not spend an audit on them, and do not
   reword a production comment because of one.
+
+  The exception is a pointer to a page that **never existed in this
+  repository's history** - `docs.old/android.md` was one, and it was
+  referenced 38 times. A pointer to a file that was never there is not a
+  record of provenance; it is a broken link that reads as one. Those are
+  rewritten to name the page that holds the material now, or the sentence is
+  rewritten to state what is true.
 * **L2's blend kernels are keyed by the script's operation-mode numbers.**
   `crates/engine/src/layer_ops.rs` holds a `ModeKernel` per mode whose
   discriminants are the numbers the script reads and writes, and the mapping
