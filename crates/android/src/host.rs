@@ -92,7 +92,7 @@ impl AndroidHost {
 
     /// Records a fatal error for the state file and ends the loop.
     fn fail(&mut self, message: String) -> Flow {
-        log::error!("{message}");
+        log::error!("android.host: {message}");
         self.outcome.fail(message);
         Flow::Exit
     }
@@ -385,7 +385,7 @@ pub(crate) fn run_loop(
                 MainEvent::SaveState { .. } => {
                     state::write_state(state::State::Running, None);
                 }
-                MainEvent::LowMemory => log::warn!("the system reported low memory"),
+                MainEvent::LowMemory => log::warn!("android.host: the system reported low memory"),
                 MainEvent::InputAvailable => {
                     let input_started = Instant::now();
                     translate_input(&app, &mut handler);
@@ -448,12 +448,15 @@ fn create_window(app: &AndroidApp) -> Result<PlatformWindow, PlatformError> {
         Some(dpi) => match i32::try_from(dpi) {
             Ok(dpi) => dpi,
             Err(_) => {
-                log::warn!("display density {dpi} does not fit in i32; using the 160 dpi baseline");
+                log::warn!(
+                    "android.host: display density {dpi} does not fit in i32; \
+                     using the 160 dpi baseline"
+                );
                 160
             }
         },
         None => {
-            log::warn!("the display reported no density; using the 160 dpi baseline");
+            log::warn!("android.host: the display reported no density; using the 160 dpi baseline");
             160
         }
     };

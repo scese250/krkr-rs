@@ -783,7 +783,7 @@ impl Drop for StreamSource {
             self.shared.work_ready.notify_all();
             self.shared.data_ready.notify_all();
             if worker.join().is_err() {
-                log::warn!("sound: the audio decode thread stopped unexpectedly");
+                log::warn!("engine.audio: the audio decode thread stopped unexpectedly");
             }
         }
     }

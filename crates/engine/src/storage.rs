@@ -201,8 +201,8 @@ impl ArchiveImage {
             });
         if let Err(error) = worker {
             log::warn!(
-                "the archive image of {} is loaded on the mounting thread: {error}",
-                path.display()
+                "engine.storage: the archive image of {} is loaded on the mounting thread: {error}",
+                archive_name(path)
             );
             let started = Instant::now();
             let result = load_archive_image(fs, file, path, len);
@@ -217,8 +217,8 @@ impl ArchiveImage {
         *state = match result {
             Ok(image) => {
                 log::info!(
-                    "the archive image of {} is loaded ({} bytes in {:.1} ms)",
-                    path.display(),
+                    "engine.storage: the archive image of {} is loaded bytes={} load_ms={:.1}",
+                    archive_name(path),
                     image.len(),
                     elapsed.as_secs_f64() * 1000.0
                 );
@@ -226,8 +226,8 @@ impl ArchiveImage {
             }
             Err(error) => {
                 log::warn!(
-                    "the archive image of {} could not be read: {error}",
-                    path.display()
+                    "engine.storage: the archive image of {} could not be read: {error}",
+                    archive_name(path)
                 );
                 ImageState::Failed(error)
             }
@@ -1764,7 +1764,7 @@ fn stop_read_workers(shared: &PoolShared, workers: Vec<JoinHandle<()>>) {
     shared.wake.notify_all();
     for worker in workers {
         if worker.join().is_err() {
-            log::warn!("engine: a storage read worker stopped with a panic");
+            log::warn!("engine.storage: a storage read worker stopped with a panic");
         }
     }
 }
@@ -2016,7 +2016,10 @@ impl Storage {
         let mut storage = Self::with_base_dir(fs, base_dir.into(), options.preload_archives)?;
         for path in archives {
             if let Err(error) = storage.mount_archive(path.as_ref()) {
-                log::warn!("skipping archive {}: {error}", path.as_ref().display());
+                log::warn!(
+                    "engine.storage: skipping archive {}: {error}",
+                    archive_name(path.as_ref())
+                );
             }
         }
         Ok(storage)
@@ -2169,7 +2172,11 @@ impl Storage {
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
-        log::info!("opened {} ({} entries)", path.display(), archive.len());
+        log::info!(
+            "engine.storage: opened {} entries={}",
+            archive_name(&path),
+            archive.len()
+        );
         self.archives.push(MountedArchive {
             path,
             file_name,
@@ -2349,7 +2356,7 @@ impl Storage {
                         // The pool refused the read: the entry is read on the
                         // calling thread, and the refusal is reported.
                         log::warn!(
-                            "storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread"
+                            "engine.storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread"
                         );
                         let payload = FileSystemReader.read(&plan.work)?;
                         return Ok(Some(StorageEntry::File {
@@ -2473,7 +2480,7 @@ impl Storage {
                         // The pool refused the read: the entry is read on the
                         // calling thread, and the refusal is reported.
                         log::warn!(
-                            "storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread"
+                            "engine.storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread"
                         );
                         return Ok(None);
                     }
@@ -2523,7 +2530,7 @@ impl Storage {
                     // The name does not resolve: the read that follows
                     // reports the failure, and the shared read skips it.
                     log::debug!(
-                        "storage: {name:?} could not be resolved for a shared read: {error}"
+                        "engine.storage: {name:?} could not be resolved for a shared read: {error}"
                     );
                     continue;
                 }
@@ -2595,7 +2602,7 @@ impl Storage {
                     // The pool refused the read: the entry is read on the
                     // calling thread, and the refusal is reported.
                     log::warn!(
-                        "storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread"
+                        "engine.storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread"
                     );
                 }
             }
@@ -2745,11 +2752,11 @@ impl Storage {
                 self.resolution_cache.borrow_mut().probes.misses += 1;
                 if trace.enabled {
                     log::debug!(
-                        "storage miss {name:?}: {}",
+                        "engine.storage: miss {name:?}: {}",
                         trace.render_short(MISS_LOG_HEAD_CHARS)
                     );
                     if log::log_enabled!(log::Level::Trace) {
-                        log::trace!("storage miss {name:?}: {}", trace.render());
+                        log::trace!("engine.storage: miss {name:?}: {}", trace.render());
                     }
                 }
             }
@@ -3877,7 +3884,8 @@ fn discover_archives_inner(
     Ok(())
 }
 
-/// The lowercased file name used as the primary archive-discovery sort key.
+/// The lowercased file name of an archive: the discovery sort key and the
+/// name a record gives the archive.
 fn archive_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
@@ -4457,7 +4465,7 @@ mod tests {
         assert!(found.unwrap().is_none());
         let miss = logs
             .iter()
-            .find(|line| line.contains("storage miss"))
+            .find(|line| line.contains("engine.storage: miss"))
             .expect("one miss line");
         assert!(miss.contains('…'), "the debug line is bounded: {miss}");
         assert!(

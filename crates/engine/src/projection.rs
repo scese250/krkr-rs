@@ -561,8 +561,8 @@ fn append_window<F>(
                 for pass in &draw.passes {
                     let Some(pipeline) = scene.effect_pipelines.handle(pass.program) else {
                         log::warn!(
-                            "projection: layer {layer_id} names the {:?} program, which this \
-                             scene has no pipeline for; the pass is not drawn",
+                            "engine.projection: layer id={layer_id} names the {:?} program, which \
+                             this scene has no pipeline for; the pass is not drawn",
                             pass.program
                         );
                         continue;
@@ -582,8 +582,8 @@ fn append_window<F>(
                     }
                     if missing {
                         log::warn!(
-                            "projection: layer {layer_id} samples a bitmap that has no texture; \
-                             the pass is not drawn"
+                            "engine.projection: layer id={layer_id} samples a bitmap that has no \
+                             texture; the pass is not drawn"
                         );
                         continue;
                     }
@@ -729,7 +729,7 @@ fn append_window<F>(
                         None => {
                             clipped += 1;
                             log::trace!(
-                                "projection: layer {layer_id} clipped away: rect={:?} \
+                                "engine.projection: layer id={layer_id} clipped away: rect={:?} \
                                  image=({},{}) {}x{} bitmap={}x{} parent={:?}",
                                 node_composed.rect,
                                 image_left,
@@ -792,7 +792,7 @@ fn append_window<F>(
     }
 
     log::trace!(
-        "projection: window {window}: drew {drawn} layer(s); skipped \
+        "engine.projection: window id={window} drew {drawn} layer(s); skipped \
          hidden={hidden} empty={empty} clipped={clipped} of {}",
         scene.window_layer_order(window).len()
     );

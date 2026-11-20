@@ -612,7 +612,7 @@ fn stop_workers(shared: &PoolShared, workers: Vec<JoinHandle<()>>) {
     shared.wake.notify_all();
     for worker in workers {
         if worker.join().is_err() {
-            log::warn!("engine: a job worker stopped with a panic");
+            log::warn!("engine.jobpool: a job worker stopped with a panic");
         }
     }
 }

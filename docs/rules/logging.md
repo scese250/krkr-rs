@@ -36,6 +36,7 @@ from. It is the crate, and the module inside it:
 | `app.audio` | the audio device, its underruns and its playback cap |
 | `app.frame` | the frame body, its phases and the slow-frame report |
 | `app.runner` | the run: the mount, the window and the report it prints |
+| `app.vm` | the VM's own analysis of the script compilation |
 | `app.startup` | the open sequence and its phases |
 | `android.host` | the Android composition root |
 | `android.input` | the Android input queue and the touch mapping |

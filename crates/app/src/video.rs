@@ -75,7 +75,7 @@ impl Inner {
             // outlive the compat host that owns this source.
             let storage = unsafe { &*self.storage };
             let bytes = storage.read(path).map_err(|error| MediaError::Io {
-                message: format!("video: cannot read {path:?}: {error}"),
+                message: format!("cannot read {path:?}: {error}"),
             })?;
             let media = self.media;
             let (spec, decoder) =
@@ -87,7 +87,7 @@ impl Inner {
         self.streams
             .get(path)
             .ok_or_else(|| MediaError::InvalidState {
-                message: format!("video: {path:?} vanished from the decoder cache"),
+                message: format!("{path:?} vanished from the decoder cache"),
             })
     }
 
@@ -97,7 +97,7 @@ impl Inner {
     /// pixels.
     fn frame(&mut self, path: &str, at_ms: i64) -> Option<Arc<RgbaFrame>> {
         if let Err(error) = self.open(path) {
-            log::warn!("video: {error}");
+            log::warn!("platform.media: {error}");
             return None;
         }
         let media = self.media;
@@ -106,7 +106,7 @@ impl Inner {
         match present_video(&media, &mut stream.decoder, at) {
             Ok(frame) => Some(frame),
             Err(error) => {
-                log::warn!("video: cannot decode {path:?} at {at} ms: {error}");
+                log::warn!("platform.media: cannot decode {path:?} at {at} ms: {error}");
                 None
             }
         }
@@ -139,7 +139,7 @@ impl VideoSource for MediaVideoSource {
         match self.inner.borrow_mut().open(path) {
             Ok(stream) => Some(stream.spec),
             Err(error) => {
-                log::warn!("video: {error}");
+                log::warn!("platform.media: {error}");
                 None
             }
         }

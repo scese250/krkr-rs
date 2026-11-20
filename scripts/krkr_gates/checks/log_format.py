@@ -30,6 +30,7 @@ SUBSYSTEMS = (
     "app.audio",
     "app.frame",
     "app.runner",
+    "app.vm",
     "app.startup",
     "android.host",
     "android.input",

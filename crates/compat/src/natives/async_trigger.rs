@@ -71,6 +71,10 @@ use crate::{CompatCtx, CompatError, CompatServices};
 /// (`TVP_ACTION_INVOKE_BEGIN(0, "onFire", objthis)`, `EventIntf.cpp:1139`).
 const EVENT_TYPE: &str = "onFire";
 
+/// The dispatch at least this long is logged, so the natives a slow frame's
+/// async poll spends its time in are named.
+const ASYNC_DISPATCH_LOG_MS: f64 = 5.0;
+
 /// The reference `TVPActionName`, the default action member (`EventIntf.cpp:740`).
 const DEFAULT_ACTION_NAME: &str = "action";
 
@@ -696,6 +700,7 @@ pub fn async_trigger_poll(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     let ready = services.state::<AsyncTriggerState>().take_pending();
     for event in ready {
         let id = event.id;
+        let started = std::time::Instant::now();
         // The queued event's source retention keeps the trigger alive across
         // the call; the event entry is dropped after dispatch, releasing it.
         let result: Result<(), String> = match &event.owner {
@@ -707,6 +712,12 @@ pub fn async_trigger_poll(ctx: &mut CompatCtx) -> Result<(), CompatError> {
             None => invoke_action(host, services, id, std::ptr::null_mut())
                 .map_err(|error| error.to_string()),
         };
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if elapsed_ms >= ASYNC_DISPATCH_LOG_MS {
+            log::debug!(
+                "compat.async: on_fire id={id:?} ms={elapsed_ms:.1}"
+            );
+        }
         if let Err(error) = result {
             log::warn!("AsyncTrigger {id:?}: onFire failed ({error})");
         }

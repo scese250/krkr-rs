@@ -179,12 +179,12 @@ rebuilds its swapchain at the start of the next frame when it needs to, and a
 skip has nothing to retry.
 
 A stall is a **run**, not a per-frame fault. The first skipped frame opens it;
-each distinct cause warns once (`engine: the display did not release a
+each distinct cause warns once (`engine.frame: the display did not release a
 swapchain image within the presentation budget; this frame was skipped` and
 its siblings); at one second and then every ten seconds it reports its age and
 frame count, so a display that stops accepting frames is never silent; and the
 next presented frame closes it with
-`engine: presentation resumed after {frames} skipped frame(s) in {seconds} s:
+`engine.frame: presentation resumed after {frames} skipped frame(s) in {seconds} s:
 {causes}`. The causes are the distinct reasons the frames were skipped — an
 `AcquireTimeout` from the display, a lost or out-of-date surface, a backend
 that presented nothing, or a game surface that cannot be fitted into the

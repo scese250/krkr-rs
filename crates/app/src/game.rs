@@ -34,7 +34,7 @@ use crate::{Host, HostError, StepReport};
 ///
 /// The default matches the audio drain's playback cap
 /// (`crate::audio::DEFAULT_MAX_CHUNK_MS`), so the frame that produces the
-/// existing `audio: ... exceeds the ... playback cap` warning also produces
+/// `app.audio: ... exceeds the playback cap ...` warning also produces
 /// the attribution line that explains it. A caller that measures a frame
 /// budget - a target frame rate, a run that must not miss a deadline - sets
 /// its own threshold through [`HostConfig::slow_frame_ms`]; the frame budget
@@ -379,7 +379,8 @@ impl SlowReporting {
         }
         self.noted = true;
         Some(format!(
-            "slow-frame reporting stopped: the {} ms reporting budget is spent after {} reports",
+            "slow-frame reporting stopped: the reporting budget is spent \
+             budget_ms={} reports={}",
             limit.as_millis(),
             self.reports
         ))
@@ -512,7 +513,8 @@ impl FrameAttribution {
     /// frame and the wait leave unaccounted. The totals name the sums those
     /// parts add up to.
     ///
-    /// The report is one string, and the log carries it as one entry.
+    /// The report is one string: the log prefixes it with the subsystem and
+    /// carries it as one entry.
     fn slow_frame_report(&self, gap_ms: f64, pacing: FramePacing) -> String {
         let timings = self.timings.unwrap_or_default();
         let mut costs = vec![
@@ -645,7 +647,7 @@ impl FrameAttribution {
         // without the reader comparing the numbers.
         costs.sort_by(|left, right| right.ms.total_cmp(&left.ms));
         let mut out = format!(
-            "app.frame: slow frame={} presented={} gap_ms={gap_ms:.1}",
+            "slow frame={} presented={} gap_ms={gap_ms:.1}",
             self.report.frame_index, self.report.presented
         );
         if let Some(dominant) = costs.first() {
@@ -1266,7 +1268,7 @@ impl GameHost {
         if !self.first_frame_logged {
             self.first_frame_logged = true;
             log::info!(
-                "startup: first frame {:.1} ms after open",
+                "app.startup: first frame after open frame_ms={:.1}",
                 self.open_start.elapsed().as_secs_f64() * 1000.0
             );
         }
@@ -1289,13 +1291,13 @@ impl GameHost {
         }
         if !self.reporting.allows_report() {
             if let Some(note) = self.reporting.exhaustion_note() {
-                log::warn!("{note}");
+                log::warn!("app.frame: {note}");
             }
             return;
         }
         let started = Instant::now();
         log::warn!(
-            "{}",
+            "app.frame: {}",
             self.last_frame.slow_frame_report(gap_ms, pacing)
         );
         self.reporting.charge(started.elapsed());
@@ -1323,7 +1325,13 @@ fn log_startup(
         match fs::stat(storage.file_system(), &FsPath::host(path)) {
             Ok(stat) => bytes = bytes.saturating_add(stat.size),
             Err(error) => {
-                log::warn!("startup: cannot size archive {}: {error}", path.display());
+                // The archive is named, not located: a record never carries a
+                // path into the game's own directory.
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                log::warn!("app.startup: cannot size archive {name}: {error}");
             }
         }
     });
@@ -1335,22 +1343,22 @@ fn log_startup(
         snapshot.image_decode = snapshot.image_decode.saturating_add(deferred.elapsed);
     }
     log::info!(
-        "startup: archives mounted count={} entries={entries} bytes={bytes} in {:.1} ms",
+        "app.startup: archives mounted count={} entries={entries} bytes={bytes} mount_ms={:.1}",
         storage.archive_count(),
         mount_time.as_secs_f64() * 1000.0,
     );
     log::info!(
-        "startup: images decoded count={} in {:.1} ms",
+        "app.startup: images decoded count={} decode_ms={:.1}",
         snapshot.images_decoded,
         snapshot.image_decode.as_secs_f64() * 1000.0,
     );
     log::info!(
-        "startup: decoders opened audio={} video={}",
+        "app.startup: decoders opened audio={} video={}",
         snapshot.audio_decoders_opened,
         snapshot.video_decoders_opened,
     );
     log::info!(
-        "startup: entry scripts count={} in {:.1} ms (the whole startup sequence took {:.1} ms)",
+        "app.startup: entry scripts count={} scripts_ms={:.1} startup_ms={:.1}",
         snapshot.startup_scripts,
         snapshot.startup_script_time.as_secs_f64() * 1000.0,
         startup_time.as_secs_f64() * 1000.0,
@@ -1556,7 +1564,7 @@ fn run_startup(
     if let Some(name) = &plan.patch
         && let Err(error) = run_startup_script(vm, storage, name, stats)
     {
-        log::warn!("startup: {name}: {error}");
+        log::warn!("app.startup: script={name} error={error}");
     }
 
     match &plan.startup {
@@ -1584,7 +1592,7 @@ fn run_startup(
     if let Some(name) = &plan.after
         && let Err(error) = run_startup_script(vm, storage, name, stats)
     {
-        log::warn!("startup: {name}: {error}");
+        log::warn!("app.startup: script={name} error={error}");
     }
     Ok(())
 }
@@ -1720,7 +1728,10 @@ mod tests {
             },
         );
 
-        let header = report.lines().next().expect("the report has a header");
+        // The log site prefixes the report with the subsystem, so the record
+        // is the prefixed report.
+        let record = format!("app.frame: {report}");
+        let header = record.lines().next().expect("the record has a header");
         assert!(
             header.starts_with("app.frame: slow frame=7 "),
             "the header names the subsystem and the frame: {header}"
@@ -2000,8 +2011,8 @@ mod tests {
         let note = reporting
             .exhaustion_note()
             .expect("the note names the budget");
-        assert!(note.contains("10 ms"), "note was: {note}");
-        assert!(note.contains("2 reports"), "note was: {note}");
+        assert!(note.contains("budget_ms=10"), "note was: {note}");
+        assert!(note.contains("reports=2"), "note was: {note}");
         assert!(
             reporting.exhaustion_note().is_none(),
             "the note is said once"
@@ -2019,8 +2030,8 @@ mod tests {
         let note = reporting
             .exhaustion_note()
             .expect("the note names the budget");
-        assert!(note.contains("0 ms"), "note was: {note}");
-        assert!(note.contains("0 reports"), "note was: {note}");
+        assert!(note.contains("budget_ms=0"), "note was: {note}");
+        assert!(note.contains("reports=0"), "note was: {note}");
     }
 
     /// An unbounded budget always allows a report.

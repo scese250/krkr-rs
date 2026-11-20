@@ -2,50 +2,6 @@
 # The entries are keyed to the record itself, so a line shift does not make
 # an entry stale and a rewritten record does.  A record that is touched is
 # brought into compliance with the convention and its entry is deleted.
-{"anchor": "{message}", "path": "crates/android/src/host.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "the system reported low memory", "path": "crates/android/src/host.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "display density {dpi} does not fit in i32; using the 160 dpi baseline", "path": "crates/android/src/host.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "the display reported no density; using the 160 dpi baseline", "path": "crates/android/src/host.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "cannot read the Android input queue: {error:?}", "path": "crates/android/src/input.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "an Android motion action does not fit in i32", "path": "crates/android/src/input.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "touch action index {index} is out of range for {} pointer(s)", "path": "crates/android/src/input.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "unmapped Android mouse button {raw}", "path": "crates/android/src/input.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "negative Android pointer id {} ignored", "path": "crates/android/src/input.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "Android key code {raw} does not fit in i32", "path": "crates/android/src/input.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "cannot obtain the JavaVM: {error}", "path": "crates/android/src/jni_fields.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "cannot attach the native thread to the JVM: {error}", "path": "crates/android/src/jni_fields.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "cannot read KrkrGameActivity.{field}: {error}", "path": "crates/android/src/jni_fields.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "cannot read KrkrGameActivity.pendingGameName: {error}", "path": "crates/android/src/lib.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "krkr: launching {name:?} from {}", "path": "crates/android/src/lib.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "invalid runtime configuration: {error}", "path": "crates/android/src/lib.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "krkr: frame rate {} fps, preload archives {}, debug overlay {}, log level {}", "path": "crates/android/src/lib.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "krkr-state: the panic could not be written to the state file", "path": "crates/android/src/lib.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "krkr-state: the panic hook failed", "path": "crates/android/src/lib.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "{message}", "path": "crates/android/src/lib.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "the engine log is already installed for this process", "path": "crates/android/src/lib.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "krkr-state: cannot write {}: {e}", "path": "crates/android/src/state.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "audio: {} could not decode the track: {error}", "path": "crates/app/src/audio.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "audio: opened {} device at {} Hz/{} ch", "path": "crates/app/src/audio.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "audio: non-finite frame duration; skipping this buffer", "path": "crates/app/src/audio.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "audio: {dt_ms:.1} ms frame exceeds the {:.0} ms playback cap; \\\n                 playback falls {:.1} ms behind the wall clock", "path": "crates/app/src/audio.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "audio: wrote {frames} frames ({:.1} ms) to the {} device", "path": "crates/app/src/audio.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "audio: the output device underran ({} episode(s) so far); the queue holds \\\n                 {depth_ms:.0} ms", "path": "crates/app/src/audio.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "audio: the output device dropped its oldest audio ({} episode(s) so far); the \\\n                 queue holds {depth_ms:.0} ms", "path": "crates/app/src/audio.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "startup: first frame {:.1} ms after open", "path": "crates/app/src/game.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "{note}", "path": "crates/app/src/game.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "{}", "path": "crates/app/src/game.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "startup: cannot size archive {}: {error}", "path": "crates/app/src/game.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "startup: archives mounted count={} entries={entries} bytes={bytes} in {:.1} ms", "path": "crates/app/src/game.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "startup: images decoded count={} in {:.1} ms", "path": "crates/app/src/game.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "startup: decoders opened audio={} video={}", "path": "crates/app/src/game.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "startup: entry scripts count={} in {:.1} ms (the whole startup sequence took {:.1} ms)", "path": "crates/app/src/game.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "startup: {name}: {error}", "path": "crates/app/src/game.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "startup: {name}: {error}", "path": "crates/app/src/game.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "app: frame={} (+{} in {:.1} s), dt={dt_ms:.1} ms, presented={}, \\\n             scene_changed={}/{}", "path": "crates/app/src/runner.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "video: {error}", "path": "crates/app/src/video.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "video: cannot decode {path:?} at {at} ms: {error}", "path": "crates/app/src/video.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "video: {error}", "path": "crates/app/src/video.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "kag progress capture probe", "path": "crates/app/tests/real_game_progress.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "event adapter: {name} -> window {window} and layer {layer}", "path": "crates/compat/src/event.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "event adapter: {name} -> window {window}", "path": "crates/compat/src/event.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "event adapter: {name} -> layer {layer}", "path": "crates/compat/src/event.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
@@ -267,72 +223,6 @@
 {"anchor": "Plugins.link({name:?}): built-in emulation activated", "path": "crates/compat/src/plugins_native.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "Plugins.unlink({name:?}) -> {removed}", "path": "crates/compat/src/plugins_native.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "script decode ({label}): dropped {dropped} undecodable byte(s)", "path": "crates/compat/src/text.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the backend presented no frame and reported no surface event", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the display did not release a swapchain image within the \\\n                 presentation budget; this frame was skipped", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the presentation surface was lost; this frame was not presented", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the presentation surface is out of date; rebuilding the swapchain", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the surface was restored but this frame was not presented", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: this frame was not presented after a resize to {width}x{height}", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "transitions: this backend cannot run effect pipelines; the display bitmap is \\\n                 blended on the CPU", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "transitions: the {:?} program was refused: {error}", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "transitions: the {:?} program has no pipeline: {error}", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "transitions: the {:?} program has no pipeline handle", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: presentation surface recreated after it was lost", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the display has not accepted a frame for {:.1} s (frames skipped: {}); \\\n                 {}", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: presentation resumed after {} skipped frame(s) in {:.1} s: {}", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "presentation skipped: a {vm:?} game surface cannot be fitted into a {device:?} framebuffer", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "presentation: VM {}x{} -> framebuffer {}x{} (scale {:.3})", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "bitmap #{id} has a zero dimension; skipping upload", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "bitmap #{id} has {len} pixel bytes, expected {expected}; skipping upload", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "failed to create a texture for bitmap #{id}: {error}", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "failed to upload {} bitmap(s): {error}; the bitmaps stay dirty and the \\\n                         next frame retries them", "path": "crates/engine/src/engine.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: a job worker stopped with a panic", "path": "crates/engine/src/jobpool.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: {operation} met a {}x{} bitmap holding {} pixel bytes; the operation is skipped", "path": "crates/engine/src/layer_ops.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: operateRect met the unknown operation mode {mode}", "path": "crates/engine/src/layer_ops.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: operateStretch met the unknown operation mode {mode}", "path": "crates/engine/src/layer_ops.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the affine pass met the unknown operation mode {mode}", "path": "crates/engine/src/layer_ops.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "projection: layer {layer_id} names the {:?} program, which this \\\n                             scene has no pipeline for; the pass is not drawn", "path": "crates/engine/src/projection.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "projection: layer {layer_id} samples a bitmap that has no texture; \\\n                             the pass is not drawn", "path": "crates/engine/src/projection.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "projection: layer {layer_id} clipped away: rect={:?} \\\n                                 image=({},{}) {}x{} bitmap={}x{} parent={:?}", "path": "crates/engine/src/projection.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "projection: window {window}: drew {drawn} layer(s); skipped \\\n         hidden={hidden} empty={empty} clipped={clipped} of {}", "path": "crates/engine/src/projection.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: fillRect met a {}x{} bitmap holding {} pixel bytes", "path": "crates/engine/src/raster.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: a blank {width}x{height} image could not be allocated", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the province pixel read of a {}x{} province plane found {} plane \\\n                     bytes", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the province pixel write of a {w}x{h} province plane has no address", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the province pixel write of a {w}x{h} province plane found {} plane bytes", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the hit test of a {}x{} province plane found {} plane bytes", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the hit test of a {}x{} image found no pixel buffer", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the preloaded image {} does not match its probed size", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: a preloaded image failed to decode: {message}", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: a preloaded image was cancelled before it decoded", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the decoded image of a {width}x{height} bitmap does not \\\n                             match the probed size; the bitmap stays blank", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: an image decode failed: {message}", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: an image decode was cancelled before it produced pixels", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: bitmap #{id} declares {old_w}x{old_h} but holds {available} pixel bytes; \\\n                 a resize to {new_w}x{new_h} keeps the fill for {missing_rows} of {copy_h} \\\n                 preserved rows", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "released scene bitmap #{id}", "path": "crates/engine/src/scene.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "sound: the audio decode thread stopped unexpectedly", "path": "crates/engine/src/sound.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "the archive image of {} is loaded on the mounting thread: {error}", "path": "crates/engine/src/storage.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "the archive image of {} is loaded ({} bytes in {:.1} ms)", "path": "crates/engine/src/storage.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "the archive image of {} could not be read: {error}", "path": "crates/engine/src/storage.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: a storage read worker stopped with a panic", "path": "crates/engine/src/storage.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "skipping archive {}: {error}", "path": "crates/engine/src/storage.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "opened {} ({} entries)", "path": "crates/engine/src/storage.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread", "path": "crates/engine/src/storage.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread", "path": "crates/engine/src/storage.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "storage: {name:?} could not be resolved for a shared read: {error}", "path": "crates/engine/src/storage.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "storage: the read pool refused {name:?} ({error}); the entry is read on the calling thread", "path": "crates/engine/src/storage.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "storage miss {name:?}: {}", "path": "crates/engine/src/storage.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "storage miss {name:?}: {}", "path": "crates/engine/src/storage.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "system fonts: the host font scan could not start: {error}", "path": "crates/engine/src/text.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "system fonts: no installed face provides the host's default font: {error}", "path": "crates/engine/src/text.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "system fonts: the default face is {default_name}", "path": "crates/engine/src/text.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "system fonts: no installed face provides a CJK glyph: {error}", "path": "crates/engine/src/text.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "system fonts: the coverage face is {coverage_name}", "path": "crates/engine/src/text.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "system fonts: no fonts found in any of {} directories; \\\n                 text has no face to fall back to", "path": "crates/engine/src/text.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "system fonts: {} faces from {} directories", "path": "crates/engine/src/text.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "timer: {fired} fire(s) at {now_ms} ms", "path": "crates/engine/src/timer.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "transition effect: the uniform block is not usable: {error}", "path": "crates/engine/src/trans/effect.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "engine: the destination of a {}x{} video frame declares {}x{} but holds {} pixel \\\n             bytes; the frame is not copied", "path": "crates/engine/src/video.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "psb: resource chunk {}:{} carries no bytes", "path": "crates/platform/media/psd/src/container.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "psb_file: unknown PSB object type {other:#x}", "path": "crates/platform/media/psd/src/container.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "psb_file: name index {name_index} out of range", "path": "crates/platform/media/psd/src/container.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
@@ -370,9 +260,3 @@
 {"anchor": "vulkan: the frame failed ({error}) and its image-available \\\n                     semaphore could not be recreated: {semaphore_error}", "path": "crates/platform/render/src/vulkan/mod.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "vulkan: presentation stalled: {}", "path": "crates/platform/render/src/vulkan/mod.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "vulkan: presentation recovered: {}", "path": "crates/platform/render/src/vulkan/mod.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "{text}", "path": "crates/vm/src/host.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "tjs: {msg}", "path": "crates/vm/src/host.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "tjs: {msg}", "path": "crates/vm/src/host.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "tjs: {msg}", "path": "crates/vm/src/host.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "tjs: {msg}", "path": "crates/vm/src/host.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "tjs: {msg}", "path": "crates/vm/src/host.rs", "reason": "the record predates the convention; the migration is in TODO.md"}

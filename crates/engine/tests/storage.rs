@@ -681,7 +681,7 @@ fn archive_miss_reports_near_misses() {
     assert_eq!(found.unwrap(), None);
     let miss = logs
         .iter()
-        .find(|line| line.starts_with("TRACE storage miss"))
+        .find(|line| line.starts_with("TRACE engine.storage: miss"))
         .expect("a miss logs a full trace line");
     assert!(miss.contains("1 entries, 1 index section(s)"), "{miss}");
     assert!(miss.contains("system/config.tjs"), "{miss}");
@@ -893,19 +893,19 @@ fn miss_reports_every_searched_location() {
 
     let misses: Vec<&String> = logs
         .iter()
-        .filter(|line| line.contains("storage miss"))
+        .filter(|line| line.contains("engine.storage: miss"))
         .collect();
     assert_eq!(misses.len(), 2, "a bounded line and a full line: {logs:?}");
     let bounded = misses
         .iter()
-        .find(|line| line.starts_with("DEBUG storage miss"))
+        .find(|line| line.starts_with("DEBUG engine.storage: miss"))
         .expect("a bounded debug line");
     let full = misses
         .iter()
-        .find(|line| line.starts_with("TRACE storage miss"))
+        .find(|line| line.starts_with("TRACE engine.storage: miss"))
         .expect("a full trace line");
     assert!(
-        bounded.starts_with("DEBUG storage miss \"config.tjs\""),
+        bounded.starts_with("DEBUG engine.storage: miss \"config.tjs\""),
         "{bounded}"
     );
     assert!(
@@ -927,7 +927,7 @@ fn miss_reports_every_searched_location() {
         ))
     );
     assert!(
-        logs.iter().all(|line| !line.contains("storage miss")),
+        logs.iter().all(|line| !line.contains("engine.storage: miss")),
         "a hit must not log: {logs:?}"
     );
 }
@@ -947,7 +947,7 @@ fn resolver_cache_lists_each_auto_path_once() {
     assert_eq!(found.unwrap(), None);
     let miss_line = first_logs
         .iter()
-        .find(|line| line.starts_with("TRACE storage miss"))
+        .find(|line| line.starts_with("TRACE engine.storage: miss"))
         .expect("a miss logs a full trace line");
     assert!(miss_line.contains("parts/missing.txt"), "{miss_line}");
     assert!(miss_line.contains("data.xp3"), "{miss_line}");
@@ -971,7 +971,7 @@ fn resolver_cache_lists_each_auto_path_once() {
     );
     assert_eq!(after_second.misses, 2);
     assert!(
-        logs.iter().any(|line| line.contains("storage miss")),
+        logs.iter().any(|line| line.contains("engine.storage: miss")),
         "the cached miss is still reported: {logs:?}"
     );
 }
@@ -1043,11 +1043,11 @@ fn startup_miss_debug_line_is_bounded_but_trace_is_complete() {
     assert_eq!(found.unwrap(), None);
     let debug = logs
         .iter()
-        .find(|line| line.starts_with("DEBUG storage miss"))
+        .find(|line| line.starts_with("DEBUG engine.storage: miss"))
         .expect("a bounded debug line");
     let full = logs
         .iter()
-        .find(|line| line.starts_with("TRACE storage miss"))
+        .find(|line| line.starts_with("TRACE engine.storage: miss"))
         .expect("a full trace line");
 
     assert!(debug.contains('…'), "the debug line is bounded: {debug}");

@@ -205,7 +205,7 @@ impl LogDedup {
             .map(utc_timestamp)
             .unwrap_or_else(|| "unknown".to_string());
         LogAction::Summary(format!(
-            "tjs: suppressed {count} further identical exception dump(s) for {header}; last at {when}"
+            "suppressed {count} further identical exception dump(s) for {header}; last at {when}"
         ))
     }
 
@@ -249,18 +249,18 @@ fn emit_action(action: LogAction) {
                 emit_record(level, &line);
             }
         }
-        LogAction::Summary(text) => log::debug!("{text}"),
+        LogAction::Summary(text) => log::debug!("vm.tjs: {text}"),
     }
 }
 
-/// Emits one VM record at `level` under the `tjs:` prefix.
+/// Emits one VM record at `level` under the `vm.tjs:` prefix.
 fn emit_record(level: c_int, msg: &str) {
     match level {
-        LOG_ERROR => log::error!("tjs: {msg}"),
-        LOG_WARN => log::warn!("tjs: {msg}"),
-        LOG_INFO => log::info!("tjs: {msg}"),
-        LOG_DEBUG => log::debug!("tjs: {msg}"),
-        _ => log::trace!("tjs: {msg}"),
+        LOG_ERROR => log::error!("vm.tjs: {msg}"),
+        LOG_WARN => log::warn!("vm.tjs: {msg}"),
+        LOG_INFO => log::info!("vm.tjs: {msg}"),
+        LOG_DEBUG => log::debug!("vm.tjs: {msg}"),
+        _ => log::trace!("vm.tjs: {msg}"),
     }
 }
 
@@ -603,11 +603,11 @@ mod tests {
         assert_eq!(host.eval("r", "test").unwrap(), TjsValue::Integer(1));
 
         let lines = captured();
-        // The bare message is the record the spdlog bridge adds; a debug-mode
-        // build also emits a `... at position` console record, which does not
-        // match exactly.
+        // The record is the message under its subsystem; a debug-mode build
+        // also emits a `... at position` console record, which does not match
+        // exactly.
         assert!(
-            lines.iter().any(|line| line == "DEBUG tjs: boom-message"),
+            lines.iter().any(|line| line == "DEBUG vm.tjs: boom-message"),
             "the caught exception must reach the engine log: {lines:?}"
         );
     }

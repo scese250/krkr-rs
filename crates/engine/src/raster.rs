@@ -128,7 +128,7 @@ pub fn fill_rect_replace(bitmap: &mut BitmapState, x: i32, y: i32, w: u32, h: u3
     };
     if bitmap.rgba.len() < expected {
         log::error!(
-            "engine: fillRect met a {}x{} bitmap holding {} pixel bytes",
+            "engine.scene: fillRect met a {}x{} bitmap holding {} pixel bytes",
             bitmap.width,
             bitmap.height,
             bitmap.rgba.len()

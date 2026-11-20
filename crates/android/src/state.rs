@@ -201,7 +201,7 @@ fn write_to_state_dir(write: impl FnOnce(&Path) -> std::io::Result<()>) {
     };
     if let Err(e) = write(dir) {
         log::error!(
-            "krkr-state: cannot write {}: {e}",
+            "android.host: cannot write {}: {e}",
             dir.join(STATE_FILE_NAME).display()
         );
     }

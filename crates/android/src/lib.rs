@@ -157,11 +157,11 @@ mod android_entry {
             // The name only decorates a log line; a read failure there is not
             // fatal, but it is logged rather than silently blanked.
             Err(error) => {
-                log::warn!("cannot read KrkrGameActivity.pendingGameName: {error}");
+                log::warn!("android.host: cannot read KrkrGameActivity.pendingGameName: {error}");
                 String::new()
             }
         };
-        log::info!("krkr: launching {name:?} from {}", game_dir.display());
+        log::info!("android.host: launching name={name:?}");
 
         // The launcher persisted these choices in its own settings store and
         // published them over JNI. Resolving them here keeps configuration
@@ -199,14 +199,14 @@ mod android_entry {
         ) {
             Ok(runtime) => runtime,
             Err(error) => {
-                log::error!("invalid runtime configuration: {error}");
+                log::error!("android.host: invalid runtime configuration: {error}");
                 let message = error.to_string();
                 state::write_state(state::State::Failed, Some(&message));
                 return;
             }
         };
         log::info!(
-            "krkr: frame rate {} fps, preload archives {}, debug overlay {}, log level {}",
+            "android.host: frame_rate_fps={} preload_archives={} debug_overlay={} log_level={}",
             runtime.frame_rate_limit.fps(),
             runtime.preload_archives,
             runtime.debug_overlay,
@@ -248,14 +248,14 @@ mod android_entry {
                 }))
                 .is_err()
                 {
-                    log::error!("krkr-state: the panic could not be written to the state file");
+                    log::error!("android.host: the panic could not be written to the state file");
                 }
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     previous(info);
                 }))
                 .is_err()
                 {
-                    log::error!("krkr-state: the panic hook failed");
+                    log::error!("android.host: the panic hook failed");
                 }
             }));
         });
@@ -297,7 +297,7 @@ mod android_entry {
 
     /// Reports a startup failure through the state file and the log.
     fn report_startup_failure(message: &str) {
-        log::error!("{message}");
+        log::error!("android.host: {message}");
         state::write_state(state::State::Failed, Some(message));
     }
 
@@ -357,7 +357,7 @@ mod android_entry {
             // a genuine setup failure (an unopenable log file) was returned
             // above, before the claim.
             Err(_) => {
-                log::debug!("the engine log is already installed for this process");
+                log::debug!("android.host: the engine log is already installed for this process");
                 Ok(())
             }
         }

@@ -364,7 +364,7 @@ impl TimerState {
 pub fn deliver_due(registry: &mut TimerState, now_ms: u64) -> u64 {
     let fired = registry.advance(now_ms);
     if fired > 0 {
-        log::trace!("timer: {fired} fire(s) at {now_ms} ms");
+        log::trace!("engine.timer: fired={fired} now_ms={now_ms}");
     }
     fired
 }

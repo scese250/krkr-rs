@@ -110,12 +110,12 @@ fn install_capture() {
         }
         log::set_max_level(log::LevelFilter::Debug);
     });
-    log::info!("kag progress capture probe");
+    log::info!("compat.kag: progress capture probe");
     let captured = CAPTURED_LOGS.with(|logs| logs.borrow().clone());
     assert!(
         captured
             .iter()
-            .any(|line| line.contains("kag progress capture probe")),
+            .any(|line| line.contains("compat.kag: progress capture probe")),
         "the capturing log sink is not installed: {captured:?}"
     );
     CAPTURED_LOGS.with(|logs| logs.borrow_mut().clear());

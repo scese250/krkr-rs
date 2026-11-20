@@ -904,8 +904,8 @@ pub fn blit_frame_to_layer_opacity(
     };
     if !bitmap_holds_pixels(dst) {
         log::error!(
-            "engine: the destination of a {}x{} video frame declares {}x{} but holds {} pixel \
-             bytes; the frame is not copied",
+            "engine.scene: the destination of a {}x{} video frame declares {}x{} but holds {} \
+             pixel bytes; the frame is not copied",
             frame.width,
             frame.height,
             dst.width,

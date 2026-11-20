@@ -450,7 +450,7 @@ fn decode_with_attempts(
             Ok(source) => return Ok(source),
             Err(error) => {
                 log::warn!(
-                    "audio: {} could not decode the track: {error}",
+                    "app.audio: could not decode the track decoder={} error={error}",
                     attempt.label
                 );
                 failures.push(format!("{}: {error}", attempt.label));
@@ -633,7 +633,7 @@ impl AudioOutput {
         };
         let spec = device.spec();
         log::info!(
-            "audio: opened {} device at {} Hz/{} ch",
+            "app.audio: opened device={} sample_rate={} channels={}",
             if headless { "null" } else { "output" },
             spec.sample_rate,
             spec.channels,
@@ -675,7 +675,7 @@ impl AudioOutput {
         self.report_health();
         if !dt_ms.is_finite() {
             self.carry_frames = 0.0;
-            log::warn!("audio: non-finite frame duration; skipping this buffer");
+            log::warn!("app.audio: non-finite frame duration; skipping this buffer");
             return Ok(());
         }
         let rate = f64::from(self.spec.sample_rate);
@@ -683,8 +683,8 @@ impl AudioOutput {
         self.carry_frames = plan.carry_frames;
         if plan.behind_ms > 0.0 {
             log::warn!(
-                "audio: {dt_ms:.1} ms frame exceeds the {:.0} ms playback cap; \
-                 playback falls {:.1} ms behind the wall clock",
+                "app.audio: the frame exceeds the playback cap frame_ms={dt_ms:.1} \
+                 cap_ms={:.0} behind_ms={:.1}",
                 self.max_chunk_ms,
                 plan.behind_ms
             );
@@ -712,7 +712,7 @@ impl AudioOutput {
         // number to place a picture that follows the sound.
         set_output_latency(&ctx, self.device.queued_seconds(&self.state));
         log::trace!(
-            "audio: wrote {frames} frames ({:.1} ms) to the {} device",
+            "app.audio: wrote frames={frames} duration_ms={:.1} device={}",
             frames as f64 * 1000.0 / rate,
             if self.null { "null" } else { "output" },
         );
@@ -737,15 +737,14 @@ impl AudioOutput {
         let depth_ms = self.device.queued_seconds(&self.state) * 1000.0;
         if episodes.underruns > 0 {
             log::warn!(
-                "audio: the output device underran ({} episode(s) so far); the queue holds \
-                 {depth_ms:.0} ms",
+                "app.audio: the output device underran episodes={} queue_depth_ms={depth_ms:.0}",
                 health.underrun_episodes,
             );
         }
         if episodes.overruns > 0 {
             log::warn!(
-                "audio: the output device dropped its oldest audio ({} episode(s) so far); the \
-                 queue holds {depth_ms:.0} ms",
+                "app.audio: the output device dropped its oldest audio episodes={} \
+                 queue_depth_ms={depth_ms:.0}",
                 health.overrun_episodes,
             );
         }

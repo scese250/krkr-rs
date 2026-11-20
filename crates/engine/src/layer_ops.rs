@@ -366,7 +366,7 @@ fn pixels_usable(bitmap: &BitmapState, operation: &str) -> bool {
         return true;
     }
     log::error!(
-        "engine: {operation} met a {}x{} bitmap holding {} pixel bytes; the operation is skipped",
+        "engine.scene: {operation} met a {}x{} bitmap holding {} pixel bytes; the operation is skipped",
         bitmap.width,
         bitmap.height,
         bitmap.rgba.len()
@@ -4048,7 +4048,7 @@ pub fn operate_rect_on(
             Blend::Kernel(kernel) => kernel,
             Blend::NoMethod => return,
             Blend::UnknownMode => {
-                log::error!("engine: operateRect met the unknown operation mode {mode}");
+                log::error!("engine.scene: operateRect met an unknown mode={mode}");
                 return;
             }
         }
@@ -4139,7 +4139,7 @@ pub fn stretch_blit_on(
             Blend::Kernel(kernel) => kernel,
             Blend::NoMethod => return,
             Blend::UnknownMode => {
-                log::error!("engine: operateStretch met the unknown operation mode {mode}");
+                log::error!("engine.scene: operateStretch met an unknown mode={mode}");
                 return;
             }
         }
@@ -4470,7 +4470,7 @@ fn affine_blit_clipped_impl(
             Blend::Kernel(kernel) => kernel,
             Blend::NoMethod => return,
             Blend::UnknownMode => {
-                log::error!("engine: the affine pass met the unknown operation mode {mode}");
+                log::error!("engine.scene: the affine pass met an unknown mode={mode}");
                 return;
             }
         }

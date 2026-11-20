@@ -80,7 +80,9 @@ fn pass_uniforms(
     match EffectUniforms::from_words(&words) {
         Ok(uniforms) => Some(uniforms),
         Err(error) => {
-            log::error!("transition effect: the uniform block is not usable: {error}");
+            log::error!(
+                "engine.scene: the transition effect's uniform block is not usable: {error}"
+            );
             None
         }
     }

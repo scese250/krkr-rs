@@ -693,7 +693,7 @@ impl DesktopApp {
             return;
         }
         log::debug!(
-            "app: frame={} (+{} in {:.1} s), dt={dt_ms:.1} ms, presented={}, \
+            "app.runner: frame={} (+{} in {:.1} s), dt={dt_ms:.1} ms, presented={}, \
              scene_changed={}/{}",
             report.frame_index,
             self.heartbeat_frames,

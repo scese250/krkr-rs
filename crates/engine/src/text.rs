@@ -633,7 +633,7 @@ impl TextEngine {
             Err(error) => {
                 // The scan could not start: the faces are read on the thread
                 // that asks for them, and the failure is reported.
-                log::warn!("system fonts: the host font scan could not start: {error}");
+                log::warn!("engine.text: the host's system font scan could not start: {error}");
             }
         }
     }
@@ -662,14 +662,16 @@ impl TextEngine {
         // faces without borrowing it.
         let default_families = std::mem::take(&mut faces.default_families);
         if let Err(error) = self.install_default_face(&default_families) {
-            log::warn!("system fonts: no installed face provides the host's default font: {error}");
+            log::warn!(
+                "engine.text: no installed system face provides the host's default font: {error}"
+            );
         }
         // The role is named so the host log says which face fills it.
         let default_name = match self.default_face_id() {
             Some(id) => self.family_name(id).unwrap_or("none"),
             None => "none",
         };
-        log::info!("system fonts: the default face is {default_name}");
+        log::info!("engine.text: the system default face is {default_name}");
     }
 
     /// Resolves the host's coverage face, once.
@@ -692,7 +694,7 @@ impl TextEngine {
         faces.coverage_resolved = true;
         let coverage_codepoint = faces.coverage_codepoint;
         if let Err(error) = self.install_coverage_face(coverage_codepoint) {
-            log::warn!("system fonts: no installed face provides a CJK glyph: {error}");
+            log::warn!("engine.text: no installed system face provides a CJK glyph: {error}");
         }
         // The role is named so the host log says which face fills it: a host
         // with no coverage face draws every character its default face lacks
@@ -701,7 +703,7 @@ impl TextEngine {
             Some(id) => self.family_name(id).unwrap_or("none"),
             None => "none",
         };
-        log::info!("system fonts: the coverage face is {coverage_name}");
+        log::info!("engine.text: the system coverage face is {coverage_name}");
     }
 
     /// Registers a font face from `bytes` (a TTF/OTF, or a TTC/OTC with
@@ -934,13 +936,13 @@ impl TextEngine {
         // asked for a face.
         if scanned.faces == 0 {
             log::info!(
-                "system fonts: no fonts found in any of {} directories; \
+                "engine.text: the host's system font scan found no font in directories={}; \
                  text has no face to fall back to",
                 scanned.directories
             );
         } else {
             log::info!(
-                "system fonts: {} faces from {} directories",
+                "engine.text: the host's system font scan found faces={} in directories={}",
                 scanned.faces,
                 scanned.directories
             );

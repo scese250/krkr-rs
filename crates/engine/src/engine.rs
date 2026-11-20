@@ -592,7 +592,7 @@ impl Engine {
     fn install_effect_pipelines(&mut self) {
         if !supports_effect_pipelines(&self.pipeline) {
             log::info!(
-                "transitions: this backend cannot run effect pipelines; the display bitmap is \
+                "engine.scene: this backend cannot run effect pipelines; the display bitmap is \
                  blended on the CPU"
             );
             return;
@@ -602,7 +602,7 @@ impl Engine {
                 Ok(shader) => shader,
                 Err(error) => {
                     log::error!(
-                        "transitions: the {:?} program was refused: {error}",
+                        "engine.scene: the {:?} program was refused: {error}",
                         program.name()
                     );
                     return;
@@ -617,7 +617,7 @@ impl Engine {
                 Ok(pipeline) => pipeline,
                 Err(error) => {
                     log::error!(
-                        "transitions: the {:?} program has no pipeline: {error}",
+                        "engine.scene: the {:?} program has no pipeline: {error}",
                         program.name()
                     );
                     return;
@@ -626,7 +626,7 @@ impl Engine {
             let handle = self.shader.pipeline_handle(pipeline).cloned();
             let Some(handle) = handle else {
                 log::error!(
-                    "transitions: the {:?} program has no pipeline handle",
+                    "engine.scene: the {:?} program has no pipeline handle",
                     program.name()
                 );
                 return;
@@ -930,7 +930,7 @@ impl Engine {
             // recovered frame is skipped and the next frame presents normally.
             if outcome.surface_event == Some(SurfaceEvent::Lost) {
                 recover_surface(&self.pipeline, &mut self.surface, &mut self.render_state)?;
-                log::info!("engine: presentation surface recreated after it was lost");
+                log::info!("engine.frame: presentation surface recreated after it was lost");
                 // The recreated surface holds nothing, so the whole frame is
                 // drawn again.
                 self.scene.mark_dirty();
@@ -980,8 +980,8 @@ impl Engine {
         }
         if let Some(age) = self.stall.due_report(now_ms) {
             log::warn!(
-                "engine: the display has not accepted a frame for {:.1} s (frames skipped: {}); \
-                 {}",
+                "engine.frame: the display has not accepted a frame elapsed_s={:.1} \
+                 frames_skipped={} causes={}",
                 age.elapsed_ms as f64 / 1000.0,
                 age.frames,
                 describe_stall_causes(&self.stall.causes),
@@ -993,7 +993,7 @@ impl Engine {
     fn finish_presentation_stall(&mut self, now_ms: u64) {
         if let Some(summary) = self.stall.resumed(now_ms) {
             log::info!(
-                "engine: presentation resumed after {} skipped frame(s) in {:.1} s: {}",
+                "engine.frame: presentation resumed frames_skipped={} elapsed_s={:.1} causes={}",
                 summary.frames,
                 summary.elapsed_ms as f64 / 1000.0,
                 describe_stall_causes(&summary.causes),
@@ -1092,7 +1092,8 @@ impl Engine {
             Err(TranslateError::EmptyDimension { vm, device }) => {
                 if !self.presentation_skipped_logged {
                     log::warn!(
-                        "presentation skipped: a {vm:?} game surface cannot be fitted into a {device:?} framebuffer"
+                        "engine.frame: the game surface cannot be fitted into the framebuffer \
+                         vm_size={vm:?} device_size={device:?}"
                     );
                     self.presentation_skipped_logged = true;
                 }
@@ -1107,7 +1108,7 @@ impl Engine {
             self.scene.mark_dirty();
             if let Some(translation) = translation {
                 log::info!(
-                    "presentation: VM {}x{} -> framebuffer {}x{} (scale {:.3})",
+                    "engine.frame: the presentation mapping vm_size={}x{} device_size={}x{} scale={:.3}",
                     translation.vm_size.0,
                     translation.vm_size.1,
                     translation.device_size.0,
@@ -1365,14 +1366,15 @@ impl Engine {
                 continue;
             };
             if width == 0 || height == 0 {
-                log::warn!("bitmap #{id} has a zero dimension; skipping upload");
+                log::warn!("engine.scene: bitmap id={id} has a zero dimension; skipping upload");
                 self.scene.set_bitmap_clean(id);
                 continue;
             }
             let expected = width as usize * height as usize * 4;
             if len != expected {
                 log::warn!(
-                    "bitmap #{id} has {len} pixel bytes, expected {expected}; skipping upload"
+                    "engine.scene: bitmap id={id} has {len} pixel bytes, expected {expected}; \
+                     skipping upload"
                 );
                 self.scene.set_bitmap_clean(id);
                 continue;
@@ -1445,8 +1447,8 @@ impl Engine {
                 Ok(()) => true,
                 Err(error) => {
                     log::warn!(
-                        "failed to upload {} bitmap(s): {error}; the bitmaps stay dirty and the \
-                         next frame retries them",
+                        "engine.scene: failed to upload bitmaps count={}: {error}; the bitmaps stay \
+                         dirty and the next frame retries them",
                         uploads.len()
                     );
                     false

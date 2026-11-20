@@ -70,14 +70,14 @@ pub(crate) fn activity_static_string(
     let vm = match unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) } {
         Ok(vm) => vm,
         Err(error) => {
-            log::error!("cannot obtain the JavaVM: {error}");
+            log::error!("android.host: cannot obtain the JavaVM: {error}");
             return Err(error);
         }
     };
     let mut env = match vm.attach_current_thread() {
         Ok(env) => env,
         Err(error) => {
-            log::error!("cannot attach the native thread to the JVM: {error}");
+            log::error!("android.host: cannot attach the native thread to the JVM: {error}");
             return Err(error);
         }
     };
@@ -114,7 +114,7 @@ fn report<T>(
     field: &str,
     error: jni::errors::Error,
 ) -> Result<T, jni::errors::Error> {
-    log::error!("cannot read KrkrGameActivity.{field}: {error}");
+    log::error!("android.host: cannot read KrkrGameActivity.{field}: {error}");
     // The jni crate leaves the Java exception pending; clear it so every later
     // JNI call on this thread is not poisoned.
     let _ = env.exception_clear();

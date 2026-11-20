@@ -25,7 +25,7 @@ pub(crate) fn translate_input(app: &AndroidApp, handler: &mut AndroidHost) {
     let mut iter = match app.input_events_iter() {
         Ok(iter) => iter,
         Err(error) => {
-            log::error!("cannot read the Android input queue: {error:?}");
+            log::error!("android.input: cannot read the Android input queue: {error:?}");
             return;
         }
     };
@@ -60,7 +60,7 @@ fn deliver_motion(handler: &mut AndroidHost, motion: &MotionEvent<'_>) {
     let action = match i32::try_from(u32::from(motion.action())) {
         Ok(action) => action,
         Err(_) => {
-            log::warn!("an Android motion action does not fit in i32");
+            log::warn!("android.input: an Android motion action does not fit in i32");
             return;
         }
     };
@@ -79,7 +79,7 @@ fn deliver_motion(handler: &mut AndroidHost, motion: &MotionEvent<'_>) {
                     deliver_touch(handler, &motion.pointer_at_index(index), phase);
                 } else {
                     log::warn!(
-                        "touch action index {index} is out of range for {} pointer(s)",
+                        "android.input: touch action index {index} is out of range for {} pointer(s)",
                         motion.pointer_count()
                     );
                 }
@@ -105,7 +105,7 @@ fn deliver_motion(handler: &mut AndroidHost, motion: &MotionEvent<'_>) {
                 .and_then(PlatformWindow::mouse_button_from_android)
             {
                 Some(button) => handler.send_input(InputEvent::MouseButton { button, pressed }),
-                None => log::warn!("unmapped Android mouse button {raw}"),
+                None => log::warn!("android.input: unmapped Android mouse button {raw}"),
             }
         }
         _ => {}
@@ -118,7 +118,7 @@ fn deliver_touch(handler: &mut AndroidHost, pointer: &Pointer<'_>, phase: TouchP
         Ok(id) => id,
         Err(_) => {
             log::warn!(
-                "negative Android pointer id {} ignored",
+                "android.input: negative Android pointer id {} ignored",
                 pointer.pointer_id()
             );
             return;
@@ -138,7 +138,7 @@ fn deliver_key(handler: &mut AndroidHost, key: &KeyEvent<'_>) {
     let raw = match i32::try_from(raw) {
         Ok(raw) => raw,
         Err(_) => {
-            log::warn!("Android key code {raw} does not fit in i32");
+            log::warn!("android.input: Android key code {raw} does not fit in i32");
             return;
         }
     };

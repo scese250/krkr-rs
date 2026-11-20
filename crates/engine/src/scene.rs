@@ -2046,8 +2046,8 @@ impl Scene {
             Some(byte) => i32::from(*byte),
             None => {
                 log::error!(
-                    "engine: the province pixel read of a {}x{} province plane found {} plane \
-                     bytes",
+                    "engine.scene: the province pixel read of a {}x{} province plane found {} \
+                     plane bytes",
                     layer.province_width,
                     layer.province_height,
                     buf.len()
@@ -2091,7 +2091,7 @@ impl Scene {
         }
         let Some(offset) = plane_offset(w, px, py) else {
             log::error!(
-                "engine: the province pixel write of a {w}x{h} province plane has no address"
+                "engine.scene: the province pixel write of a {w}x{h} province plane has no address"
             );
             return;
         };
@@ -2104,7 +2104,8 @@ impl Scene {
                 layer.image_modified = true;
             }
             None => log::error!(
-                "engine: the province pixel write of a {w}x{h} province plane found {} plane bytes",
+                "engine.scene: the province pixel write of a {w}x{h} province plane found {} \
+                 plane bytes",
                 plane.len()
             ),
         }
@@ -2843,7 +2844,7 @@ impl Scene {
                     plane_offset(layer.province_width, px, py).and_then(|offset| buf.get(offset));
                 let Some(byte) = byte else {
                     log::error!(
-                        "engine: the hit test of a {}x{} province plane found {} plane bytes",
+                        "engine.scene: the hit test of a {}x{} province plane found {} plane bytes",
                         layer.province_width,
                         layer.province_height,
                         buf.len()
@@ -2871,7 +2872,7 @@ impl Scene {
                     };
                     let Some(alpha) = bmp.rgba.get(offset + 3) else {
                         log::error!(
-                            "engine: the hit test of a {}x{} image found no pixel buffer",
+                            "engine.scene: the hit test of a {}x{} image found no pixel buffer",
                             bmp.width,
                             bmp.height
                         );
@@ -3075,7 +3076,7 @@ impl Scene {
                         .and_then(|pixels| pixels.checked_mul(4));
                     if !decoded.is_consistent() || expected != Some(decoded.rgba.len()) {
                         log::warn!(
-                            "engine: the preloaded image {} does not match its probed size",
+                            "engine.scene: the preloaded image {} does not match its probed size",
                             preload.key.name
                         );
                         continue;
@@ -3083,10 +3084,10 @@ impl Scene {
                     self.cache_decoded_image(preload.key, decoded);
                 }
                 ImageOutcome::Failed(message) => {
-                    log::warn!("engine: a preloaded image failed to decode: {message}");
+                    log::warn!("engine.scene: a preloaded image failed to decode: {message}");
                 }
                 ImageOutcome::Cancelled => {
-                    log::warn!("engine: a preloaded image was cancelled before it decoded");
+                    log::warn!("engine.scene: a preloaded image was cancelled before it decoded");
                 }
             }
         }
@@ -3256,7 +3257,7 @@ impl Scene {
                     }
                     _ => {
                         log::error!(
-                            "engine: the decoded image of a {width}x{height} bitmap does not \
+                            "engine.scene: the decoded image of a {width}x{height} bitmap does not \
                              match the probed size; the bitmap stays blank"
                         );
                         install_blank(bitmap);
@@ -3264,11 +3265,11 @@ impl Scene {
                 }
             }
             ImageOutcome::Failed(message) => {
-                log::error!("engine: an image decode failed: {message}");
+                log::error!("engine.scene: an image decode failed: {message}");
                 install_blank(bitmap);
             }
             ImageOutcome::Cancelled => {
-                log::warn!("engine: an image decode was cancelled before it produced pixels");
+                log::warn!("engine.scene: an image decode was cancelled before it produced pixels");
                 install_blank(bitmap);
             }
         }
@@ -3805,7 +3806,7 @@ impl Scene {
             return false;
         }
         if self.remove_bitmap(id) {
-            log::trace!("released scene bitmap #{id}");
+            log::trace!("engine.scene: released scene bitmap id={id}");
             return true;
         }
         false
