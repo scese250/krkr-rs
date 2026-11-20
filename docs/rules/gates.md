@@ -181,6 +181,16 @@ green (section 6).
   Zig, `build-android.sh`, Gradle, the `check-jni-libs.sh` self-test and
   package verification. The APK is signed with the configured keystore when the
   secret exists, otherwise with the debug key.
+* **`apk`** ends with `scripts/apk_size_report.sh`, before the upload. It
+  reports what the package is made of — every entry, grouped, with the
+  totals — and checks the names the native code resolves *by name*: the seven
+  static fields the engine reads off its Activity with `GetStaticFieldID`,
+  and the game-activity glue's own by-name lookup of the native entry point.
+  A shrinker that renames or drops one of them leaves a package that installs,
+  launches and then dies on the device, with nothing in the build log to show
+  for it, so the names are read out of the package and checked where no device
+  is needed. The step also holds the package to a size budget, so a build
+  that grows without a reason fails before it is published.
 * **`release`** downloads both artifacts and is the only job that runs
   `gh release create`/`gh release upload`. It needs both platform jobs, so the
   two builds cannot race to create or update the release. On a manual run there

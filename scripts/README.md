@@ -34,7 +34,22 @@ suites and the CI release pipeline are documented in
 - `krkr_gates/checks/` — one module per check, each exposing `run(argv) -> int`.
 - `fixtures/` — the checks' own test corpus; see below.
 - `allowlists/` — the reviewed exceptions, one file per check.
+- `apk_size_report.py` / `apk_size_report.sh` — the release job's APK report;
+  not a gate check, because it needs the built package. See below.
 - `pyproject.toml` / `uv.lock` — the project metadata.
+
+### The APK size report
+
+`apk_size_report.sh` runs in the release workflow's `apk` job, after the
+package is assembled and before it is uploaded. It reports what the package
+is made of (every entry, grouped, with the totals, and a `apk-size …` line per
+group for a later build to compare against) and verifies the names the native
+code resolves *by name* — the static fields the engine reads off its Activity
+through JNI, and the game-activity glue's lookup of the native entry point.
+The check reads the DEX tables, the ELF symbol table and the compiled manifest
+directly, with the standard library only, so it needs no SDK tool and no
+device; `--self-test` mutates the real package four ways and asserts that each
+mutation is caught.
 
 ### The fixtures are the checks' own tests
 
