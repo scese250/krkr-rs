@@ -954,14 +954,18 @@ fn a_stopped_transition_releases_its_self_image() {
 /// (`reference/cpp/core/visual/LayerIntf.cpp:7172-7198`), and a child in a
 /// transition without children draws its self image there through
 /// `CopySelfForRect` (`:6781-6783`, `:7278-7309`). Such a child draws no
-/// cache of its own (`:7156-7157`), and the parent's cache is recomposited
-/// while a drawn image changes (`:6305-6335`).
+/// cache of its own (`:7156-7157`). The parent's cache is recomposited while
+/// a drawn **content** changes (`:6305-6335`); the nested transition's own
+/// tick is a temp update, so it appends to no region (`:6318-6324`, `:8067`)
+/// and the cached subtree keeps the blend its last reconstruction drew.
 ///
 /// reference/cpp/core/visual/LayerIntf.cpp:7172-7198
 /// reference/cpp/core/visual/LayerIntf.cpp:6781-6783
 /// reference/cpp/core/visual/LayerIntf.cpp:7278-7309
 /// reference/cpp/core/visual/LayerIntf.cpp:7156-7157
 /// reference/cpp/core/visual/LayerIntf.cpp:6305-6335
+/// reference/cpp/core/visual/LayerIntf.cpp:6318-6324
+/// reference/cpp/core/visual/LayerIntf.cpp:8067
 #[test]
 fn a_nested_childless_transition_is_cached_as_its_self_image() {
     let _lock = vm_lock();
@@ -1007,18 +1011,22 @@ fn a_nested_childless_transition_is_cached_as_its_self_image() {
     let frame = cache_bitmap_of(&env, "parent").expect("the parent's frame");
     assert_eq!(scene_pixel(&env, frame, 0, 0), blended);
 
-    // The nested self image is rewritten on every tick, so the next composite
-    // rebuilds the cache in place instead of leaving the stale main image.
+    // The nested self image is rewritten on every tick, but a transition's
+    // tick is a temp update: it appends to no recalculation region
+    // (`Update(tempupdate = true)`, LayerIntf.cpp:6315-6333, and the
+    // transition's own tick at :8067). The parent's cached subtree is
+    // therefore reused: it keeps the blend its last reconstruction drew,
+    // which is the child's self image and not its main image.
     env._scene.set_bitmap_clean(content);
     env.advance(0.0);
     assert_eq!(
         named_layer(&env, "parent").cache_content,
         Some(content),
-        "the cache is recomposited into the same bitmap"
+        "the cache keeps its own bitmap"
     );
     assert!(
-        env._scene.bitmap(content).unwrap().dirty,
-        "the changed nested self image invalidates the cache"
+        !env._scene.bitmap(content).unwrap().dirty,
+        "the transition's tick appends to no region, so the cache is reused"
     );
     assert_eq!(scene_pixel(&env, content, 0, 0), blended);
 }
@@ -1132,10 +1140,17 @@ fn with_children_reuses_the_subtree_content_between_frames() {
 /// reused rather than recomposited. `Complete` returns the existing
 /// `CacheBitmap` while `CacheRecalcRegion` is empty
 /// (`LayerIntf.cpp:7734-7737`), and a frame change is not a source change
-/// (`LayerIntf.cpp:6305-6335`).
+/// (`LayerIntf.cpp:6305-6335`). The teardown releases the transition's cache
+/// consumer before it exchanges the layers (`LayerIntf.cpp:7961-7991`), so
+/// the destination holds no cache — and no recalculation region, which the
+/// reference keeps only while the cache is enabled (`:6251-6257`) — when the
+/// exchange marks the layer.
 ///
 /// reference/cpp/core/visual/LayerIntf.cpp:7734-7737
 /// reference/cpp/core/visual/LayerIntf.cpp:6305-6335
+/// reference/cpp/core/visual/LayerIntf.cpp:7961-7991
+/// reference/cpp/core/visual/LayerIntf.cpp:6251-6257
+/// reference/cpp/core/visual/LayerIntf.cpp:7721-7723
 #[test]
 fn a_composited_whole_subtree_transition_reuses_its_content() {
     let _lock = vm_lock();
@@ -1165,16 +1180,29 @@ fn a_composited_whole_subtree_transition_reuses_its_content() {
         "the source subtree content is reused, not recomposited"
     );
 
-    // The teardown returns the layer to its own subtree; a cache kept from
-    // before or during the transition is stale and must be recomposited
-    // (LayerIntf.cpp:7961-7991).
+    // The teardown releases the transition's cache consumer before it
+    // exchanges the layers (`DecCacheEnabledCount`, LayerIntf.cpp:7961-7964),
+    // so the destination holds no cache when the exchange marks the layer
+    // (`:7969-7991`): the content goes with the last consumer, and the
+    // reference keeps a recalculation region only while the cache is enabled
+    // (`:6251-6257`, `:6327-6333`) — `Complete` returns nothing while the
+    // cache is off (`:7721-7723`). The layer draws its own subtree again.
     let _ = env
         ._scene
         .take_layer_content_region(named_layer(&env, "dest").id);
     env.run("b.stopTransition();");
+    assert_eq!(
+        named_layer(&env, "dest").cache_enabled_count,
+        0,
+        "the teardown releases the transition's cache consumer"
+    );
     assert!(
-        named_layer(&env, "dest").content_region.is_some(),
-        "the ended transition resumes from a fresh composite"
+        named_layer(&env, "dest").cache_content.is_none(),
+        "the content goes with the last consumer"
+    );
+    assert!(
+        named_layer(&env, "dest").content_region.is_none(),
+        "a layer that does not cache keeps no recalculation region"
     );
 }
 
