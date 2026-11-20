@@ -159,10 +159,6 @@ fn raster_operations_mark_the_bitmap_dirty() {
         assert!(!bmp.dirty, "{operation}: a fresh bitmap starts clean");
         run(&mut bmp);
         assert!(bmp.dirty, "{operation} must mark the bitmap dirty");
-        assert!(
-            bmp.content_generation > 0,
-            "{operation} must bump the content generation"
-        );
     }
 
     let square = [(0.0, 0.0), (8.0, 0.0), (8.0, 8.0), (0.0, 8.0)];

@@ -243,30 +243,21 @@ pub struct LayerState {
     /// the transition costs no per-tick pixel work. `None` while no such
     /// transition runs ([`Scene::set_effect`]).
     pub effect: Option<EffectDraw>,
-    /// The layer's own contribution to the composited content of its
-    /// ancestors.
+    /// The region of the layer's own composited content that must be
+    /// reconstructed, in the layer's own coordinate space.
     ///
-    /// The counter advances whenever the layer changes in a way a composite
-    /// sees — its geometry, its visibility, its face, its image placement —
-    /// so the content signature recorded for a subtree that contains it no
-    /// longer matches and the content is recomposited.
+    /// `None` — the composited content is current: nothing a composite sees
+    /// changed since the content was written.
     ///
-    /// The counter is the engine's record that the content changed: a layer
-    /// that did not change keeps its counter, and the composite of a subtree
-    /// that holds it stays reusable. A transition's tick changes the
-    /// transition's own frame and no layer's contribution, so the two
-    /// endpoints' composites stay reusable for the whole transition.
-    pub content_epoch: u64,
-    /// The content signature of the composited subtree: the sum of the drawn
-    /// sources' [`Self::content_epoch`] and their images'
-    /// [`BitmapState::content_generation`], recorded when
-    /// [`Self::cache_content`] was last composited.
+    /// The region is the layer's own contribution and its descendants': a
+    /// change to the layer's image or state marks the layer's rectangle, and
+    /// a change to a descendant marks the descendant's rectangle converted
+    /// into this layer's space. The composite of the layer reconstructs the
+    /// region alone and leaves the rest of the content untouched.
     ///
-    /// A source whose pixels changed behind the layer accessors is caught by
-    /// its image's generation, and a source whose own state changed by the
-    /// accessors by its epoch, so one comparison decides whether the
-    /// composited content is still the content the tree describes.
-    pub cache_content_signature: u64,
+    /// The region is the one record of what a composite has to redo: the
+    /// content bitmap beside it says nothing on its own.
+    pub content_region: Option<Rect>,
     /// The layer's hint (script `layer.hint`) and the hint-system flags.
     pub hint: String,
     /// Whether the layer inherits the parent's hint.
@@ -445,12 +436,6 @@ pub struct BitmapState {
     /// destroying the layer must not free it while the script object can
     /// still read it.
     pub script_owned: bool,
-    /// Monotonic pixel-change counter, bumped whenever the pixels may have
-    /// changed (a mutable access or [`BitmapState::mark_dirty`]). A
-    /// composited subtree cache records the sum over its source images so an
-    /// image edit that did not go through a layer accessor still invalidates
-    /// the cache.
-    pub content_generation: u64,
     /// The decode whose pixels have not landed yet, or `None` when the
     /// bitmap holds its pixels.
     ///
@@ -473,7 +458,6 @@ impl BitmapState {
             dirty: false,
             dirty_region: None,
             script_owned: false,
-            content_generation: 0,
             pending: None,
         }
     }
@@ -483,7 +467,6 @@ impl BitmapState {
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
         self.dirty_region = None;
-        self.content_generation = self.content_generation.wrapping_add(1);
     }
 
     /// Mark a rectangle of the bitmap as changed.
@@ -508,7 +491,6 @@ impl BitmapState {
         self.dirty = true;
         // A region that covers the whole bitmap is the same as no region.
         self.dirty_region = if region == whole { None } else { Some(region) };
-        self.content_generation = self.content_generation.wrapping_add(1);
     }
 
     /// Return the byte offset of a pixel, or `None` outside the bitmap or
@@ -612,7 +594,28 @@ pub struct FontState {
     pub angle: f64,
 }
 
+/// What a change to the scene touches, and who keeps the region.
+///
+/// The region of a layer is the part of its own composited content that is
+/// not current, so it is kept by the layers whose content a change reaches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChangeScope {
+    /// The layer's own state changed. A layer keeps a recalculation region
+    /// only while its caching is enabled, and the ancestors keep their region
+    /// while they cache.
+    Layer,
+    /// The pixels the layer draws changed. Every layer that holds those
+    /// pixels holds a content that is no longer current — the layer draws
+    /// the source image, and its ancestors hold the layer's contribution —
+    /// so every one of them keeps the region, caching or not.
+    Content,
+}
+
 /// Rectangle in window coordinates.
+///
+/// The origin is the space of whatever holds the rectangle: a layer's
+/// rectangle is in its parent's space, and a content region is in the
+/// layer's own space.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Rect {
@@ -631,6 +634,65 @@ impl Rect {
     pub fn new(x: i32, y: i32, w: u32, h: u32) -> Self {
         Self { x, y, w, h }
     }
+
+    /// The exclusive right edge, saturating.
+    pub fn right(&self) -> i32 {
+        self.x.saturating_add(rect_i32(self.w))
+    }
+
+    /// The exclusive bottom edge, saturating.
+    pub fn bottom(&self) -> i32 {
+        self.y.saturating_add(rect_i32(self.h))
+    }
+
+    /// Whether the rectangle covers no pixel.
+    pub fn is_empty(&self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+
+    /// The smallest rectangle holding both.
+    pub fn union(&self, other: &Rect) -> Rect {
+        let left = self.x.min(other.x);
+        let top = self.y.min(other.y);
+        let right = self.right().max(other.right());
+        let bottom = self.bottom().max(other.bottom());
+        Rect::new(
+            left,
+            top,
+            (right.saturating_sub(left).max(0)) as u32,
+            (bottom.saturating_sub(top).max(0)) as u32,
+        )
+    }
+
+    /// The overlapping rectangle, or `None` when the two do not overlap.
+    pub fn intersection(&self, other: &Rect) -> Option<Rect> {
+        let left = self.x.max(other.x);
+        let top = self.y.max(other.y);
+        let right = self.right().min(other.right());
+        let bottom = self.bottom().min(other.bottom());
+        (right > left && bottom > top)
+            .then(|| Rect::new(left, top, (right - left) as u32, (bottom - top) as u32))
+    }
+
+    /// The rectangle moved by an offset.
+    pub fn offset(&self, dx: i32, dy: i32) -> Rect {
+        Rect::new(
+            self.x.saturating_add(dx),
+            self.y.saturating_add(dy),
+            self.w,
+            self.h,
+        )
+    }
+
+    /// The rectangle's area in pixels.
+    pub fn area(&self) -> u64 {
+        u64::from(self.w) * u64::from(self.h)
+    }
+}
+
+/// An `i32` bound for a pixel dimension.
+fn rect_i32(value: u32) -> i32 {
+    value.min(i32::MAX as u32) as i32
 }
 
 /// The image-load variant a [`DecodedImageKey`] identifies.
@@ -1159,8 +1221,7 @@ impl Scene {
             transition_self: None,
             transition_frame: None,
             effect: None,
-            content_epoch: 0,
-            cache_content_signature: 0,
+            content_region: None,
             hint: String::new(),
             show_parent_hint: false,
             ignore_hint_sensing: false,
@@ -1503,33 +1564,144 @@ impl Scene {
             .is_some_and(|window| window.primary_layer == Some(id))
     }
 
-    /// Advance the contribution of every layer of `window`: a window
-    /// mutation can change the root render order, so the layers it holds
-    /// contribute differently to every composite that holds them.
+    /// Mark every layer of `window` as changed: a window mutation can change
+    /// the root render order, so the layers it holds contribute differently
+    /// to every composite that holds them.
     fn invalidate_window_cache(&mut self, window: u32) {
-        for layer in &mut self.layers {
-            if layer.window == window {
-                layer.content_epoch = layer.content_epoch.wrapping_add(1);
-            }
+        let ids: Vec<u32> = self
+            .layers
+            .iter()
+            .filter(|layer| layer.window == window)
+            .map(|layer| layer.id)
+            .collect();
+        for id in ids {
+            self.mark_layer_changed(id);
         }
     }
 
-    /// Advance `id`'s own contribution because this layer changed, so the
-    /// content signature every composite recorded for it no longer matches.
+    /// Mark the layer's own contribution as changed: the whole rectangle the
+    /// layer draws into has to be reconstructed.
     ///
     /// The layer's ancestors hold the layer's contribution in their own
-    /// signatures, so they are recomposited with it; they need no mark of
-    /// their own.
-    fn invalidate_layer_cache(&mut self, id: u32) {
-        if let Some(layer) = self.layer_mut_untracked(id) {
-            layer.content_epoch = layer.content_epoch.wrapping_add(1);
+    /// regions, so they are marked with it; they need no mark of their own.
+    pub(crate) fn mark_layer_changed(&mut self, id: u32) {
+        let Some(layer) = self.layer(id) else {
+            return;
+        };
+        let area = Rect::new(0, 0, layer.rect.w, layer.rect.h);
+        self.extend_layer_region(id, area, ChangeScope::Layer);
+    }
+
+    /// Mark the layer's own contribution as changed and record that the
+    /// content changed.
+    ///
+    /// The marking alone says what has to be reconstructed; the revision
+    /// says that the cached layers are to be revisited and the frame is to
+    /// be drawn again. A caller that changes a layer through the accessors
+    /// (`Scene::update_layer`, `Scene::layer_mut`) gets both.
+    pub fn invalidate_layer_content(&mut self, id: u32) {
+        self.mark_layer_changed(id);
+        self.touch_content();
+    }
+
+    /// Extend the region of `id` — and of every ancestor above it — with
+    /// `area`, the rectangle in `id`'s own coordinate space.
+    ///
+    /// The region of a layer is the part of its own composited content that
+    /// is not current. A change to the layer marks its own region, and the
+    /// ancestors hold the layer's contribution, so the same rectangle travels
+    /// up the chain, converted into each ancestor's space on the way.
+    ///
+    /// A layer contributes nothing outside its own rectangle, so the
+    /// rectangle is clipped to it as it travels. The ancestors are marked
+    /// only while the layer is visible: a hidden layer contributes nothing
+    /// to the composite of its ancestors.
+    fn extend_layer_region(&mut self, id: u32, area: Rect, scope: ChangeScope) {
+        let visible = self.layer(id).is_some_and(|layer| layer.visible);
+        self.extend_region_chain(id, area, visible, scope);
+    }
+
+    /// Walk the chain from `id` up to the root, marking every layer on it
+    /// with `area`.
+    ///
+    /// `area` is in `id`'s own coordinate space, and it is converted into
+    /// each ancestor's space on the way. `visible` says whether the
+    /// ancestors are marked at all.
+    fn extend_region_chain(&mut self, id: u32, area: Rect, visible: bool, scope: ChangeScope) {
+        // The chain from `id` up to the root, with the offset of every layer
+        // inside its parent.
+        let mut chain: Vec<(u32, i32, i32)> = Vec::new();
+        let mut current = Some(id);
+        let mut steps = 0usize;
+        while let Some(cid) = current {
+            let Some(layer) = self.layer(cid) else {
+                break;
+            };
+            chain.push((cid, layer.rect.x, layer.rect.y));
+            current = layer.parent;
+            steps += 1;
+            if steps > self.layers.len() {
+                break;
+            }
         }
+        let mut area = area;
+        for index in 0..chain.len() {
+            if index > 0 {
+                if !visible {
+                    // The layer contributes nothing to the ancestors while it
+                    // is hidden.
+                    break;
+                }
+                // The rectangle is in the child's space; the parent's space
+                // holds it at the child's offset.
+                let (_, offset_x, offset_y) = chain[index - 1];
+                area = area.offset(offset_x, offset_y);
+            }
+            let (cid, _, _) = chain[index];
+            let Some(layer) = self.layer(cid) else {
+                break;
+            };
+            // A layer keeps a region only while its caching is enabled. The
+            // change travels to the ancestors whatever the layers in between
+            // keep. A change to the pixels a layer draws is a change to the
+            // content every layer above it holds, so those keep their region
+            // whether they cache or not.
+            let keeps_region = scope == ChangeScope::Content || layer.cache_enabled_count != 0;
+            let own = Rect::new(0, 0, layer.rect.w, layer.rect.h);
+            let Some(clipped) = area.intersection(&own) else {
+                // The rectangle left the layer's own area: the rest of the
+                // chain holds nothing of it.
+                break;
+            };
+            if keeps_region {
+                if let Some(layer) = self.layer_mut_untracked(cid) {
+                    layer.content_region = Some(match layer.content_region {
+                        Some(current) => current.union(&clipped),
+                        None => clipped,
+                    });
+                }
+            }
+            area = clipped;
+        }
+    }
+
+    /// The region of the layer's own composited content that must be
+    /// reconstructed, in the layer's own coordinate space.
+    pub fn layer_content_region(&self, id: u32) -> Option<Rect> {
+        self.layer(id).and_then(|layer| layer.content_region)
+    }
+
+    /// Take the layer's content region: the composite consumed it, so the
+    /// content it wrote is current.
+    pub fn take_layer_content_region(&mut self, id: u32) -> Option<Rect> {
+        self.layer_mut_untracked(id)
+            .and_then(|layer| layer.content_region.take())
     }
 
     /// Mutably look up a layer by id, bumping [`Scene::structure_revision`].
     /// The layer's subtree cache and every caching ancestor's are marked stale.
     pub fn layer_mut(&mut self, id: u32) -> Option<&mut LayerState> {
-        self.invalidate_layer_cache(id);
+        self.mark_layer_changed(id);
         self.touch_structure();
         self.layer_mut_untracked(id)
     }
@@ -1579,9 +1751,29 @@ impl Scene {
         id: u32,
         f: impl FnOnce(&mut LayerState) -> bool,
     ) -> Option<bool> {
+        let before = self.layer(id).map(|layer| (layer.rect, layer.parent));
         let changed = f(self.layer_mut_untracked(id)?);
         if changed {
-            self.invalidate_layer_cache(id);
+            self.mark_layer_changed(id);
+            let after = self.layer(id).map(|layer| (layer.rect, layer.parent));
+            // A layer that moved leaves its old place and its new one to
+            // redraw in the parent: the parent's region holds both, so the
+            // parent is marked before and after the move.
+            if let (Some((old, old_parent)), Some((new, new_parent))) = (before, after)
+                && (old.x != new.x || old.y != new.y)
+                && old_parent == new_parent
+                && let Some(parent) = new_parent
+            {
+                let old_at = Rect::new(0, 0, old.w, old.h).offset(old.x, old.y);
+                let new_at = Rect::new(0, 0, new.w, new.h).offset(new.x, new.y);
+                let visible = self.layer(id).is_some_and(|layer| layer.visible);
+                self.extend_region_chain(
+                    parent,
+                    old_at.union(&new_at),
+                    visible,
+                    ChangeScope::Layer,
+                );
+            }
             self.touch_structure();
         }
         Some(changed)
@@ -2120,7 +2312,7 @@ impl Scene {
         // The surviving parent lost its doomed children: its subtree cache
         // and every caching ancestor's are now stale.
         if let Some(parent) = parent {
-            self.invalidate_layer_cache(parent);
+            self.mark_layer_changed(parent);
         }
         for bitmap in doomed_bitmaps {
             self.release_bitmap(bitmap);
@@ -2710,7 +2902,6 @@ impl Scene {
             dirty: true,
             dirty_region: None,
             script_owned: false,
-            content_generation: 0,
             pending: None,
         });
         // The bitmap starts dirty, so the frame uploads it.
@@ -2757,7 +2948,6 @@ impl Scene {
             dirty: true,
             dirty_region: None,
             script_owned: false,
-            content_generation: 0,
             pending: Some(pending),
         });
         // The bitmap starts dirty, so the frame uploads it, and its pixels
@@ -2913,6 +3103,7 @@ impl Scene {
         bitmap.pending = Some(pending);
         bitmap.mark_dirty();
         // The bitmap waits for a decode again, and its pixels changed.
+        self.mark_bitmap_layers_changed(id);
         self.pending_bitmaps.insert(id);
         self.dirty_bitmaps.insert(id);
         self.touch_structure();
@@ -3056,6 +3247,9 @@ impl Scene {
         bitmap.mark_dirty();
         // The bitmap holds its pixels now; it waits for no decode.
         self.pending_bitmaps.remove(&id);
+        // The pixels landed, so the layers that draw the bitmap have to be
+        // redrawn where they draw it.
+        self.mark_bitmap_layers_changed(id);
         // The pixels landed, so the bitmap's content changed; the structure
         // revision moves with it because the projection's texture table may
         // have skipped the bitmap while it had no pixels.
@@ -3723,18 +3917,76 @@ impl Scene {
     }
 
     /// Mutably look up a bitmap by id, bumping [`Scene::content_revision`]
-    /// and the bitmap's [`BitmapState::content_generation`] (every mutable
-    /// access is a possible content change). A dimension change is a
-    /// structural change: write it through [`Scene::resize_bitmap`] or
-    /// [`Scene::replace_bitmap_image`], which bump
-    /// [`Scene::structure_revision`].
+    /// (every mutable access is a possible content change). The layers that
+    /// draw the bitmap are marked with the area they draw from it, so their
+    /// composited content is no longer current there.
+    ///
+    /// A dimension change is a structural change: write it through
+    /// [`Scene::resize_bitmap`] or [`Scene::replace_bitmap_image`], which
+    /// bump [`Scene::structure_revision`].
     pub fn bitmap_mut(&mut self, id: u32) -> Option<&mut BitmapState> {
         self.touch_content();
-        let mut bitmap = self.bitmap_mut_untracked(id);
-        if let Some(state) = bitmap.as_mut() {
-            state.content_generation = state.content_generation.wrapping_add(1);
+        self.mark_bitmap_layers_changed(id);
+        self.bitmap_mut_untracked(id)
+    }
+
+    /// Mark the layers that draw the bitmap as changed: the area they draw
+    /// from the bitmap is no longer current.
+    ///
+    /// The area is the image's placement inside the layer, clipped to the
+    /// layer's own rectangle: the layer contributes nothing outside it.
+    fn mark_bitmap_layers_changed(&mut self, id: u32) {
+        // The layers that draw the bitmap, with the image they draw from it
+        // and the placement they draw it at.
+        let drawers: Vec<(u32, Option<u32>, Option<Rect>)> = self
+            .layers
+            .iter()
+            .filter(|layer| layer.bitmap == Some(id) || layer.transition_self == Some(id))
+            .map(|layer| {
+                let source = if layer.transition_self.is_some() {
+                    layer.transition_self
+                } else {
+                    layer.bitmap
+                };
+                (
+                    layer.id,
+                    source,
+                    Some(Rect::new(
+                        layer.image_left,
+                        layer.image_top,
+                        layer.image_width,
+                        layer.image_height,
+                    )),
+                )
+            })
+            .collect();
+        for (id, source, placed) in drawers {
+            let area = match placed {
+                Some(placed) => {
+                    let (bitmap_w, bitmap_h) = match source {
+                        Some(bitmap) => match self.bitmap(bitmap) {
+                            Some(bitmap) => (bitmap.width, bitmap.height),
+                            None => (0, 0),
+                        },
+                        None => (0, 0),
+                    };
+                    let width = if placed.w > 0 { placed.w } else { bitmap_w };
+                    let height = if placed.h > 0 { placed.h } else { bitmap_h };
+                    let placed = Rect::new(placed.x, placed.y, width, height);
+                    let own = Rect::new(
+                        0,
+                        0,
+                        self.layer(id).map_or(0, |layer| layer.rect.w),
+                        self.layer(id).map_or(0, |layer| layer.rect.h),
+                    );
+                    placed.intersection(&own)
+                }
+                None => None,
+            };
+            if let Some(area) = area {
+                self.extend_layer_region(id, area, ChangeScope::Content);
+            }
         }
-        bitmap
     }
 
     /// Replace a bitmap's image with `width` x `height` RGBA pixels, marking
@@ -3896,7 +4148,7 @@ impl Scene {
             _ => false,
         };
         if changed {
-            self.invalidate_layer_cache(id);
+            self.mark_layer_changed(id);
             self.touch_structure();
             if let Some(old) = replaced {
                 self.release_bitmap(old);
@@ -3929,7 +4181,7 @@ impl Scene {
                 // The layer returns to drawing its own subtree: a cache kept
                 // from before the transition (or the one its transition ran
                 // through) is stale now, so resume from a fresh composite.
-                self.invalidate_layer_cache(id);
+                self.mark_layer_changed(id);
             }
             self.touch_structure();
             if let Some(replaced) = replaced {
@@ -3979,7 +4231,7 @@ impl Scene {
                 // The layer returns to drawing its own subtree: a cache kept
                 // from before the transition (or the one its transition ran
                 // through) is stale now, so resume from a fresh composite.
-                self.invalidate_layer_cache(id);
+                self.mark_layer_changed(id);
             }
             self.touch_structure();
             if let Some(replaced) = replaced {

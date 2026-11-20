@@ -447,7 +447,7 @@ The accessors do bump it:
 |---|---|
 | `Scene::layer_mut(id)` | the structure revision, unconditionally |
 | `Scene::update_layer(id, f)` | the structure revision, when `f` reports a change |
-| `Scene::bitmap_mut(id)` | the content revision and the bitmap's content generation |
+| `Scene::bitmap_mut(id)` | the content revision and the region of every layer that draws the bitmap |
 | `Scene::replace_bitmap_image(..)` | the content revision always; the structure revision when the size changed |
 | `Scene::add_layer`, `add_window`, `add_bitmap`, `add_font`, `remove_*` | the structure revision |
 

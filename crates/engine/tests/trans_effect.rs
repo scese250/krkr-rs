@@ -159,15 +159,15 @@ fn advancing_an_effect_keeps_the_layer_content_reusable() {
         state.visible = true;
         state.bitmap = Some(source);
     }
-    let epoch = scene.layer(layer).expect("layer").content_epoch;
+    let region = scene.layer_content_region(layer);
 
     let first = cross_fade(25.0)
         .effect_draw(source, other, (4, 4), true)
         .expect("first draw");
     scene.set_effect(layer, Some(first));
     assert_eq!(
-        scene.layer(layer).expect("layer").content_epoch,
-        epoch,
+        scene.layer_content_region(layer),
+        region,
         "a new frame does not recomposite the layer's unchanged content"
     );
 
@@ -176,14 +176,14 @@ fn advancing_an_effect_keeps_the_layer_content_reusable() {
         .expect("second draw");
     scene.set_effect(layer, Some(second));
     assert_eq!(
-        scene.layer(layer).expect("layer").content_epoch,
-        epoch,
+        scene.layer_content_region(layer),
+        region,
         "the next tick reuses the content too"
     );
 
     scene.set_effect(layer, None);
     assert!(
-        scene.layer(layer).expect("layer").content_epoch > epoch,
+        scene.layer_content_region(layer) != region,
         "clearing the draw resumes from a fresh composite"
     );
 }
@@ -218,13 +218,6 @@ fn the_generic_path_writes_no_bitmap() {
     assert!(
         scene.bitmaps.iter().all(|bitmap| !bitmap.dirty),
         "the effect draw dirties no bitmap"
-    );
-    assert!(
-        scene
-            .bitmaps
-            .iter()
-            .all(|bitmap| bitmap.content_generation == 0),
-        "the effect draw writes no pixel"
     );
 
     // The CPU blend writes the frame it composites, which is what the

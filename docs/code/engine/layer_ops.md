@@ -172,27 +172,67 @@ projection draws the two sources, so nothing is written to a bitmap per tick
 
 ### The composited content's validity
 
-`render_layer_subtree` composites the subtree only while the content is not
-the content the tree describes. The **content signature** of the subtree is
-the sum of the drawn sources' own contributions
-(`LayerState::content_epoch`) and of their images' `content_generation`, and
-the value recorded when the content was composited is
-`LayerState::cache_content_signature`; the content is composited again when
-the two differ.
+`render_layer_subtree` composites the subtree only where the content is not
+the content the tree describes. The **content region** of a layer
+(`LayerState::content_region`) holds the part of the layer's own composited
+content that has to be reconstructed, in the layer's own coordinate space; a
+layer with no region holds a content that is current.
 
-The reference records the same fact as a region: the layer's
-`CacheRecalcRegion` holds the part of the cache that must be reconstructed
+The region is filled by the change that made the content stale and travels up
+the ancestor chain, converted into each ancestor's space on the way:
+
+* a change to a layer marks the layer's own rectangle — the area its image
+  and its children are composited into — and the ancestors hold the same
+  rectangle (`Scene::update_layer`, `Scene::layer_mut`). A layer keeps a
+  region only while its caching is enabled: the reference's `Update` marks
+  the recalculation region of a layer that caches
+  (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`);
+* a change to the pixels a layer draws from marks the area the layer draws
+  from that image (`Scene::bitmap_mut`). Every layer that holds those pixels
+  — the layer itself and the ancestors that hold its contribution — keeps the
+  region, caching or not: the content they hold is no longer current;
+* a layer that moved marks the old place and the new one in its parent
+  (`Scene::update_layer`), the way the reference updates the parent before
+  and after the move
+  (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6370-6381`);
+* a hidden layer marks nothing above itself: it contributes nothing to the
+  composite of its ancestors
+  (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6249-6256`).
+
+The composite then reconstructs the region alone: the backdrop is filled over
+the region and not over the whole plane, and a draw writes only the part of
+it that lands inside the region. A region that is empty leaves the content
+untouched, which is what makes a cached layer cheap.
+
+A composite settles only its own region: a layer's region is its own record,
+and only the composite that holds the layer's picture can settle it. A
+descendant that keeps no composite of its own would otherwise keep its region
+for ever.
+
+A composite that draws a descendant whose cache is stale completes that
+descendant first — the descendant's own composite rebuilds the stale part of
+its cache — and samples the rebuilt cache. A stale cache is never drawn live.
+The reference's shape is the same: the parent's draw completes the child, and
+the child's own draw consumes the child's recalculation region
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7196`).
+
+This is the reference's shape: the layer's `CacheRecalcRegion` holds the
+part of the cache that must be reconstructed
 (`reference/krkr2/cpp/core/visual/LayerIntf.h:963`), the region is filled
 with the rectangles that changed
 (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6254`, `:6285`, `:6329`), and
 `Complete` reconstructs only that region and returns the cached bitmap
 untouched while the region is empty
 (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7734-7740`). The engine's
-signature is not per pixel, so a changed region is still composited whole,
-but both answer the same question and both leave a transition's tick alone:
-the transition's update is a "temp update" that appends to no region
+region is the layer's own rectangle rather than the changed rectangle, so it
+is coarser than the reference's; the shape — one region per layer, each
+layer's own region, an empty region leaving the content alone — is the same. A transition's tick appends to no region
 (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6322-6327`), so the
 transition's endpoints keep their composites.
+
+A draw that scales its image is written whole: the resampler reads the source
+through the mapping of the whole destination, so a clipped destination would
+sample the source at a different place. The pixels are the same either way.
 
 ---
 
@@ -343,10 +383,10 @@ values from it.
   frame. `mark_dirty_rect` narrows the upload to the written rectangle for the
   affine, `operate_rect`, `stretch_blit_mode` and the copy and blend passes
   (`copyRect`, `Blt` and `stretchCopy`); the families that rewrite the whole
-  bitmap (the fills, the blurs, the colour operations) mark it wholly. Both
-  marks bump the bitmap's `content_generation`, which the subtree-cache
-  bookkeeping sums to detect an edit that did not go through a layer
-  accessor.
+  bitmap (the fills, the blurs, the colour operations) mark it wholly. A
+  mutable access to a bitmap (`Scene::bitmap_mut`) marks the area every layer
+  draws from it, so an edit that did not go through a layer accessor still
+  reaches the subtree cache.
 * **An integer one-to-one affine replace is a copy.** When the corner map is
   axis-aligned at unit scale with an integer origin, the supported resamplers
   are exact at integer source centres, so the pass routes to the clipped copy
@@ -393,7 +433,8 @@ values from it.
   that holds either is replaced by a fresh display bitmap, so a transition
   blend never overwrites pixels the script or the frame source owns.
 * **The subtree root never sources its own cache**, and a descendant whose own
-  cache is live is composited through that cache bitmap.
+  cache is live is composited through that cache bitmap; a stale one is
+  completed first.
 
 ---
 
@@ -406,7 +447,7 @@ L3 native (script call)
 layer_ops::fill_color_on_alpha(&mut scene.bitmap_mut(id)?, rect, color, opa)
    │
    ├─► writes straight-alpha RGBA bytes
-   ├─► bitmap.mark_dirty()      → content_revision + content_generation
+   ├─► bitmap.mark_dirty()      → content_revision + the upload's dirty region
    └─► engine::Engine::sync_dirty_bitmaps → upload_textures → the GPU texture
 ```
 

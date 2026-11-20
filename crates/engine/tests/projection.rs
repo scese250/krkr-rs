@@ -1068,8 +1068,8 @@ fn a_frame_update_advances_no_contribution() {
     let dest_bitmap = attach_image(&mut scene, dest, 8, 8);
     // The layers are set up; their contributions are what the frame must
     // leave alone.
-    let dest_epoch = scene.layer(dest).unwrap().content_epoch;
-    let source_epoch = scene.layer(source).unwrap().content_epoch;
+    let dest_region = scene.layer_content_region(dest);
+    let source_region = scene.layer_content_region(source);
 
     let frame = TransitionFrame::new(
         (8, 8),
@@ -1089,13 +1089,13 @@ fn a_frame_update_advances_no_contribution() {
     );
     scene.set_transition_frame(dest, Some(frame));
     assert_eq!(
-        scene.layer(dest).unwrap().content_epoch,
-        dest_epoch,
-        "the frame advances no contribution"
+        scene.layer_content_region(dest),
+        dest_region,
+        "the frame marks no region"
     );
     assert_eq!(
-        scene.layer(source).unwrap().content_epoch,
-        source_epoch,
+        scene.layer_content_region(source),
+        source_region,
         "the ancestor source stays reusable as the frame source"
     );
 
@@ -1119,11 +1119,11 @@ fn a_frame_update_advances_no_contribution() {
     );
     scene.set_transition_frame(dest, Some(next));
     assert_eq!(
-        scene.layer(dest).unwrap().content_epoch,
-        dest_epoch,
-        "the next frame advances no contribution either"
+        scene.layer_content_region(dest),
+        dest_region,
+        "the next frame marks no region either"
     );
-    assert_eq!(scene.layer(source).unwrap().content_epoch, source_epoch);
+    assert_eq!(scene.layer_content_region(source), source_region);
 }
 
 /// A whole-subtree frame stands in for the layer's subtree, so its children

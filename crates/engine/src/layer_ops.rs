@@ -5198,12 +5198,12 @@ fn alloc_bitmap(scene: &mut Scene, w: u32, h: u32) -> Option<u32> {
 
 /// Allocate `root`'s composited subtree content at `w` x `h`, reusing the
 /// existing one when its size already matches. A newly allocated content is
-/// empty, so the layer's own contribution advances: the content signature no
-/// longer matches what was recorded and the content is composited.
-fn ensure_layer_content(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<u32> {
+/// empty, so the whole area has to be drawn into it: the layer's region
+/// covers its own rectangle.
+fn ensure_layer_content(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<(u32, bool)> {
     if let Some(id) = scene.layer(root)?.cache_content {
         if scene.bitmap(id).map(|b| (b.width, b.height)) == Some((w, h)) {
-            return Some(id);
+            return Some((id, false));
         }
         scene.remove_bitmap(id);
         if scene.layer(root)?.cache_bitmap == Some(id) {
@@ -5213,8 +5213,9 @@ fn ensure_layer_content(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<
     let id = alloc_bitmap(scene, w, h)?;
     let layer = scene.layer_mut_untracked(root)?;
     layer.cache_content = Some(id);
-    layer.content_epoch = layer.content_epoch.wrapping_add(1);
-    Some(id)
+    // The new content is empty, so the whole area is what has to be drawn.
+    scene.mark_layer_changed(root);
+    Some((id, true))
 }
 
 /// Drop `root`'s composited content, and the cache-slot bitmap with it when
@@ -5224,6 +5225,9 @@ fn ensure_layer_content(scene: &mut Scene, root: u32, w: u32, h: u32) -> Option<
 /// transition's frame, and the content slot holds the composited content. The
 /// content goes with the refresh; the slot survives it, unless the slot *is*
 /// the content — then it goes with the content and is released once.
+///
+/// The content is gone, so the layer draws its own image again until it is
+/// composited anew; the layer's own region says so.
 fn release_subtree_caches(scene: &mut Scene, root: u32) {
     let (content, display) = match scene.layer_mut_untracked(root) {
         Some(layer) => (layer.cache_content.take(), layer.cache_bitmap.take()),
@@ -5286,75 +5290,28 @@ pub fn ensure_transition_self_image(scene: &mut Scene, root: u32, w: u32, h: u32
     Some(id)
 }
 
-/// The content signature of a subtree: the sum of the drawn sources' own
-/// contributions and of their images' content generations.
+/// The region of the root's composite that has to be reconstructed, in the
+/// root's own coordinate space.
 ///
-/// A source that changed through the layer accessors advances its
-/// [`LayerState::content_epoch`], and a source whose pixels changed behind
-/// them advances its image's [`BitmapState::content_generation`], so the sum
-/// is the subtree's content state in one number: it matches what a composite
-/// recorded while the subtree was unchanged, and stops matching as soon as
-/// the subtree changes.
+/// The root's own region holds what changed in the root's own contribution
+/// and what the descendants' changes were propagated into it: a change to a
+/// descendant marks the descendant's rectangle and the ancestors' regions
+/// with it, converted into each ancestor's space on the way up.
 ///
-/// A descendant whose subtree cache is live contributes the cache's
-/// generation and covers its own descendants, exactly like
-/// [`collect_subtree_draws`], so a change to a hidden layer does not
-/// invalidate the cache while an edit to any drawn image does — including the
-/// self image a transition blends into, even when the edit did not go through
-/// a layer accessor.
+/// The descendants' own regions are added again here, converted with the
+/// positions they hold now: a descendant that moved after its change was
+/// propagated still has to be redrawn where it is.
 ///
-/// `depth` bounds the nested-cache walk: a parent chain cannot be deeper than
-/// the layer pool, so a malformed cycle stops instead of recursing forever.
-///
-/// The signature answers one question — whether the composited content is
-/// still the content the tree describes. A transition's tick answers it the
-/// same way: it changes no source, so the signature does not move.
-///
-/// `order` is the paint order of the window the root belongs to. The caller
-/// reads it once and hands it down, so the nested walk does not rebuild it
-/// for every layer it visits.
-fn subtree_content_signature(scene: &Scene, order: &[u32], root: u32, depth: usize) -> u64 {
-    if scene.layer(root).is_none() {
-        return 0;
-    }
-    let mut sum = 0u64;
-    // Layer id -> the live cache bitmap whose pixels already cover it.
-    let mut covered: Map<u32, u32> = crate::hasher::map();
-    for &id in order {
-        if id != root && !is_descendant(scene, id, root) {
-            continue;
-        }
-        let Some(layer) = scene.layer(id) else {
-            continue;
-        };
-        if let Some(owner) = layer
-            .parent
-            .and_then(|parent| covered.get(&parent).copied())
-        {
-            covered.insert(id, owner);
-            continue;
-        }
-        if id != root && !(layer.visible && layer.opacity != 0.0) {
-            continue;
-        }
-        if id != root && (subtree_opacity(scene, id, root) * 255.0).round() == 0.0 {
-            continue;
-        }
-        if let Some(cache) = live_subtree_cache(scene, layer, root, depth, order) {
-            covered.insert(id, cache);
-            // The cache stands in for the layer and its descendants, so its
-            // own generation is their contribution.
-            if let Some(bitmap) = scene.bitmap(cache) {
-                sum = sum.wrapping_add(bitmap.content_generation);
-            }
-            continue;
-        }
-        sum = sum.wrapping_add(layer.content_epoch);
-        if let Some(bitmap) = subtree_drawn_image(layer).and_then(|id| scene.bitmap(id)) {
-            sum = sum.wrapping_add(bitmap.content_generation);
-        }
-    }
-    sum
+/// `None` — the content is current: nothing a composite sees changed since
+/// the content was written.
+fn subtree_content_region(scene: &Scene, root: u32, w: u32, h: u32) -> Option<Rect> {
+    let plane = Rect::new(0, 0, w, h);
+    // The area a layer reconstructs is its own region alone. The
+    // descendants' regions are settled by the descendants' own composites.
+    scene
+        .layer(root)
+        .and_then(|layer| layer.content_region)
+        .and_then(|region| region.intersection(&plane))
 }
 
 /// The image a subtree draw samples.
@@ -5385,32 +5342,22 @@ impl SubtreeSource {
 /// The cache bitmap a descendant layer draws in place of its live subtree.
 ///
 /// The cache is live while a consumer requires it
-/// ([`Scene::inc_cache_enabled_count`]), its content is up to date with the
-/// drawn sources, and it is the composited content rather than a transition
-/// frame. The layer that owns the composite is never its own source: it is
-/// writing that cache. `depth` is the nested-cache walk depth; past the
-/// layer pool a malformed parent cycle is not trusted. `order` is the paint
-/// order of the window, handed down by the caller.
-fn live_subtree_cache(
-    scene: &Scene,
-    layer: &crate::scene::LayerState,
-    root: u32,
-    depth: usize,
-    order: &[u32],
-) -> Option<u32> {
-    if layer.id == root
-        || layer.cache_enabled_count == 0
-        || layer.transition_self.is_some()
-        || depth >= scene.layers.len()
-    {
+/// ([`Scene::inc_cache_enabled_count`]), it is the composited content rather
+/// than a transition frame, and the layer has no region left to
+/// reconstruct: the region is what says whether the cached bitmap still
+/// holds the content the tree describes.
+///
+/// The layer that owns the composite is never its own source: it is writing
+/// that cache.
+fn live_subtree_cache(layer: &crate::scene::LayerState, root: u32) -> Option<u32> {
+    if layer.id == root || layer.cache_enabled_count == 0 || layer.transition_self.is_some() {
         return None;
     }
     let cache = layer.cache_bitmap?;
     if layer.cache_content != Some(cache) {
         return None;
     }
-    let recorded = layer.cache_content_signature;
-    (subtree_content_signature(scene, order, layer.id, depth + 1) == recorded).then_some(cache)
+    layer.content_region.is_none().then_some(cache)
 }
 
 /// What a subtree draw draws.
@@ -5502,16 +5449,12 @@ fn subtree_drawn_image(layer: &crate::scene::LayerState) -> Option<u32> {
 /// The image a layer contributes to the composite: its live cache when one is
 /// current, otherwise its `face` — the `dfMask`/`dfProvince` plane, or the
 /// main image (or transition self image) it draws.
-///
-/// `order` is the paint order of the window, handed down by the caller.
 fn subtree_source(
     scene: &Scene,
     layer: &crate::scene::LayerState,
     root: u32,
-    depth: usize,
-    order: &[u32],
 ) -> Option<SubtreeSource> {
-    if let Some(cache) = live_subtree_cache(scene, layer, root, depth, order) {
+    if let Some(cache) = live_subtree_cache(layer, root) {
         return Some(SubtreeSource::Cache(cache));
     }
     match layer.face {
@@ -5738,7 +5681,7 @@ fn collect_subtree_draws(
         if opa == 0 && id != root {
             continue;
         }
-        let Some(source) = subtree_source(scene, layer, root, 0, order) else {
+        let Some(source) = subtree_source(scene, layer, root) else {
             continue;
         };
         if let SubtreeSource::Cache(cache) = &source {
@@ -5822,33 +5765,74 @@ fn collect_subtree_draws(
 /// Composite one resolved draw into the cache. The source is borrowed for the
 /// draw only; the cache stays zero wherever no draw reaches.
 ///
+/// Only the part of the draw that lands inside `region` is written: the rest
+/// of the content is current, and a draw that would change it is a change the
+/// region does not name.
+///
 /// A layer's image is composited with the method its type names and the
 /// destination's face selects: the alpha blend on the alpha face takes the
 /// destination's alpha into the mix through the opacity-on-opacity table and
 /// rewrites it, so a colour lands one level below the source's. The content's
 /// base and the coverage planes are drawn over the destination as they are.
-fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &BitmapState) {
-    const FULL: RectI = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+fn composite_subtree_draw(
+    target: &mut BitmapState,
+    draw: &SubtreeDraw,
+    src: &BitmapState,
+    region: Rect,
+) {
     // The content's base and the coverage planes are drawn over the
     // destination as they are; every other image is composited with the
     // method its type names and the destination's face selects.
     let plain = draw.kind == SubtreeKind::Plain;
     if draw.dw == src.width as i32 && draw.dh == src.height as i32 {
+        // The draw lands one source pixel per destination pixel, so the part
+        // inside the region is the same part of the source: the destination
+        // and the source are clipped together.
+        let destination = (
+            draw.dx,
+            draw.dy,
+            draw.dx.saturating_add(draw.dw),
+            draw.dy.saturating_add(draw.dh),
+        );
+        let clip = (region.x, region.y, region.right(), region.bottom());
+        let Some(inside) = intersect_rect(destination, clip) else {
+            return;
+        };
+        let offset_x = inside.0 - destination.0;
+        let offset_y = inside.1 - destination.1;
+        // The source reads the part of the image the clipped destination
+        // covers: the far edge moves with the clip, not only the origin. A
+        // source that kept its width would write the whole image over the
+        // content outside the region, and the blend would take the
+        // destination's alpha there instead of the backdrop's.
+        let source = BlitSource {
+            bitmap: src,
+            rect: (
+                draw.src.0 + offset_x,
+                draw.src.1 + offset_y,
+                draw.src.0 + (inside.2 - destination.0),
+                draw.src.1 + (inside.3 - destination.1),
+            ),
+        };
         match draw.mode {
             0 => {}
             1 if draw.opa == 255 && !draw.treat_as_opaque && !draw.hold_alpha => {
-                blit_copy_clipped(target, draw.dx, draw.dy, src, draw.src, FULL);
+                blit_copy_clipped(
+                    target,
+                    draw.dx + offset_x,
+                    draw.dy + offset_y,
+                    src,
+                    source.rect,
+                    inside,
+                );
             }
             1 | 2 if plain => {
                 blit_over(
                     target,
-                    draw.dx,
-                    draw.dy,
-                    BlitSource {
-                        bitmap: src,
-                        rect: draw.src,
-                    },
-                    FULL,
+                    draw.dx + offset_x,
+                    draw.dy + offset_y,
+                    source,
+                    inside,
                     BlitOptions {
                         mode: 0,
                         opa: draw.opa,
@@ -5862,12 +5846,9 @@ fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &Bi
                 operate_rect_on(
                     draw.dst_alpha,
                     target,
-                    draw.dx,
-                    draw.dy,
-                    BlitSource {
-                        bitmap: src,
-                        rect: draw.src,
-                    },
+                    draw.dx + offset_x,
+                    draw.dy + offset_y,
+                    source,
                     BlitOptions {
                         mode,
                         opa: draw.opa,
@@ -5879,6 +5860,10 @@ fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &Bi
             }
         }
     } else {
+        // The draw is scaled: the resampler reads the source through the
+        // mapping of the whole destination, so a clipped destination would
+        // sample the source at a different place. The whole draw is written
+        // instead, with the source's current pixels.
         stretch_blit_on(
             draw.dst_alpha,
             target,
@@ -5908,19 +5893,17 @@ fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &Bi
 
 /// Render `root`'s own image and the visible layers of its subtree into the
 /// layer's composited content. Returns the bitmap to use as the layer's
-/// rendered content, reusing it while the subtree's content signature still
-/// matches the one the content was composited with:
+/// rendered content:
 ///
 /// * the layer's main image when the subtree is trivial: no visible direct
 ///   child, the image at the origin, and the image size equal to the layer
 ///   rect;
-/// * otherwise the composited content bitmap, rebuilt only when the subtree
-///   changed.
+/// * otherwise the composited content bitmap.
 ///
-/// The signature is the subtree's content state in one number — the drawn
-/// sources' own contributions and their images' generations — so a change
-/// behind the layer accessors and a change through them both reach it, and a
-/// transition's tick, which changes no source, reaches it not at all.
+/// The content is rebuilt where it is no longer current and left alone
+/// everywhere else: the layer's region names the part of the content that
+/// has to be reconstructed, and a region that is empty leaves the content
+/// untouched.
 ///
 /// A layer with no main image is not a special case: the fill is transparent
 /// wherever no child drew, which the transparent clear reproduces — unless the
@@ -5934,6 +5917,14 @@ fn composite_subtree_draw(target: &mut BitmapState, draw: &SubtreeDraw, src: &Bi
 /// registry, and the caller owns its lifetime through
 /// [`Scene::inc_cache_enabled_count`] / [`Scene::dec_cache_enabled_count`].
 pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
+    render_layer_subtree_at(scene, root, 0)
+}
+
+/// The composite of `root`'s subtree, with the depth of the walk.
+///
+/// The depth bounds the completion of the descendants' caches: a malformed
+/// parent cycle must not make the walk recurse for ever.
+fn render_layer_subtree_at(scene: &mut Scene, root: u32, depth: usize) -> Option<u32> {
     let (bitmap, w, h, trivial, opaque, window) = {
         let layer = scene.layer(root)?;
         let clip = scene.clipping_rect(root).unwrap_or(layer.rect);
@@ -5962,44 +5953,163 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
         release_subtree_caches(scene, root);
         return bitmap;
     }
-    let content = ensure_layer_content(scene, root, w, h)?;
+    let (content, fresh) = ensure_layer_content(scene, root, w, h)?;
     let content_bitmap = scene.bitmap(content)?;
     if !pixels_usable(content_bitmap, "renderLayerSubtree") {
         return None;
     }
-    // The window's paint order, read once: the composite and the nested
-    // cache walk share it instead of rebuilding it for every layer.
+    // The window's paint order, read once: the composite and the region walk
+    // share it instead of rebuilding it for every layer.
     let order = scene.window_layer_order(window);
-    let current_signature = subtree_content_signature(scene, &order, root, 0);
-    let recorded = scene.layer(root)?.cache_content_signature;
-    if current_signature != recorded {
-        let draws = collect_subtree_draws(scene, &order, root, w, h);
-        // The content starts from the layer's backdrop: an opaque layer's
-        // content is opaque, every other type's is transparent. The backdrop
-        // is what an opaque layer's children are composited over, so the
-        // colour mix holds an alpha of 255 there.
-        let backdrop = if opaque { OPAQUE_BACKDROP } else { [0; 4] };
-        for pixel in scene.bitmap_mut(content)?.rgba.as_chunks_mut::<4>().0 {
-            pixel.copy_from_slice(&backdrop);
-        }
-        for draw in &draws {
-            match &draw.source {
-                SubtreeSource::Cache(id) | SubtreeSource::Bitmap(id) => {
-                    let (target, source) = scene.bitmap_mut_with_source(content, *id)?;
-                    composite_subtree_draw(target, draw, source);
-                }
-                SubtreeSource::Derived(source) => {
-                    let target = scene.bitmap_mut_untracked(content)?;
-                    composite_subtree_draw(target, draw, source);
-                }
+    // A new content is empty, so the whole area is what has to be drawn.
+    let region = if fresh {
+        Some(Rect::new(0, 0, w, h))
+    } else {
+        subtree_content_region(scene, root, w, h)
+    };
+    let Some(region) = region else {
+        // The content is current: the region is empty and the cached bitmap
+        // is left untouched.
+        let _ = scene.take_layer_content_region(root);
+        return Some(content);
+    };
+    // The descendants whose caches are stale are completed first: a parent
+    // asks the child for its cache, and the child rebuilds the stale part of
+    // it and hands it over. A stale cache is never drawn live.
+    complete_stale_caches(scene, &order, root, depth);
+    let draws = collect_subtree_draws(scene, &order, root, w, h);
+    // The area the composite writes: the layer's region, widened over the
+    // draws that are written whole. A scaled draw is written whole — the
+    // resampler reads the source through the mapping of the whole
+    // destination — so the area it reaches has to be cleared and redrawn with
+    // it; a draw clipped to the region would leave the old content under it.
+    let area = composite_area(scene, &draws, region);
+    // The content starts from the layer's backdrop: an opaque layer's
+    // content is opaque, every other type's is transparent. The backdrop
+    // is what an opaque layer's children are composited over, so the
+    // colour mix holds an alpha of 255 there. Only the area is filled:
+    // the rest of the content is current.
+    let backdrop = if opaque { OPAQUE_BACKDROP } else { [0; 4] };
+    {
+        let target = scene.bitmap_mut_untracked(content)?;
+        fill_region(target, area, backdrop);
+    }
+    for draw in &draws {
+        match &draw.source {
+            SubtreeSource::Cache(id) | SubtreeSource::Bitmap(id) => {
+                let (target, source) = scene.bitmap_mut_with_source(content, *id)?;
+                composite_subtree_draw(target, draw, source, area);
+            }
+            SubtreeSource::Derived(source) => {
+                let target = scene.bitmap_mut_untracked(content)?;
+                composite_subtree_draw(target, draw, source, area);
             }
         }
-        scene.bitmap_mut_untracked(content)?.mark_dirty();
-        if let Some(layer) = scene.layer_mut_untracked(root) {
-            layer.cache_content_signature = current_signature;
+    }
+    // The region is the record of what the content was missing, and the
+    // content holds it now. It is the layer's own record: the descendants'
+    // regions are settled by the descendants' own composites.
+    let _ = scene.take_layer_content_region(root);
+    Some(content)
+}
+
+/// The area a composite writes: the layer's region, widened over the draws
+/// that are written whole.
+///
+/// A one-to-one draw is clipped to the area, so it writes nothing outside
+/// it. A scaled draw is written whole — the resampler reads the source
+/// through the mapping of the whole destination, and a clipped destination
+/// would sample the source at a different place — so the area it reaches has
+/// to be in the area, cleared and redrawn with it.
+fn composite_area(scene: &Scene, draws: &[SubtreeDraw], region: Rect) -> Rect {
+    let mut area = region;
+    for draw in draws {
+        let (width, height) = match &draw.source {
+            SubtreeSource::Cache(id) | SubtreeSource::Bitmap(id) => scene
+                .bitmap(*id)
+                .map_or((0, 0), |bitmap| (bitmap.width, bitmap.height)),
+            SubtreeSource::Derived(source) => (source.width, source.height),
+        };
+        if draw.dw == width as i32 && draw.dh == height as i32 {
+            continue;
+        }
+        let destination = Rect::new(
+            draw.dx,
+            draw.dy,
+            draw.dw.max(0) as u32,
+            draw.dh.max(0) as u32,
+        );
+        area = area.union(&destination);
+    }
+    area
+}
+
+/// Complete the descendants whose caches are stale.
+///
+/// A parent never draws a child live: it asks the child for its cache, and
+/// the child rebuilds the stale part of it before handing it over. The
+/// completion is the descendant's own composite, so the descendant's region
+/// is settled by it and the parent samples the rebuilt cache.
+fn complete_stale_caches(scene: &mut Scene, order: &[u32], root: u32, depth: usize) {
+    if depth >= scene.layers.len() {
+        return;
+    }
+    for &id in order {
+        if id == root || !is_descendant(scene, id, root) {
+            continue;
+        }
+        let Some(layer) = scene.layer(id) else {
+            continue;
+        };
+        // Only a layer that keeps a cache of its own can be completed.
+        if layer.cache_enabled_count == 0 || layer.cache_content != layer.cache_bitmap {
+            continue;
+        }
+        if layer.content_region.is_none() {
+            continue;
+        }
+        let _ = render_layer_subtree_at(scene, id, depth + 1);
+    }
+}
+
+/// Fill a rectangle of the bitmap with a colour.
+///
+/// The rectangle is clipped to the bitmap, so a region that reaches outside
+/// it writes only the part that is inside.
+fn fill_region(bitmap: &mut BitmapState, region: Rect, color: [u8; 4]) {
+    let width = bitmap.width as i32;
+    let height = bitmap.height as i32;
+    let left = region.x.max(0);
+    let top = region.y.max(0);
+    let right = region.right().min(width);
+    let bottom = region.bottom().min(height);
+    if right <= left || bottom <= top {
+        return;
+    }
+    let (Ok(left), Ok(top), Ok(right), Ok(bottom)) = (
+        u32::try_from(left),
+        u32::try_from(top),
+        u32::try_from(right),
+        u32::try_from(bottom),
+    ) else {
+        return;
+    };
+    let pitch = (bitmap.width as usize).saturating_mul(4);
+    let row_bytes = ((right - left) as usize).saturating_mul(4);
+    for y in top..bottom {
+        let start = (y as usize)
+            .saturating_mul(pitch)
+            .saturating_add((left as usize) * 4);
+        let Some(row) = bitmap.rgba.get_mut(start..start.saturating_add(row_bytes)) else {
+            continue;
+        };
+        for pixel in row.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&color);
         }
     }
-    Some(content)
+    // The upload needs the rectangle the fill wrote and not the whole
+    // bitmap.
+    bitmap.mark_dirty_rect(PixelRegion::new(left, top, right - left, bottom - top));
 }
 
 #[cfg(test)]

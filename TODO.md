@@ -98,7 +98,13 @@ residuals:
 
 ## 4. Rendering and layers
 
-### 4.0 The transition's subtree is recomposited whole, every tick
+### 4.0 The transition's subtree is recomposited whole, every tick - CLOSED
+
+**Closed by `5f5fd8bc` (the content signature), then by the region's shape**
+(`LayerState::content_region`, the reference's `CacheRecalcRegion`). The
+composite reconstructs only the region that changed, and an empty region
+leaves the cached bitmap untouched. The record of what is in `docs/perf.md`
+§11.4-§11.6.
 
 **Measured on the real game, in gameplay** (the title menu is idle and shows
 nothing): the 1% low is **1.1 fps** (889 ms), and 151 frames of 6 000 are
@@ -166,7 +172,13 @@ transition tick. A transition that runs for 30 ticks at 60 Hz pays 30 whole-
 plane composites, and each of them is inside the frame that runs the
 scenario.
 
-### 4.0.1 The blend kernel is a naive per-pixel loop
+### 4.0.1 The blend kernel is a naive per-pixel loop - CLOSED
+
+**Closed by `8b7a392e` (the row pass and the dispatch hoist) and by the
+shared per-channel tables.** The per-pixel `match kernel` is gone: each
+mode's arithmetic is a type of its own, so the row loop is monomorphised and
+the mode is resolved once per row. The mode kernels are 3.5x faster as a
+family and the soft light 13.8x. The record is in `docs/perf.md` §11.3.
 
 **This is the real cost, and caching it would only hide it.** Measured with
 the blend-family benchmark over a 512x512 rectangle of a 1920x1080 plane

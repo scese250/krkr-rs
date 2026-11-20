@@ -627,7 +627,11 @@ fn unchanged_visible_write_does_not_invalidate() {
          var l = new Layer(w, null);",
     );
     let id = env.scene.layers.last().expect("the layer").id;
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    // The reference's shape: a layer keeps a recalculation region only while
+    // its caching is enabled (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`),
+    // so the layer caches here.
+    env.scene.inc_cache_enabled_count(id);
+    env.scene.take_layer_content_region(id);
     let before = env.scene.structure_revision();
 
     // hidden -> visible still invalidates.
@@ -638,12 +642,12 @@ fn unchanged_visible_write_does_not_invalidate() {
         "a hidden->visible write still invalidates"
     );
     assert!(
-        env.scene.layer(id).unwrap().content_epoch > epoch,
-        "the write advances the layer's contribution"
+        env.scene.layer_content_region(id).is_some(),
+        "the write marks the layer's region"
     );
 
     // The same value written again touches nothing.
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    let region = env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.visible = true;");
     // reference/cpp/core/visual/LayerIntf.cpp:1183
@@ -652,14 +656,13 @@ fn unchanged_visible_write_does_not_invalidate() {
         revision,
         "an unchanged visible write bumps no revision"
     );
-    assert_eq!(
-        env.scene.layer(id).unwrap().content_epoch,
-        epoch,
-        "an unchanged visible write advances no contribution"
+    assert!(
+        env.scene.layer_content_region(id).is_none(),
+        "an unchanged visible write marks no region"
     );
 
     // visible -> hidden still invalidates.
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    env.scene.take_layer_content_region(id);
     env.run("l.visible = false;");
     // reference/cpp/core/visual/LayerIntf.cpp:1187-1193
     assert!(
@@ -667,8 +670,8 @@ fn unchanged_visible_write_does_not_invalidate() {
         "a visible->hidden write still invalidates"
     );
     assert!(
-        env.scene.layer(id).unwrap().content_epoch > epoch,
-        "the write advances the layer's contribution"
+        env.scene.layer_content_region(id).is_some(),
+        "the write marks the layer's region"
     );
 }
 
@@ -686,6 +689,10 @@ fn unchanged_geometry_opacity_and_blend_writes_are_no_ops() {
          var l = new Layer(w, null);",
     );
     let id = env.scene.layers.last().expect("the layer").id;
+    // The reference's shape: a layer keeps a recalculation region only while
+    // its caching is enabled (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`),
+    // so the layer caches here.
+    env.scene.inc_cache_enabled_count(id);
     for write in [
         "l.left = 7;",
         "l.top = 9;",
@@ -695,7 +702,7 @@ fn unchanged_geometry_opacity_and_blend_writes_are_no_ops() {
         "l.type = 1;",
     ] {
         env.run(write);
-        let epoch = env.scene.layer(id).unwrap().content_epoch;
+        env.scene.take_layer_content_region(id);
         let revision = env.scene.structure_revision();
         env.run(write);
         assert_eq!(
@@ -703,10 +710,9 @@ fn unchanged_geometry_opacity_and_blend_writes_are_no_ops() {
             revision,
             "{write} repeated at the same value bumps no revision"
         );
-        assert_eq!(
-            env.scene.layer(id).unwrap().content_epoch,
-            epoch,
-            "{write} repeated at the same value advances no contribution"
+        assert!(
+            env.scene.layer_content_region(id).is_none(),
+            "{write} repeated at the same value marks no region"
         );
     }
 }
@@ -724,8 +730,12 @@ fn unchanged_unguarded_property_write_still_invalidates() {
          var l = new Layer(w, null);",
     );
     let id = env.scene.layers.last().expect("the layer").id;
+    // The reference's shape: a layer keeps a recalculation region only while
+    // its caching is enabled (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`),
+    // so the layer caches here.
+    env.scene.inc_cache_enabled_count(id);
     env.run("l.hitType = 1;");
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    let region = env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.hitType = 1;");
     assert!(
@@ -733,8 +743,8 @@ fn unchanged_unguarded_property_write_still_invalidates() {
         "an unguarded repeated write bumps revision"
     );
     assert!(
-        env.scene.layer(id).unwrap().content_epoch > epoch,
-        "the write advances the layer's contribution"
+        env.scene.layer_content_region(id).is_some(),
+        "the write marks the layer's region"
     );
 }
 
@@ -753,19 +763,23 @@ fn unchanged_set_pos_write_does_not_invalidate() {
          var l = new Layer(w, null);",
     );
     let id = env.scene.layers.last().expect("the layer").id;
+    // The reference's shape: a layer keeps a recalculation region only while
+    // its caching is enabled (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`),
+    // so the layer caches here.
+    env.scene.inc_cache_enabled_count(id);
 
     // A real move invalidates and reads back.
     // reference/cpp/core/visual/LayerIntf.cpp:2204-2216
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    let region = env.scene.take_layer_content_region(id);
     env.run("l.setPos(5, 7);");
     assert_eq!(env.eval_int("l.left"), 5);
     assert_eq!(env.eval_int("l.top"), 7);
     assert!(
-        env.scene.layer(id).unwrap().content_epoch > epoch,
-        "the write advances the layer's contribution"
+        env.scene.layer_content_region(id).is_some(),
+        "the write marks the layer's region"
     );
 
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    let region = env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.setPos(5, 7);");
     // reference/cpp/core/visual/LayerIntf.cpp:2203
@@ -774,10 +788,9 @@ fn unchanged_set_pos_write_does_not_invalidate() {
         revision,
         "an unchanged setPos bumps no revision"
     );
-    assert_eq!(
-        env.scene.layer(id).unwrap().content_epoch,
-        epoch,
-        "an unchanged setPos advances no contribution"
+    assert!(
+        env.scene.layer_content_region(id).is_none(),
+        "an unchanged setPos marks no region"
     );
 
     // The position guard is not a clamp: a negative move still invalidates.
@@ -807,20 +820,24 @@ fn unchanged_set_pos_with_bounds_write_does_not_invalidate() {
          var l = new Layer(w, null);",
     );
     let id = env.scene.layers.last().expect("the layer").id;
+    // The reference's shape: a layer keeps a recalculation region only while
+    // its caching is enabled (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`),
+    // so the layer caches here.
+    env.scene.inc_cache_enabled_count(id);
 
     // reference/cpp/core/visual/LayerIntf.cpp:2138-2159
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    env.scene.take_layer_content_region(id);
     env.run("l.setPos(5, 7, 20, 30);");
     assert_eq!(env.eval_int("l.left"), 5);
     assert_eq!(env.eval_int("l.top"), 7);
     assert_eq!(env.eval_int("l.width"), 20);
     assert_eq!(env.eval_int("l.height"), 30);
     assert!(
-        env.scene.layer(id).unwrap().content_epoch > epoch,
-        "the write advances the layer's contribution"
+        env.scene.layer_content_region(id).is_some(),
+        "the write marks the layer's region"
     );
 
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    let region = env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.setPos(5, 7, 20, 30);");
     // reference/cpp/core/visual/LayerIntf.cpp:2121, :2144
@@ -829,10 +846,9 @@ fn unchanged_set_pos_with_bounds_write_does_not_invalidate() {
         revision,
         "an unchanged setPos with bounds bumps no revision"
     );
-    assert_eq!(
-        env.scene.layer(id).unwrap().content_epoch,
-        epoch,
-        "an unchanged write advances no contribution"
+    assert!(
+        env.scene.layer_content_region(id).is_none(),
+        "an unchanged write marks no region"
     );
 
     // A new position alone still invalidates with the size unchanged.
@@ -863,20 +879,24 @@ fn unchanged_set_size_write_does_not_invalidate() {
          var l = new Layer(w, null);",
     );
     let id = env.scene.layers.last().expect("the layer").id;
+    // The reference's shape: a layer keeps a recalculation region only while
+    // its caching is enabled (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`),
+    // so the layer caches here.
+    env.scene.inc_cache_enabled_count(id);
 
     // reference/cpp/core/visual/LayerIntf.cpp:2122-2139, :2656-2673
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    env.scene.take_layer_content_region(id);
     env.run("l.setSize(48, 40);");
     assert_eq!(env.eval_int("l.width"), 48);
     assert_eq!(env.eval_int("l.height"), 40);
     assert_eq!(env.eval_int("l.imageWidth"), 48);
     assert_eq!(env.eval_int("l.imageHeight"), 40);
     assert!(
-        env.scene.layer(id).unwrap().content_epoch > epoch,
-        "the write advances the layer's contribution"
+        env.scene.layer_content_region(id).is_some(),
+        "the write marks the layer's region"
     );
 
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    let region = env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.setSize(48, 40);");
     // reference/cpp/core/visual/LayerIntf.cpp:2121
@@ -885,10 +905,9 @@ fn unchanged_set_size_write_does_not_invalidate() {
         revision,
         "an unchanged setSize bumps no revision"
     );
-    assert_eq!(
-        env.scene.layer(id).unwrap().content_epoch,
-        epoch,
-        "an unchanged setSize advances no contribution"
+    assert!(
+        env.scene.layer_content_region(id).is_none(),
+        "an unchanged setSize marks no region"
     );
 
     // A zero extent is a real change; the rect shrinks but the image does not.
@@ -919,6 +938,10 @@ fn unchanged_set_size_to_image_size_write_does_not_invalidate() {
          l.setSize(4, 4);",
     );
     let id = env.scene.layers.last().expect("the layer").id;
+    // The reference's shape: a layer keeps a recalculation region only while
+    // its caching is enabled (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`),
+    // so the layer caches here.
+    env.scene.inc_cache_enabled_count(id);
     let revision = env.scene.structure_revision();
 
     // reference/cpp/core/visual/LayerIntf.cpp:8587-8588, :2122-2139
@@ -932,7 +955,7 @@ fn unchanged_set_size_to_image_size_write_does_not_invalidate() {
     assert_eq!(env.eval_int("l.imageWidth"), 32);
     assert_eq!(env.eval_int("l.imageHeight"), 32);
 
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.setSizeToImageSize();");
     // reference/cpp/core/visual/LayerIntf.cpp:8587, :2121
@@ -941,10 +964,9 @@ fn unchanged_set_size_to_image_size_write_does_not_invalidate() {
         revision,
         "an unchanged setSizeToImageSize bumps no revision"
     );
-    assert_eq!(
-        env.scene.layer(id).unwrap().content_epoch,
-        epoch,
-        "an unchanged write advances no contribution"
+    assert!(
+        env.scene.layer_content_region(id).is_none(),
+        "an unchanged write marks no region"
     );
 }
 
@@ -965,13 +987,17 @@ fn unchanged_set_image_pos_and_size_writes_do_not_invalidate() {
          l.setImageSize(24, 24);",
     );
     let id = env.scene.layers.last().expect("the layer").id;
+    // The reference's shape: a layer keeps a recalculation region only while
+    // its caching is enabled (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`),
+    // so the layer caches here.
+    env.scene.inc_cache_enabled_count(id);
 
     // reference/cpp/core/visual/LayerIntf.cpp:2549-2560
     env.run("l.setImagePos(-4, -4);");
     assert_eq!(env.eval_int("l.imageLeft"), -4);
     assert_eq!(env.eval_int("l.imageTop"), -4);
 
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.setImagePos(-4, -4);");
     // reference/cpp/core/visual/LayerIntf.cpp:2549
@@ -980,13 +1006,12 @@ fn unchanged_set_image_pos_and_size_writes_do_not_invalidate() {
         revision,
         "an unchanged setImagePos bumps no revision"
     );
-    assert_eq!(
-        env.scene.layer(id).unwrap().content_epoch,
-        epoch,
-        "an unchanged write advances no contribution"
+    assert!(
+        env.scene.layer_content_region(id).is_none(),
+        "an unchanged write marks no region"
     );
 
-    let epoch = env.scene.layer(id).unwrap().content_epoch;
+    env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.setImageSize(24, 24);");
     // reference/cpp/core/visual/LayerIntf.cpp:2649-2650
@@ -995,10 +1020,9 @@ fn unchanged_set_image_pos_and_size_writes_do_not_invalidate() {
         revision,
         "an unchanged setImageSize bumps no revision"
     );
-    assert_eq!(
-        env.scene.layer(id).unwrap().content_epoch,
-        epoch,
-        "an unchanged write advances no contribution"
+    assert!(
+        env.scene.layer_content_region(id).is_none(),
+        "an unchanged write marks no region"
     );
 }
 

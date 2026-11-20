@@ -406,6 +406,9 @@ fn render_layer_subtree_reuses_the_cache_until_the_subtree_changes() {
         l.visible = true;
         l.bitmap = Some(child_bitmap);
     }
+    // The parent's caching is on, so it keeps a region
+    // (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`).
+    scene.inc_cache_enabled_count(parent);
 
     let content = render_layer_subtree(&mut scene, parent).expect("content bitmap");
     scene.set_bitmap_clean(content);
@@ -473,7 +476,7 @@ fn render_layer_subtree_reuse_does_not_touch_the_scene_revisions() {
 /// An image edit that does not go through a layer accessor (the `Layer` pixel
 /// natives borrow the scene's bitmap vec directly) still invalidates the
 /// cache: the composited content records the source images'
-/// `content_generation` and recomposites when it changes.
+/// the layer's region and recomposites when it changes.
 ///
 /// reference/cpp/core/visual/LayerIntf.cpp:6305-6335
 #[test]
@@ -579,7 +582,13 @@ fn nested_cache_scene() -> (Scene, u32, u32, u32, u32) {
         l.visible = true;
         l.bitmap = Some(live);
     }
+    // The reference's shape: a layer keeps a recalculation region only while
+    // its caching is enabled (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`),
+    // so the layers that cache here have their caching on. The change travels
+    // to the ancestors whatever the layers in between keep
+    // (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6236-6262`).
     scene.inc_cache_enabled_count(inner);
+    scene.inc_cache_enabled_count(outer);
     let content = render_layer_subtree(&mut scene, inner).expect("inner content");
     scene.set_cache_bitmap(inner, Some(content));
     (scene, outer, inner, content, live)
@@ -630,8 +639,9 @@ fn render_layer_subtree_uses_a_live_nested_cache() {
 ///
 /// reference/cpp/core/visual/LayerIntf.cpp:6305-6335
 /// reference/cpp/core/visual/LayerIntf.cpp:7734-7737
+/// reference/cpp/core/visual/LayerIntf.cpp:4548
 #[test]
-fn render_layer_subtree_falls_back_from_a_stale_nested_cache() {
+fn render_layer_subtree_completes_a_stale_nested_cache() {
     let (mut scene, outer, inner, content, live) = nested_cache_scene();
     paint(&mut scene, content, [200, 100, 50, 255]);
     let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
@@ -641,49 +651,66 @@ fn render_layer_subtree_falls_back_from_a_stale_nested_cache() {
     );
 
     // The grandchild's pixels change without a layer accessor: the inner
-    // cache's recorded source generation no longer matches.
+    // cache no longer holds the content the tree describes.
+    //
+    // The green reaches the outer through two cache levels, and each level
+    // blends the level below it into its own cache with the channel mix
+    // `d + ((f - d) * a >> 8)`
+    // (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:67-76`): the
+    // grandchild's opaque green is `255 * 255 >> 8 = 254` in the inner's
+    // cache, and that cache is `254 * 255 >> 8 = 253` in the outer's.
     scene.bitmap_mut(live).unwrap().rgba[..4].copy_from_slice(&[0, 255, 0, 255]);
     let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
     assert_eq!(
         &scene.bitmap(outer_content).unwrap().rgba[..4],
-        &[0, 254, 0, 255],
-        "a stale cache is not sampled"
+        &[0, 253, 0, 255],
+        "the stale cache is completed, not drawn live"
     );
 
-    // Recompositing the inner cache makes it live again.
+    // The inner's own composite has nothing left to do: its region was
+    // settled when the outer completed it.
     let refreshed = render_layer_subtree(&mut scene, inner).expect("inner content");
     assert_eq!(refreshed, content, "the cache bitmap is reused");
-    scene.set_cache_bitmap(inner, Some(refreshed));
+
+    // The outer holds the inner's rebuilt cache, and the reference's `Complete`
+    // returns a cache untouched while its own region is empty
+    // (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7737-7740`): the
+    // outer is not recomposited, so its pixels stay as they are.
     paint(&mut scene, refreshed, [50, 100, 200, 255]);
     scene.set_bitmap_clean(outer_content);
     let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
     assert_eq!(
         &scene.bitmap(outer_content).unwrap().rgba[..4],
-        &[49, 99, 199, 255],
-        "the refreshed cache is sampled"
+        &[0, 253, 0, 255],
+        "an empty region leaves the outer cache untouched"
     );
     assert!(
-        scene.bitmap(outer_content).unwrap().dirty,
-        "the outer cache is recomposited"
+        !scene.bitmap(outer_content).unwrap().dirty,
+        "an empty region writes no pixel"
     );
 
-    // A layer write marks the child's cache for recomposite; the outer falls
-    // back to the live subtree until the child rebuilds it.
+    // A layer write marks the child's cache for recomposite; the outer
+    // completes it and samples the rebuilt cache.
     scene.layer_mut(inner).unwrap().name = "inner".to_string();
     let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
     assert_eq!(
         &scene.bitmap(outer_content).unwrap().rgba[..4],
-        &[0, 254, 0, 255],
-        "a pending recomposite is not sampled"
+        &[0, 253, 0, 255],
+        "a pending recomposite is completed, not drawn live"
     );
+
+    // The child's cache is rebuilt on its own; the outer holds it, and the
+    // reference's `Complete` returns the outer's cache untouched while the
+    // outer's own region is empty
+    // (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7737-7740`).
     let refreshed = render_layer_subtree(&mut scene, inner).expect("inner content");
     scene.set_cache_bitmap(inner, Some(refreshed));
     paint(&mut scene, refreshed, [5, 6, 7, 255]);
     let outer_content = render_layer_subtree(&mut scene, outer).expect("outer content");
     assert_eq!(
         &scene.bitmap(outer_content).unwrap().rgba[..4],
-        &[4, 5, 6, 255],
-        "the rebuilt cache is sampled"
+        &[0, 253, 0, 255],
+        "the outer cache is not rebuilt while its region is empty"
     );
 }
 
@@ -700,6 +727,19 @@ fn update_layer_unchanged_write_does_not_invalidate() {
     let win = scene.add_window("t", (1, 1));
     let parent = scene.add_layer(win, None);
     let child = scene.add_layer(win, Some(parent));
+    // The layers have an area, so a change to them marks a region.
+    scene
+        .update_layer(parent, |layer| {
+            layer.rect = Rect::new(0, 0, 8, 8);
+            true
+        })
+        .expect("the parent is there");
+    scene
+        .update_layer(child, |layer| {
+            layer.rect = Rect::new(0, 0, 4, 4);
+            true
+        })
+        .expect("the child is there");
     // The first write changes the value, so it invalidates like `layer_mut`.
     assert_eq!(
         scene.update_layer(child, |layer| {
@@ -711,8 +751,8 @@ fn update_layer_unchanged_write_does_not_invalidate() {
         }),
         Some(true)
     );
-    let epoch = scene.layer(child).unwrap().content_epoch;
-    let parent_epoch = scene.layer(parent).unwrap().content_epoch;
+    let region = scene.layer_content_region(child);
+    let parent_region = scene.layer_content_region(parent);
     let revision = scene.structure_revision();
     // The second write receives the stored value: the guard skips `Update()`
     // and `Parent->NotifyChildrenVisualStateChanged()`
@@ -733,14 +773,14 @@ fn update_layer_unchanged_write_does_not_invalidate() {
         "a no-op write bumps no revision"
     );
     assert_eq!(
-        scene.layer(child).unwrap().content_epoch,
-        epoch,
-        "a no-op write advances no contribution"
+        scene.layer_content_region(child),
+        region,
+        "a no-op write marks no region"
     );
     assert_eq!(
-        scene.layer(parent).unwrap().content_epoch,
-        parent_epoch,
-        "a no-op write advances no contribution in the ancestors either"
+        scene.layer_content_region(parent),
+        parent_region,
+        "a no-op write marks no region in the ancestors either"
     );
 }
 
@@ -763,6 +803,9 @@ fn update_layer_changed_write_marks_subtree_and_ancestors() {
     }
     let child = scene.add_layer(win, Some(parent));
     let child_image = scene.add_bitmap(2, 2, vec![2u8; 16]);
+    // The parent's caching is on, so it keeps a region
+    // (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`).
+    scene.inc_cache_enabled_count(parent);
     {
         let layer = scene.layer_mut(child).expect("the child");
         layer.rect = Rect::new(0, 0, 2, 2);
@@ -770,11 +813,17 @@ fn update_layer_changed_write_marks_subtree_and_ancestors() {
         layer.bitmap = Some(child_image);
     }
     // The parent's content is composited, so the write that follows has to
-    // composite it again: the parent's signature holds the child's
-    // contribution, and the write advances it.
+    // composite it again: the parent's region holds the child's contribution,
+    // and the write marks it.
     let content = render_layer_subtree(&mut scene, parent).expect("the parent's content");
-    let generation = scene.bitmap(content).expect("the parent's content").content_generation;
-    let epoch = scene.layer(child).unwrap().content_epoch;
+    let before = scene
+        .bitmap(content)
+        .expect("the parent's content")
+        .rgba
+        .clone();
+    // The composite consumed the parent's region; the write below marks it
+    // again.
+    let _ = scene.take_layer_content_region(parent);
     let revision = scene.structure_revision();
     assert_eq!(
         scene.update_layer(child, |layer| {
@@ -791,17 +840,14 @@ fn update_layer_changed_write_marks_subtree_and_ancestors() {
         "a changed write bumps the structural revision"
     );
     assert!(
-        scene.layer(child).unwrap().content_epoch > epoch,
-        "a changed write advances the layer's contribution"
+        scene.layer_content_region(parent).is_some(),
+        "a changed write marks the ancestor's region"
     );
     let again = render_layer_subtree(&mut scene, parent).expect("the parent's content");
     assert_eq!(again, content, "the parent keeps its content bitmap");
-    assert!(
-        scene
-            .bitmap(again)
-            .expect("the parent's content")
-            .content_generation
-            > generation,
+    assert_ne!(
+        scene.bitmap(again).expect("the parent's content").rgba,
+        before,
         "the caching ancestor is recomposited with the layer that changed"
     );
 }
@@ -1544,17 +1590,9 @@ fn a_transition_tick_keeps_the_endpoint_composites() {
     let source_content = render_layer_subtree(&mut scene, source).expect("the source content");
     // The parent's own composite is current as well.
     render_layer_subtree(&mut scene, parent).expect("the parent content");
-    let dest_generation = scene
-        .bitmap(dest_content)
-        .expect("the destination content")
-        .content_generation;
-    let source_generation = scene
-        .bitmap(source_content)
-        .expect("the source content")
-        .content_generation;
-    let dest_epoch = scene.layer(dest).expect("the destination").content_epoch;
-    let source_epoch = scene.layer(source).expect("the source").content_epoch;
-    let parent_epoch = scene.layer(parent).expect("the parent").content_epoch;
+    let dest_region = scene.layer_content_region(dest);
+    let source_region = scene.layer_content_region(source);
+    let parent_region = scene.layer_content_region(parent);
 
     // The first tick's frame.
     let frame = TransitionFrame::new(
@@ -1575,19 +1613,19 @@ fn a_transition_tick_keeps_the_endpoint_composites() {
     );
     scene.set_transition_frame(dest, Some(frame));
     assert_eq!(
-        scene.layer(dest).expect("the destination").content_epoch,
-        dest_epoch,
-        "the frame advances no contribution"
+        scene.layer_content_region(dest),
+        dest_region,
+        "the frame marks no region"
     );
     assert_eq!(
-        scene.layer(source).expect("the source").content_epoch,
-        source_epoch,
-        "the frame advances no contribution in the other endpoint either"
+        scene.layer_content_region(source),
+        source_region,
+        "the frame marks no region in the other endpoint either"
     );
     assert_eq!(
-        scene.layer(parent).expect("the parent").content_epoch,
-        parent_epoch,
-        "the frame advances no contribution in the caching ancestors either"
+        scene.layer_content_region(parent),
+        parent_region,
+        "the frame marks no region in the caching ancestors either"
     );
 
     // The next tick's frame is a new display of the same content.
@@ -1609,9 +1647,9 @@ fn a_transition_tick_keeps_the_endpoint_composites() {
     );
     scene.set_transition_frame(dest, Some(next));
     assert_eq!(
-        scene.layer(dest).expect("the destination").content_epoch,
-        dest_epoch,
-        "the next frame advances no contribution either"
+        scene.layer_content_region(dest),
+        dest_region,
+        "the next frame marks no region either"
     );
 
     // The endpoints' composites are still the ones the frame samples.
@@ -1623,19 +1661,13 @@ fn a_transition_tick_keeps_the_endpoint_composites() {
     );
     assert_eq!(source_again, source_content, "the source keeps its content");
     assert_eq!(
-        scene
-            .bitmap(dest_content)
-            .expect("the destination content")
-            .content_generation,
-        dest_generation,
+        scene.layer_content_region(dest),
+        None,
         "the destination subtree is not recomposited"
     );
     assert_eq!(
-        scene
-            .bitmap(source_content)
-            .expect("the source content")
-            .content_generation,
-        source_generation,
+        scene.layer_content_region(source),
+        None,
         "the source subtree is not recomposited"
     );
 }
@@ -1665,26 +1697,19 @@ fn enabling_the_cache_keeps_the_composited_content() {
         layer.bitmap = Some(child_image);
     }
     let content = render_layer_subtree(&mut scene, parent).expect("the content");
-    let generation = scene
-        .bitmap(content)
-        .expect("the content")
-        .content_generation;
-    let parent_epoch = scene.layer(parent).expect("the parent").content_epoch;
+    let parent_region = scene.layer_content_region(parent);
 
     scene.inc_cache_enabled_count(parent);
     assert_eq!(
-        scene.layer(parent).expect("the parent").content_epoch,
-        parent_epoch,
-        "enabling the cache advances no contribution"
+        scene.layer_content_region(parent),
+        parent_region,
+        "enabling the cache marks no region"
     );
     let again = render_layer_subtree(&mut scene, parent).expect("the content");
     assert_eq!(again, content, "the content is the same bitmap");
     assert_eq!(
-        scene
-            .bitmap(content)
-            .expect("the content")
-            .content_generation,
-        generation,
+        scene.layer_content_region(parent),
+        None,
         "the subtree is not recomposited"
     );
 }

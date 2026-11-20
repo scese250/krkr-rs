@@ -53,11 +53,11 @@ projected scene.
 | type | owns |
 |---|---|
 | `WindowState` | the client size, visibility, opacity, the primary layer, the focus domains and their focus, and the window's layer list |
-| `LayerState` | the parent/child links, the focus domain, the rect, visibility, opacity, the generic `BlendMode`, the sibling sort key, the image placement, the province plane, the hit-test mode, the clip rect, the focus and hint properties, the cache slots (`cache_bitmap`, `cache_content`, `transition_self`, `transition_frame`, `cache_enabled_count`, `cache_recalc`), the content bookkeeping (`content_epoch`, `cache_content_signature`) and the `pending_paint` / `shutdown` flags |
+| `LayerState` | the parent/child links, the focus domain, the rect, visibility, opacity, the generic `BlendMode`, the sibling sort key, the image placement, the province plane, the hit-test mode, the clip rect, the focus and hint properties, the cache slots (`cache_bitmap`, `cache_content`, `transition_self`, `transition_frame`, `cache_enabled_count`, `cache_recalc`), the content region (`content_region`) and the `pending_paint` / `shutdown` flags |
 | `TransitionFrame` / `TransitionSource` | the frame a composited transition draws on a layer: its pixel size, whether it covers the layer rect, and the two source draws (`bitmap`, `src`, `dst`, `alpha`) |
-| `BitmapState` | the RGBA8 pixels, the dimensions, the dirty flag and dirty region, the script-ownership flag, the `content_generation` counter and the pending decode (`pending`) |
+| `BitmapState` | the RGBA8 pixels, the dimensions, the dirty flag and dirty region, the script-ownership flag and the pending decode (`pending`) |
 | `FontState` | the requested face, height, colour and the style flags |
-| `Rect` | a window-coordinate rectangle (`x`, `y`, `w`, `h`) |
+| `Rect` | a rectangle (`x`, `y`, `w`, `h`) in the space of whatever holds it: a layer's rectangle is in its parent's space, a content region in the layer's own space |
 | `DecodedImageKey` / `DecodedImageMode` | the cache key of one decoded image and its load variant (`Full` / `Province`) |
 
 ---
@@ -308,36 +308,46 @@ Scene  ──► projection::project_scene_report ──► RenderScene (VM pixe
 ```
 
 `BitmapState::mark_dirty` sets the whole bitmap dirty; `mark_dirty_rect`
-widens a partial region. Both bump `content_generation`, which the
-subtree-cache bookkeeping sums to detect an image edit that did not go through
-a layer accessor. A full mark (`dirty_region == None`) overrides a partial one.
+widens a partial region. A full mark (`dirty_region == None`) overrides a
+partial one. A mutable access to a bitmap (`Scene::bitmap_mut`) also marks
+the area every layer draws from it, so an image edit that did not go through
+a layer accessor still reaches the subtree cache.
 
 ### The cache's validity
 
-A layer's composited subtree content is valid while the **content signature**
-of the subtree still matches the one the content was composited with. The
-signature is the sum of the drawn sources' own contributions
-(`LayerState::content_epoch`) and of their images' `content_generation`, and
-it is recorded in `LayerState::cache_content_signature`. One comparison
-therefore decides whether the content is still the content the tree
-describes: a source that changed through the layer accessors advanced its
-epoch, and a source whose pixels changed behind them advanced its image's
-generation.
+A layer's composited subtree content is valid while the layer has no
+**content region** (`LayerState::content_region`): the region holds the part
+of the layer's own composited content that has to be reconstructed, in the
+layer's own coordinate space, and an absent region says the content is
+current.
 
-The counter is the engine's record of *that* the content changed; the
-reference records *where*, in the layer's `CacheRecalcRegion` — a complex
+The region is the one record of what a composite has to redo. A change to a
+layer marks the layer's own rectangle and the ancestors hold it
+(`Scene::invalidate_layer_content`, `Scene::update_layer`,
+`Scene::layer_mut`); a layer keeps a region only while its caching is
+enabled; a change to the pixels a layer draws from marks the area the layer
+draws from that image (`Scene::bitmap_mut`), and every layer that holds those
+pixels keeps the region, caching or not, because the content they hold is no
+longer current; a layer that moved marks the old place and the new one in its
+parent (`Scene::update_layer`); a hidden layer marks nothing above itself.
+The composite reconstructs the region alone — the backdrop is filled over the
+region and every draw writes only the part of it that lands inside — and an
+empty region leaves the content untouched.
+
+This is the reference's shape: the layer's `CacheRecalcRegion` — a complex
 rectangle of the part of the cache that must be reconstructed
-(`reference/krkr2/cpp/core/visual/LayerIntf.h:963`). The reference fills it
-with the rectangles that changed
-(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6254`, `:6285`, `:6329`) and
+(`reference/krkr2/cpp/core/visual/LayerIntf.h:963`) — is filled with the
+rectangles that changed
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6254`, `:6285`, `:6329`), and
 `Complete` returns the cached bitmap untouched while it is empty
-(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7734-7740`).
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7734-7740`). The engine's
+region is the layer's own rectangle rather than the changed rectangle, so it
+is coarser; the shape is the same.
 
 The transition's tick is the case the two shapes answer the same way: the
 transition changes its own frame and no source's pixels, so it appends to no
-region (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6322-6327`) and
-advances no epoch, and the transition's endpoints keep their composites for
-the whole run.
+region (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6322-6327`), and the
+transition's endpoints keep their composites for the whole run.
 
 ### The pending-image path
 

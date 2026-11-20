@@ -506,9 +506,9 @@ fn cached_layers_composite_and_refresh_through_the_frame_pump() {
 /// already samples the `CacheBitmap` its child just completed instead of the
 /// previous frame's state.
 ///
-/// reference/cpp/core/visual/LayerIntf.cpp:7196 (the parent's cache loop
+/// reference/krkr2/cpp/core/visual/LayerIntf.cpp:7196 (the parent's cache loop
 /// completes each child before it completes itself)
-/// reference/cpp/core/visual/LayerIntf.cpp:7226
+/// reference/krkr2/cpp/core/visual/LayerIntf.cpp:7226
 #[test]
 fn nested_caches_composite_deepest_first() {
     let _lock = vm_lock();
@@ -542,24 +542,16 @@ fn nested_caches_composite_deepest_first() {
     );
 
     // Force the pass to run again without invalidating either cache. A parent
-    // that composited the child's live image would still record the live
-    // source generation and rewrite its cache now that the child's cache is
-    // current; a parent that already sampled the child cache recomposites
-    // nothing.
-    let generation = env
-        .scene
-        .bitmap(parent_cache)
-        .expect("parent cache")
-        .content_generation;
+    // that composited the child's live image would still hold the child's
+    // area as a region to reconstruct and rewrite its cache now that the
+    // child's cache is current; a parent that already sampled the child
+    // cache has no region left and recomposites nothing.
+    env.scene.set_bitmap_clean(parent_cache);
     env.scene.add_bitmap(1, 1, vec![0; 4]);
     env.refresh_caches();
     assert_eq!(named_layer(&env, "p").cache_bitmap, Some(parent_cache));
-    assert_eq!(
-        env.scene
-            .bitmap(parent_cache)
-            .expect("parent cache")
-            .content_generation,
-        generation,
+    assert!(
+        !env.scene.bitmap(parent_cache).expect("parent cache").dirty,
         "the parent sampled the child cache in the first pass"
     );
 }

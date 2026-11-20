@@ -688,10 +688,6 @@ fn load_into_a_resized_bitmap_installs_the_decoded_pixels() {
     assert_eq!(bitmap.rgba.as_slice(), DECODED_RGBA.as_slice());
     assert!(bitmap.dirty, "a loaded image is dirty");
     assert!(
-        bitmap.content_generation > 0,
-        "a loaded image bumps its content generation"
-    );
-    assert!(
         env._scene.structure_revision() > structure,
         "a load that changes the image size invalidates the scene projection"
     );

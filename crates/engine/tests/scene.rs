@@ -585,8 +585,8 @@ fn replace_bitmap_image_splits_resize_from_content_and_keeps_ownership() {
 
 /// `bitmap_mut_with_source` borrows the write target and one read source at
 /// once, in either pool order, and refuses the bitmap it writes. It is a
-/// borrow accessor, not a content change: neither revision nor the target's
-/// `content_generation` moves (the caller reports the write once).
+/// borrow accessor, not a content change: neither revision moves (the caller
+/// reports the write once).
 #[test]
 fn bitmap_mut_with_source_splits_without_touching_the_revision() {
     let mut scene = Scene::default();
@@ -619,7 +619,6 @@ fn bitmap_mut_with_source_splits_without_touching_the_revision() {
     assert!(scene.bitmap_mut_with_source(first, 9999).is_none());
     assert_eq!(scene.structure_revision(), structure);
     assert_eq!(scene.content_revision(), content);
-    assert_eq!(scene.bitmap(first).unwrap().content_generation, 0);
 }
 
 /// `resize_province_image` uses checked arithmetic and a fallible allocation:
@@ -1136,8 +1135,8 @@ fn the_hit_test_offers_the_candidates_front_to_back() {
     assert_eq!(scene.layer_hit_outcome(front, true), Some(front));
 }
 
-/// The pending-paint flag is not what the layer draws, so arming it moves
-/// neither the layer's contribution to a composite nor the tree's shape.
+/// The pending-paint flag is not what the layer draws, so arming it marks
+/// neither the layer's region nor the tree's shape.
 ///
 /// The reference's `CallOnPaint` flag is read by the paint dispatch and
 /// changes nothing about the layer's picture
@@ -1149,30 +1148,29 @@ fn the_pending_paint_flag_moves_no_contribution() {
     let mut scene = Scene::default();
     let win = scene.add_window("t", (320, 240));
     let layer = scene.add_layer(win, None);
-    let epoch = scene.layer(layer).unwrap().content_epoch;
 
     assert!(scene.set_layer_pending_paint(layer, true));
     assert!(scene.layer(layer).unwrap().pending_paint);
     assert_eq!(
-        scene.layer(layer).unwrap().content_epoch,
-        epoch,
+        scene.layer_content_region(layer),
+        None,
         "the pending-paint flag is not what the layer draws"
     );
 
     assert!(scene.set_layer_pending_paint(layer, false));
     assert!(!scene.layer(layer).unwrap().pending_paint);
     assert_eq!(
-        scene.layer(layer).unwrap().content_epoch,
-        epoch,
+        scene.layer_content_region(layer),
+        None,
         "clearing the pending-paint flag is not what the layer draws"
     );
 }
 
 /// A z-order write moves the moved child's contribution, not the parent's.
 ///
-/// The parent's signature holds the child's contribution, so the parent's own
-/// cache is recomposited because of the child; the parent's own contribution
-/// does not move, because the parent's picture does not change.
+/// The parent's region holds the child's contribution, so the parent's own
+/// cache is recomposited because of the child; the parent's own area is not
+/// marked, because the parent's picture does not change.
 #[test]
 fn a_z_order_write_moves_no_parent_contribution() {
     let mut scene = Scene::default();
@@ -1180,30 +1178,46 @@ fn a_z_order_write_moves_no_parent_contribution() {
     let parent = scene.add_layer(win, None);
     let first = scene.add_layer(win, Some(parent));
     let second = scene.add_layer(win, Some(parent));
+    // The parent is bigger than the children, so the parent's own area and
+    // the child's differ.
+    for (id, size) in [(parent, 320u32), (first, 16), (second, 16)] {
+        scene
+            .update_layer(id, |layer| {
+                layer.rect = engine::Rect::new(0, 0, size, size);
+                layer.visible = true;
+                true
+            })
+            .expect("the layer is there");
+    }
+    // The parent caches: the reference's shape is that a layer keeps a
+    // recalculation region only while its caching is enabled
+    // (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`).
+    scene.inc_cache_enabled_count(parent);
     // The absolute order mode is switched on first: the switch is a change of
     // the parent's own contribution, and it is not what this test is about.
     assert!(scene.set_absolute_order_mode(parent, true));
-
-    let parent_epoch = scene.layer(parent).unwrap().content_epoch;
-    let first_epoch = scene.layer(first).unwrap().content_epoch;
-    let second_epoch = scene.layer(second).unwrap().content_epoch;
+    // The setup marked the layers; the test starts from a clean tree.
+    for id in [parent, first, second] {
+        let _ = scene.take_layer_content_region(id);
+    }
 
     scene
         .set_absolute_order_index(second, 0)
         .expect("the child moves to the front");
 
     assert_eq!(
-        scene.layer(parent).unwrap().content_epoch,
-        parent_epoch,
-        "the parent's picture does not change, so its contribution does not move"
-    );
-    assert_eq!(
-        scene.layer(first).unwrap().content_epoch,
-        first_epoch,
+        scene.layer_content_region(first),
+        None,
         "the sibling that stayed does not move"
     );
-    assert!(
-        scene.layer(second).unwrap().content_epoch > second_epoch,
-        "the moved child's contribution moves"
+    assert_eq!(
+        scene.layer_content_region(second),
+        None,
+        "the moved child keeps no region of its own: it keeps no cache, and a\n         layer that keeps no cache keeps no recalculation region\n         (reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331)"
+    );
+    assert_eq!(
+        scene.layer_content_region(parent),
+        Some(engine::Rect::new(0, 0, 16, 16)),
+        "the parent's own area does not change: only the child's does"
     );
 }
