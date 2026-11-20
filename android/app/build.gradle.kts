@@ -81,6 +81,12 @@ android {
         jniLibs {
             useLegacyPackaging = false
         }
+        // The dex files are compressed in the package: the runtime unpacks
+        // them itself, which makes the package smaller and the install a
+        // little longer.
+        dex {
+            useLegacyPackaging = true
+        }
     }
 
     // Release signing comes from the **environment**, so CI can sign with a real
@@ -125,10 +131,16 @@ android {
     }
 
     buildTypes {
-        // No minification: the UI is small, and R8 would only add a way for this
-        // to break in a manner that is hard to debug.
+        // R8 shrinks the launcher: the Compose and Material 3 artifacts carry a
+        // large amount of code the launcher never calls. The names the engine
+        // and the framework resolve by name are kept in `proguard-rules.pro`.
         getByName("release") {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
             signingConfig = signingConfigs.findByName("release")
                 ?: signingConfigs.getByName("debug")
         }
