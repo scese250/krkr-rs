@@ -2692,6 +2692,25 @@ fn tint_crop(
     colors: [[u8; 4]; 4],
     half_alpha: bool,
 ) -> Option<BitmapState> {
+    // The divisor is a constant, so the division is a multiply and not a
+    // per-pixel division.
+    if half_alpha {
+        tint_crop_scaled::<128>(pixels, crop, colors)
+    } else {
+        tint_crop_scaled::<255>(pixels, crop, colors)
+    }
+}
+
+/// Crop `pixels` to `crop` and scale each channel by the bilinearly
+/// interpolated corner colour, dividing by [`DIVISOR`].
+///
+/// The divisor is the constant the tint scales a channel by: 255 for the
+/// plain tint and 128 for the half-alpha one.
+fn tint_crop_scaled<const DIVISOR: u32>(
+    pixels: &Pixels,
+    crop: RectI,
+    colors: [[u8; 4]; 4],
+) -> Option<BitmapState> {
     let width = u32::try_from(crop.2.checked_sub(crop.0)?).ok()?;
     let height = u32::try_from(crop.3.checked_sub(crop.1)?).ok()?;
     if width == 0 || height == 0 {
@@ -2702,7 +2721,6 @@ fn tint_crop(
     let row_bytes = width_usize.checked_mul(4)?;
     let source_width = usize::try_from(pixels.width).ok()?;
     let source_left = usize::try_from(crop.0).ok()?;
-    let divisor = if half_alpha { 128u32 } else { 255u32 };
     let span_x = i32::try_from(width).ok()?.saturating_sub(1).max(1);
     let span_y = i32::try_from(height).ok()?.saturating_sub(1).max(1);
     let lerp = |from: u8, to: u8, step: i32, span: i32| -> u32 {
@@ -2710,7 +2728,16 @@ fn tint_crop(
         let to = i32::from(to);
         (from + step * (to - from) / span) as u32
     };
-    let mut rgba = Vec::with_capacity(row_bytes.checked_mul(height_usize)?);
+    // A chunk that keeps the order the file stores has its red and blue
+    // channels exchanged when it is copied into a bitmap; a chunk that
+    // already carries the scene's order is copied as it is. The alpha is the
+    // chunk's fourth byte in every case.
+    let (red_index, green_index, blue_index) = match pixels.order {
+        ChannelOrder::File => (2, 1, 0),
+        ChannelOrder::Scene => (0, 1, 2),
+    };
+    let mut rgba = vec![0u8; row_bytes.checked_mul(height_usize)?];
+    let mut at = 0usize;
     for y in crop.1..crop.3 {
         let row = usize::try_from(y).ok()?.checked_mul(source_width)?;
         let start = row.checked_add(source_left)?.checked_mul(4)?;
@@ -2728,30 +2755,96 @@ fn tint_crop(
             lerp(colors[1][2], colors[2][2], row_step, span_y),
             lerp(colors[1][3], colors[2][3], row_step, span_y),
         ];
-        for (index, pixel) in row.as_chunks::<4>().0.iter().enumerate() {
-            let column = i32::try_from(index).ok()?;
-            // A chunk that keeps the order the file stores has its red and
-            // blue channels exchanged when it is copied into a bitmap; a
-            // chunk that already carries the scene's order is copied as it
-            // is. The alpha is the chunk's fourth byte in every case.
-            let (red, green, blue) = match pixels.order {
-                ChannelOrder::File => (pixel[2], pixel[1], pixel[0]),
-                ChannelOrder::Scene => (pixel[0], pixel[1], pixel[2]),
-            };
-            rgba.extend_from_slice(&[
-                ((u32::from(red) * lerp(left[0] as u8, right[0] as u8, column, span_x)) / divisor)
-                    .min(255) as u8,
-                ((u32::from(green) * lerp(left[1] as u8, right[1] as u8, column, span_x)) / divisor)
-                    .min(255) as u8,
-                ((u32::from(blue) * lerp(left[2] as u8, right[2] as u8, column, span_x)) / divisor)
-                    .min(255) as u8,
-                ((u32::from(pixel[3]) * lerp(left[3] as u8, right[3] as u8, column, span_x))
-                    / divisor)
-                    .min(255) as u8,
-            ]);
+        // The horizontal ramp of every channel. The ramp is walked with an
+        // exact incremental step, so the values are the ones the division
+        // gives and the per-pixel division disappears.
+        let mut ramps = [
+            ColorRamp::new(left[0] as u8, right[0] as u8, span_x),
+            ColorRamp::new(left[1] as u8, right[1] as u8, span_x),
+            ColorRamp::new(left[2] as u8, right[2] as u8, span_x),
+            ColorRamp::new(left[3] as u8, right[3] as u8, span_x),
+        ];
+        for pixel in row.as_chunks::<4>().0 {
+            rgba[at] = ((u32::from(pixel[red_index]) * ramps[0].value()) / DIVISOR).min(255) as u8;
+            rgba[at + 1] =
+                ((u32::from(pixel[green_index]) * ramps[1].value()) / DIVISOR).min(255) as u8;
+            rgba[at + 2] =
+                ((u32::from(pixel[blue_index]) * ramps[2].value()) / DIVISOR).min(255) as u8;
+            rgba[at + 3] = ((u32::from(pixel[3]) * ramps[3].value()) / DIVISOR).min(255) as u8;
+            at += 4;
+            ramps[0].step();
+            ramps[1].step();
+            ramps[2].step();
+            ramps[3].step();
         }
     }
     Some(BitmapState::new(width, height, rgba))
+}
+
+/// The horizontal colour ramp of one channel.
+///
+/// The value at column `c` is `from + c * (to - from) / span`, with the
+/// division truncating toward zero. The ramp is walked with an exact
+/// incremental step: the whole steps of the division are taken once and the
+/// remainder is carried, so the value at every column is the one the
+/// division gives.
+struct ColorRamp {
+    /// The value at column zero.
+    from: i32,
+    /// The sign of the step: a ramp that falls carries a negative sign.
+    sign: i32,
+    /// The whole steps the division takes per column.
+    whole: i32,
+    /// The remainder of one step, below the span.
+    remainder: i32,
+    /// The span the ramp divides by.
+    span: i32,
+    /// The column the ramp is at.
+    column: i32,
+    /// The whole steps the remainder has carried so far.
+    carry: i32,
+    /// The remainder at the current column.
+    rest: i32,
+}
+
+impl ColorRamp {
+    /// The ramp from `from` to `to` over `span` columns.
+    fn new(from: u8, to: u8, span: i32) -> Self {
+        let delta = i32::from(to) - i32::from(from);
+        // A division that truncates toward zero is the floor of the positive
+        // magnitude, so a falling ramp carries the magnitude and the sign
+        // apart.
+        let (sign, magnitude) = if delta < 0 { (-1, -delta) } else { (1, delta) };
+        Self {
+            from: i32::from(from),
+            sign,
+            whole: magnitude / span,
+            remainder: magnitude % span,
+            span,
+            column: 0,
+            carry: 0,
+            rest: 0,
+        }
+    }
+
+    /// The value at the current column.
+    ///
+    /// The value lies between the two corner colours, so it is a byte.
+    fn value(&self) -> u32 {
+        (self.from + self.sign * (self.column * self.whole + self.carry)) as u32
+    }
+
+    /// Steps the ramp to the next column.
+    fn step(&mut self) {
+        self.column += 1;
+        self.rest += self.remainder;
+        // The remainder is below the span and the step's remainder is too, so
+        // one subtraction settles it.
+        if self.rest >= self.span {
+            self.rest -= self.span;
+            self.carry += 1;
+        }
+    }
 }
 
 /// Composite a cropped icon onto its quad.
@@ -7131,5 +7224,121 @@ mod tests {
             transparent.rgba[3], 0,
             "a transparent corner colour takes the chunk's alpha away"
         );
+    }
+
+    /// The tint's horizontal ramp divides with a truncation toward zero, so
+    /// a ramp that falls lands on the same integers as the division gives.
+    ///
+    /// The ramp is walked with an incremental step, and the pixels it
+    /// produces are the ones the per-pixel division produces, for every
+    /// colour pair, every width and both divisors. The tint multiplies every
+    /// channel by the interpolated corner colour, the alpha among them
+    /// (`reference/cpp/plugins/motionplayer/SourceCache.cpp:129-149`).
+    #[test]
+    fn the_tint_ramp_keeps_the_division_truncation() {
+        for width in [1usize, 2, 3, 7, 16, 64] {
+            for height in [1usize, 3, 8] {
+                for order in [super::ChannelOrder::File, super::ChannelOrder::Scene] {
+                    for half_alpha in [false, true] {
+                        let pixels = super::Pixels {
+                            width: width as u32,
+                            height: height as u32,
+                            rgba: (0..width * height * 4)
+                                .map(|index| (index * 37 % 256) as u8)
+                                .collect(),
+                            order,
+                        };
+                        let colors = [
+                            [255, 0, 32, 255],
+                            [0, 255, 0, 200],
+                            [17, 0, 255, 0],
+                            [0, 0, 255, 255],
+                        ];
+                        let expected = the_tint_with_a_division_per_pixel(
+                            &pixels,
+                            (0, 0, width as i32, height as i32),
+                            colors,
+                            half_alpha,
+                        );
+                        let tinted = super::tint_crop(
+                            &pixels,
+                            (0, 0, width as i32, height as i32),
+                            colors,
+                            half_alpha,
+                        )
+                        .expect("the tint covers the crop");
+                        assert_eq!(
+                            tinted.rgba, expected,
+                            "the ramp of a {width}x{height} crop with the half alpha \
+                             {half_alpha} is the one the division gives"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The tint's pixels, computed with a division per pixel.
+    ///
+    /// The formula is the one the ramp replaces: the horizontal value is
+    /// `from + column * (to - from) / span`, with the division truncating
+    /// toward zero, and the channel is divided by the tint's divisor.
+    fn the_tint_with_a_division_per_pixel(
+        pixels: &super::Pixels,
+        crop: (i32, i32, i32, i32),
+        colors: [[u8; 4]; 4],
+        half_alpha: bool,
+    ) -> Vec<u8> {
+        let width = (crop.2 - crop.0) as usize;
+        let height = (crop.3 - crop.1) as usize;
+        let divisor = if half_alpha { 128u32 } else { 255u32 };
+        let span_x = width as i32 - 1;
+        let span_y = height as i32 - 1;
+        let span_x = span_x.max(1);
+        let span_y = span_y.max(1);
+        let lerp = |from: u8, to: u8, step: i32, span: i32| -> u32 {
+            let from = i32::from(from);
+            let to = i32::from(to);
+            (from + step * (to - from) / span) as u32
+        };
+        let mut rgba = Vec::new();
+        for y in 0..height as i32 {
+            let row_step = y;
+            let left = [
+                lerp(colors[0][0], colors[3][0], row_step, span_y),
+                lerp(colors[0][1], colors[3][1], row_step, span_y),
+                lerp(colors[0][2], colors[3][2], row_step, span_y),
+                lerp(colors[0][3], colors[3][3], row_step, span_y),
+            ];
+            let right = [
+                lerp(colors[1][0], colors[2][0], row_step, span_y),
+                lerp(colors[1][1], colors[2][1], row_step, span_y),
+                lerp(colors[1][2], colors[2][2], row_step, span_y),
+                lerp(colors[1][3], colors[2][3], row_step, span_y),
+            ];
+            for column in 0..width as i32 {
+                let index = (y as usize * width + column as usize) * 4;
+                let pixel = &pixels.rgba[index..index + 4];
+                let (red, green, blue) = match pixels.order {
+                    super::ChannelOrder::File => (pixel[2], pixel[1], pixel[0]),
+                    super::ChannelOrder::Scene => (pixel[0], pixel[1], pixel[2]),
+                };
+                rgba.extend_from_slice(&[
+                    ((u32::from(red) * lerp(left[0] as u8, right[0] as u8, column, span_x))
+                        / divisor)
+                        .min(255) as u8,
+                    ((u32::from(green) * lerp(left[1] as u8, right[1] as u8, column, span_x))
+                        / divisor)
+                        .min(255) as u8,
+                    ((u32::from(blue) * lerp(left[2] as u8, right[2] as u8, column, span_x))
+                        / divisor)
+                        .min(255) as u8,
+                    ((u32::from(pixel[3]) * lerp(left[3] as u8, right[3] as u8, column, span_x))
+                        / divisor)
+                        .min(255) as u8,
+                ]);
+            }
+        }
+        rgba
     }
 }
