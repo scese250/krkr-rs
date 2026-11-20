@@ -392,8 +392,8 @@ staging-copy transport is the current default.
 | topic | document |
 |---|---|
 | the Android composition root overview | [README.md](README.md) |
-| the Android design, the milestones, the storage decision | [`android.md`](../../../docs.old/android.md) · snapshot [`docs.old/android.md`](../../../docs.old/android.md) |
-| the Android backends (AAudio, MediaCodec, `AHardwareBuffer`) | [`10-android-backends.md`](../../../docs.old/migration/10-android-backends.md) · snapshot [`docs.old/migration/10-android-backends.md`](../../../docs.old/migration/10-android-backends.md) |
+| the launcher and the storage decision | [ui.md](ui.md) §2 |
+| the Android backends (AAudio, MediaCodec, `AHardwareBuffer`) | [`../platform/platform.md`](../platform/platform.md) §6, [`../platform/media.md`](../platform/media.md) §6 |
 | the Kotlin frontend's own README | [`android/README.md`](../../../android/README.md) |
 | the per-target dependency-graph check | [`../../rules/arch_rules.md`](../../rules/arch_rules.md) §12 |
 | the agent gate | [`../../rules/arch_rules.md`](../../rules/arch_rules.md) §14 |

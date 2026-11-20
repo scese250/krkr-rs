@@ -13,7 +13,7 @@
 //! The Android wiring (`crate::input`) supplies the clock and forwards the
 //! produced [`InputEvent`]s through the same host path as a real mouse; it
 //! consumes the raw touch instead of forwarding it, so no event fires twice
-//! (`docs.old/android.md` §5).
+//! (`docs/code/android/gesture.md` §4, §5).
 //!
 //! ## The mapping
 //!

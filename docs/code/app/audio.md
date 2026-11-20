@@ -195,4 +195,4 @@ device that rejects the write is a typed error — never a silent frame.
 | the L3 sound natives the decoder feeds | [`../compat/sound.md`](../compat/sound.md) |
 | the L1 audio device and its queue | [`../arch/l1.md`](../../arch/l1.md) §4 |
 | the media backends | [`../../migration/05-media-engine.md`](../../../docs.old/migration/05-media-engine.md) |
-| the Android AAudio backend | [`../../android.md`](../../../docs.old/android.md) |
+| the Android AAudio backend | [`../platform/platform.md`](../platform/platform.md) §6 |

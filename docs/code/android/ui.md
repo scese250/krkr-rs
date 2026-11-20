@@ -245,4 +245,4 @@ The engine-side contracts the launcher depends on are documented in
 | the engine log file the Logs screen reads | [host.md](host.md) |
 | the settings the launcher persists | [config.md](config.md) |
 | the cross-compile and the packaging | [build.md](build.md) |
-| the Android design, the launcher, the storage decision | [`android.md`](../../../docs.old/android.md) |
+| the storage decision and the resolved path | [`../platform/fs.md`](../platform/fs.md) §7 |

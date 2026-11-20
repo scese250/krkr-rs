@@ -126,7 +126,7 @@ impl AndroidHost {
     ///
     /// The raw touch is consumed here rather than forwarded: a KAG menu reads
     /// the mouse event family, and forwarding both would fire twice
-    /// (`docs.old/android.md` §5).
+    /// (`docs/code/android/gesture.md` §4).
     pub(crate) fn touch(&mut self, id: u64, phase: api::host::TouchPhase, x: f32, y: f32) {
         let now_ms = self.now_ms();
         let events = self.gestures.phase(id, phase, x, y, now_ms);

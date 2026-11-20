@@ -12,8 +12,8 @@
 #
 # Scope of the Android build: `arm64-v8a` only, release build. No other ABIs,
 # no emulator, no real signing key (the APK is signed with the debug key when
-# no keystore secret is configured, so it installs — see docs.old/android.md
-# §1).
+# no keystore secret is configured, so it installs — see
+# docs/code/android/build.md §5, "Signing").
 #
 # The commands mirror builds that were run by hand and verified end to end on a
 # development machine; the orchestrations below are exercised by every `v*`

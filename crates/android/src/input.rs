@@ -53,9 +53,9 @@ fn deliver(handler: &mut AndroidHost, event: &AndroidInputEvent<'_>) {
 ///
 /// The contact phases are fed to the touch synthesizer ([`AndroidHost::touch`])
 /// rather than forwarded as raw touch: KAG reads the mouse event family, and
-/// sending both would fire twice (`docs.old/android.md` §5). A hover move becomes a
-/// pointer move; a button press/release becomes a mouse button. An action that
-/// is none of these (outside, scroll) is dropped.
+/// sending both would fire twice (`docs/code/android/input.md` §4). A hover
+/// move becomes a pointer move; a button press/release becomes a mouse button.
+/// An action that is none of these (outside, scroll) is dropped.
 fn deliver_motion(handler: &mut AndroidHost, motion: &MotionEvent<'_>) {
     let action = match i32::try_from(u32::from(motion.action())) {
         Ok(action) => action,

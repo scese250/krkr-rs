@@ -108,7 +108,6 @@ It is kept as the **evidence archive**, for two reasons:
 |---|---|
 | `docs.old/migration/` | the design record: the decision log and the per-topic design documents |
 | `docs.old/audits/` | the read-only audits (17 pages) |
-| `docs.old/android.md` | the archived Android launcher guide |
 | `docs.old/runtime-config.md` | the archived runtime configuration surface |
 | `docs.old/code-conduct.md` | the archived Rust baseline, replaced by `rules/code_styles.md` |
 | `docs.old/performance.md`, `docs.old/optimization.md` | the measured performance work |

@@ -16,10 +16,10 @@ import android.provider.DocumentsContract
  * `1A2B-3C4D:Games` → `/storage/1A2B-3C4D/Games`), so we resolve rather than
  * stream.
  *
- * This is option A in `docs.old/android.md` §4: `MANAGE_EXTERNAL_STORAGE` is
- * required for the resolved path to be readable on Android 11+. The
- * policy-clean alternative (a SAF-backed storage backend that streams through
- * `ContentResolver`) is the documented follow-up.
+ * `MANAGE_EXTERNAL_STORAGE` is required for the resolved path to be readable on
+ * Android 11+ (`docs/code/android/ui.md` §2). The policy-clean alternative — a
+ * SAF-backed storage backend that streams through `ContentResolver` — is not
+ * wired (`docs/code/platform/fs.md` §7).
  *
  * Only ids from known filesystem providers are trusted: the external-storage
  * provider's `primary:...` / `XXXX-XXXX:...` ids, and the Downloads provider's

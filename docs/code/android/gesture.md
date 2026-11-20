@@ -192,6 +192,6 @@ hit a real KAG menu, and the DPI-based slop.
 | the Android composition root overview | [README.md](README.md) |
 | the input wiring that feeds this machine | [input.md](input.md) |
 | the handler that owns the synthesizer | [host.md](host.md) |
-| the reference Android touch mapping | [`android.md`](../../../docs.old/android.md) §5 · snapshot [`docs.old/android.md`](../../../docs.old/android.md) |
+| the touch → mouse mapping and the state machine | [§4](#4-the-mapping), [§5](#5-the-state-machine) |
 | the L1 input model the events feed | [`../platform/platform.md`](../platform/platform.md) §3 |
 | the L2 input state that turns the pair into a click | [`../../rules/arch_rules.md`](../../rules/arch_rules.md) §5 |

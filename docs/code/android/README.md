@@ -11,10 +11,16 @@ launcher's choice to the shared host; it contains **no engine logic**. The
 desktop binary (`krkr`) and this library drive the same `app::Host` and
 `app::GameHost` through the same `platform::EventHandler`.
 
-The full design — the launcher, the storage decision, the touch bridge, the
-MediaCodec backend and the packaging — is in
-[`android.md`](../../../docs.old/android.md) (evidence trail:
-[`docs.old/android.md`](../../../docs.old/android.md)).
+The design is in the pages this README links: the launcher in [ui.md](ui.md),
+the touch bridge in [gesture.md](gesture.md), the MediaCodec backend in
+[`../platform/media.md`](../platform/media.md) §6 and the packaging in
+[build.md](build.md). The storage decision — a path-based engine and a
+path-resolving launcher — is stated in [`../platform/fs.md`](../platform/fs.md)
+§7 and in [ui.md](ui.md) §2. There is no separate design document in this
+tree: the rules the engine is bound by are stated in
+[`../../rules/arch_rules.md`](../../rules/arch_rules.md) (§12 the platform and
+backend selection, §13 the decisions), and the open Android work is in
+[`../../../TODO.md`](../../../TODO.md) §14.
 
 The launcher's own interface — the Kotlin side of the app, under
 `android/app/src/main/kotlin/` — is documented in [ui.md](ui.md).
@@ -172,13 +178,13 @@ resolver, the JNI field names, and the whole touch → mouse state machine.
 
 | topic | document |
 |---|---|
-| the Android design, the launcher, the storage decision | [`android.md`](../../../docs.old/android.md) · snapshot [`docs.old/android.md`](../../../docs.old/android.md) |
+| the launcher and the storage decision | [ui.md](ui.md) §2, [`../platform/fs.md`](../platform/fs.md) §7 |
 | the event loop and the handler | [host.md](host.md) |
 | the input translation | [input.md](input.md) |
 | the touch → mouse bridge | [gesture.md](gesture.md) |
 | the settings resolution | [config.md](config.md) |
 | the cross-compile and the packaging | [build.md](build.md) |
-| the Android backends (AAudio, MediaCodec, `AHardwareBuffer`) | [`10-android-backends.md`](../../../docs.old/migration/10-android-backends.md) · snapshot [`docs.old/migration/10-android-backends.md`](../../../docs.old/migration/10-android-backends.md) |
+| the Android backends (AAudio, MediaCodec, `AHardwareBuffer`) | [build.md](build.md) §9 |
 | the L1 Android window and audio backend | [`../platform/platform.md`](../platform/platform.md) |
 | the MediaCodec video backend | [`../platform/media.md`](../platform/media.md) §6 |
 | the layer rules and the composition-root rule | [`../../rules/arch_rules.md`](../../rules/arch_rules.md) §2, §4.2 |

@@ -166,5 +166,5 @@ real KAG menu.
 | the touch → mouse synthesizer this module feeds | [gesture.md](gesture.md) |
 | the handler that receives the events | [host.md](host.md) |
 | the L1 translation functions | [`../platform/platform.md`](../platform/platform.md) §3 |
-| the reference Android input mapping | [`android.md`](../../../docs.old/android.md) §5 · snapshot [`docs.old/android.md`](../../../docs.old/android.md) |
+| the translation and the events each action yields | [§4](#4-the-translation) |
 | the L1↔L2 input protocol | [`../../rules/arch_rules.md`](../../rules/arch_rules.md) §5 |

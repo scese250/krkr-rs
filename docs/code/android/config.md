@@ -197,6 +197,6 @@ only would make the JNI read observe null and silently take the default.
 | the Android composition root overview | [README.md](README.md) |
 | the entry point that consumes the resolved values | [host.md](host.md) §3 |
 | the shared configuration value types | [`../platform/api.md`](../platform/api.md) §4 |
-| the configuration surface as a whole | [`runtime-config.md`](../../../docs.old/runtime-config.md) |
-| the launcher's settings file and the JNI path | [`android.md`](../../../docs.old/android.md) §3.2 · snapshot [`docs.old/android.md`](../../../docs.old/android.md) |
+| the configuration surface as a whole | [`../app/config.md`](../app/config.md) §1, [`../platform/api.md`](../platform/api.md) §4 |
+| the launcher's settings screen and its persisted draft | [ui.md](ui.md) §2, §3 |
 | the runtime configuration rule | [`../../rules/arch_rules.md`](../../rules/arch_rules.md) §9 |

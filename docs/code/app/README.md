@@ -227,5 +227,5 @@ a real-game test mounts.
 | game loading and the startup order | [`../migration/09-game-loading.md`](../../../docs.old/migration/09-game-loading.md) |
 | the VM host and the frame body | [vm.md](../vm.md), [`../../migration/08-tjs-vm-and-native-plugins.md`](../../../docs.old/migration/08-tjs-vm-and-native-plugins.md) §6 |
 | runtime configuration | [config.md](config.md), [`../runtime-config.md`](../../../docs.old/runtime-config.md) |
-| the Android root | [`../android.md`](../../../docs.old/android.md) |
+| the Android root | [`../android/README.md`](../android/README.md) |
 | the working rules for agents and humans | [`../../../AGENTS.md`](../../../AGENTS.md) |

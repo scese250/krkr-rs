@@ -283,6 +283,6 @@ the engine starts, decodes and renders on a real phone.
 | the input translation the handler consumes | [input.md](input.md) |
 | the touch → mouse state machine the handler owns | [gesture.md](gesture.md) |
 | the settings the entry point resolves | [config.md](config.md) |
-| the Android design and the launcher contract | [`android.md`](../../../docs.old/android.md) · snapshot [`docs.old/android.md`](../../../docs.old/android.md) |
+| the launcher contract the engine shares | [ui.md](ui.md) |
 | the L1 window and the Android backend | [`../platform/platform.md`](../platform/platform.md) |
 | the composition-root rule | [`../../rules/arch_rules.md`](../../rules/arch_rules.md) §4.2 |

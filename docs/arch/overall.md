@@ -245,7 +245,7 @@ See [`l3.md`](l3.md) §7.
 | the VM/compat protocol, the engine seam | [`l3.md`](l3.md) §2 |
 | plugins, an unported plugin, the DLL-surface pipeline | [`l3.md`](l3.md) §5 |
 | the VM host, script loading, the Rust-port audit | [`l4.md`](l4.md) |
-| Android backends (AAudio, MediaCodec, `AHardwareBuffer`) | [`../android.md`](../../docs.old/android.md), [`l1.md`](l1.md) §6 |
+| Android backends (AAudio, MediaCodec, `AHardwareBuffer`) | [`../code/android/build.md`](../code/android/build.md) §9, [`l1.md`](l1.md) §6, §8 |
 | open work | [`../../TODO.md`](../../TODO.md) |
 | native and plugin parity reports | [`../native_parity.md`](../native_parity.md), [`../plugin_parity.md`](../plugin_parity.md) |
 | runtime configuration and launcher options | [`../runtime-config.md`](../../docs.old/runtime-config.md) |

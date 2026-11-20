@@ -650,9 +650,9 @@ private fun copyPath(context: Context, path: String): Boolean {
 /**
  * Starts the engine for [entry], or explains why it cannot.
  *
- * The engine needs a real path (docs.old/android.md §4), so every failure is turned
- * into a specific dialog *before* the engine Activity is started: a null
- * resolution ([SafPaths.resolve] returns null for a provider that is not a
+ * The engine needs a real path (`docs/code/android/ui.md` §2), so every failure
+ * is turned into a specific dialog *before* the engine Activity is started: a
+ * null resolution ([SafPaths.resolve] returns null for a provider that is not a
  * filesystem), a missing/unreadable directory, or a folder that is not a
  * KiriKiri game ([GamePreflight]). A successful launch is recorded
  * ([EngineDiagnostics.markLaunch]) so a crash can be reported when the launcher

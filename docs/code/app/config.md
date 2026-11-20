@@ -122,4 +122,4 @@ The full contract, with both launchers side by side, is in
 | the game host and the cache policy | [game.md](game.md) |
 | the debug panel the overlay flag drives | [overlay.md](overlay.md) |
 | the runtime configuration contract | [`../../runtime-config.md`](../../../docs.old/runtime-config.md) |
-| the Android root | [`../../android.md`](../../../docs.old/android.md) |
+| the Android root | [`../android/README.md`](../android/README.md) |
