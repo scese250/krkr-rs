@@ -82,6 +82,13 @@ pub struct Launch {
     /// spent it stops reporting and says so once. A budget of zero reports no
     /// slow frame at all.
     pub slow_report_budget: Option<Duration>,
+    /// The frame gap at which a frame is reported, in milliseconds.
+    ///
+    /// `None` leaves the default threshold. A caller that measures a frame
+    /// budget sets its own: the budget of a 30 fps target is 33.3 ms, and
+    /// the default threshold hides exactly the frames such a budget is
+    /// about.
+    pub slow_frame_threshold_ms: Option<f64>,
     /// Whether the run reports its frame-time distribution at the end.
     ///
     /// The report is the run's last line: the number of frames, the fastest
@@ -308,7 +315,10 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
             input.base_dir.clone(),
             launch.runtime.preload_archives,
         )?
-        .with_slow_report_budget(launch.slow_report_budget);
+        .with_slow_report_budget(launch.slow_report_budget)
+        .with_slow_frame_threshold(launch.slow_frame_threshold_ms.unwrap_or(
+            crate::game::DEFAULT_SLOW_FRAME_MS,
+        ));
         println!(
             "krkr headless game: backend={} frames={} archives={}",
             game.host().backend().name(),
@@ -507,6 +517,13 @@ struct DesktopApp {
     /// The wall-clock time the run may spend producing slow-frame reports, or
     /// `None` to leave the reports unbounded.
     slow_report_budget: Option<Duration>,
+    /// The frame gap at which a frame is reported, in milliseconds.
+    ///
+    /// `None` leaves the default threshold. A caller that measures a frame
+    /// budget sets its own: the budget of a 30 fps target is 33.3 ms, and
+    /// the default threshold hides exactly the frames such a budget is
+    /// about.
+    slow_frame_threshold_ms: Option<f64>,
     /// The run's frame-gap history, shared with the runner that reports it.
     ///
     /// The handler records every gap the platform measured; the runner reads
@@ -657,6 +674,7 @@ impl DesktopApp {
             software: None,
             dump_frame: launch.dump_frame.clone(),
             slow_report_budget: launch.slow_report_budget,
+            slow_frame_threshold_ms: launch.slow_frame_threshold_ms,
             frame_times,
             media: Media::new(),
         }
@@ -750,7 +768,13 @@ impl EventHandler for DesktopApp {
                             input.base_dir.clone(),
                             self.preload_archives,
                         )
-                        .map(|game| game.with_slow_report_budget(self.slow_report_budget))
+                        .map(|game| {
+                            game.with_slow_report_budget(self.slow_report_budget)
+                                .with_slow_frame_threshold(
+                                    self.slow_frame_threshold_ms
+                                        .unwrap_or(crate::game::DEFAULT_SLOW_FRAME_MS),
+                                )
+                        })
                         {
                             Ok(game) => Running::Game(Box::new(game)),
                             Err(error) => {
@@ -925,6 +949,7 @@ mod tests {
             mode: RunMode::Headless { frames: 2 },
             dump_frame: None,
             slow_report_budget: None,
+            slow_frame_threshold_ms: None,
             frame_report: true,
         })
         .expect("headless run");
@@ -966,6 +991,7 @@ mod tests {
             mode: RunMode::Headless { frames: 5 },
             dump_frame: None,
             slow_report_budget: None,
+            slow_frame_threshold_ms: None,
             frame_report: true,
         })
         .expect("headless run");

@@ -140,6 +140,11 @@ const OPTIONS: &[OptionDoc] = &[
         help: "Bound the wall-clock time the run spends reporting slow frames (default: unbounded; 0 reports no slow frame).",
     },
     OptionDoc {
+        flag: "--slow-frame-ms",
+        value: "N",
+        help: "The frame gap at which a frame is reported as slow (default: 250; the 30 fps budget is 33.3).",
+    },
+    OptionDoc {
         flag: "--no-frame-report",
         value: "",
         help: "Skip the frame-time distribution the run prints as its last line (on by default).",
@@ -209,6 +214,11 @@ struct Cli {
     /// The whole-run budget for the slow-frame reports, in milliseconds, or
     /// `None` when the option was absent.
     slow_report_ms: Option<u64>,
+    /// The frame gap at which a frame is reported, in milliseconds.
+    ///
+    /// The default is the audio drain's playback cap, so the frame that trips
+    /// the audio warning also produces the report that explains it.
+    slow_frame_ms: Option<u64>,
     /// Whether the run prints its frame-time distribution at the end.
     frame_report: bool,
     /// Whether `--vm-report` was given.
@@ -250,6 +260,7 @@ impl Cli {
             graphic_cache_limit: None,
             dump_frame: None,
             slow_report_ms: None,
+            slow_frame_ms: None,
             frame_report: true,
             vm_report: false,
             archives: Vec::new(),
@@ -303,6 +314,18 @@ impl Cli {
                     cli.slow_report_ms = Some(value.parse().map_err(|_| {
                         ConfigError::invalid(
                             "--slow-report-ms",
+                            value.clone(),
+                            "a non-negative integer",
+                        )
+                    })?);
+                }
+                "--slow-frame-ms" => {
+                    let value = args.next().ok_or_else(|| {
+                        CliError::Usage("--slow-frame-ms requires a value".to_owned())
+                    })?;
+                    cli.slow_frame_ms = Some(value.parse().map_err(|_| {
+                        ConfigError::invalid(
+                            "--slow-frame-ms",
                             value.clone(),
                             "a non-negative integer",
                         )
@@ -496,6 +519,7 @@ fn main() -> ExitCode {
         },
         dump_frame: cli.dump_frame,
         slow_report_budget,
+        slow_frame_threshold_ms: cli.slow_frame_ms.map(|ms| ms as f64),
         frame_report: cli.frame_report,
     };
 

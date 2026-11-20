@@ -30,14 +30,17 @@ use crate::audio::AudioOutput;
 use crate::startup::{StartupSnapshot, StartupStats};
 use crate::{Host, HostError, StepReport};
 
-/// A frame whose wall-clock gap reaches this many milliseconds logs its phase
-/// breakdown once, at `warn`.
+/// The default wall-clock gap at which a frame logs its breakdown.
 ///
-/// The threshold matches the audio drain's playback cap
+/// The default matches the audio drain's playback cap
 /// (`crate::audio::DEFAULT_MAX_CHUNK_MS`), so the frame that produces the
 /// existing `audio: ... exceeds the ... playback cap` warning also produces
-/// the attribution line that explains it.
-const SLOW_FRAME_MS: f64 = 250.0;
+/// the attribution line that explains it. A caller that measures a frame
+/// budget - a target frame rate, a run that must not miss a deadline - sets
+/// its own threshold through [`HostConfig::slow_frame_ms`]; the frame budget
+/// of a 30 fps target is 33.3 ms, and a threshold above it hides exactly the
+/// frames the budget is about.
+pub const DEFAULT_SLOW_FRAME_MS: f64 = 250.0;
 
 /// Errors surfaced while opening or stepping a real game.
 #[derive(Debug, thiserror::Error)]
@@ -317,18 +320,33 @@ impl PoolWork {
 /// The run's slow-frame reporting budget and what it has spent.
 ///
 /// The budget is a whole-run budget: it is spent by the time the reports
-/// take, and a run that has spent it stops reporting and says so once.
-#[derive(Clone, Copy, Debug, Default)]
+/// take, and a run that has spent it stops reporting and says so once. The
+/// threshold is the gap at which a frame is slow enough to report.
+#[derive(Clone, Copy, Debug)]
 struct SlowReporting {
     /// The wall-clock time the run may spend reporting, or `None` for no
     /// bound.
     budget: Option<Duration>,
+    /// The gap at which a frame is reported, in milliseconds.
+    threshold_ms: f64,
     /// The wall-clock time the reports have taken so far.
     spent: Duration,
     /// The number of reports emitted so far.
     reports: u64,
     /// Whether the exhaustion note was emitted.
     noted: bool,
+}
+
+impl Default for SlowReporting {
+    fn default() -> Self {
+        Self {
+            budget: None,
+            threshold_ms: DEFAULT_SLOW_FRAME_MS,
+            spent: Duration::ZERO,
+            reports: 0,
+            noted: false,
+        }
+    }
 }
 
 impl SlowReporting {
@@ -436,8 +454,8 @@ impl FrameAttribution {
 
     /// Whether the gap reaches the slow-frame threshold and a previous frame
     /// exists to explain it.
-    fn is_slow(&self, gap_ms: f64) -> bool {
-        self.valid && gap_ms >= SLOW_FRAME_MS
+    fn is_slow(&self, gap_ms: f64, threshold_ms: f64) -> bool {
+        self.valid && gap_ms >= threshold_ms
     }
 
     /// The VM tick the polls and the input segments do not cover.
@@ -466,86 +484,27 @@ impl FrameAttribution {
         gap_ms - self.total_ms - pacing.poll_ms
     }
 
-    /// Formats the single slow-frame line for `gap_ms`.
+    /// Formats the slow-frame report for `gap_ms`.
+    ///
+    /// One record answers what caused the slow frame. The header names the
+    /// frame, whether it reached the surface, the gap it spans and the
+    /// dominant cost; the costs follow, ranked largest first and labelled
+    /// with the section they belong to; the residuals and the totals close
+    /// it. Every line carries `key=value` pairs, so the report is read by a
+    /// person and parsed by a tool alike.
     ///
     /// The named phases and host/GPU costs are the previous frame's, because
     /// the gap spans it, and `presented` says whether that frame reached the
     /// surface: an acquisition timeout appears as `presented=false` with the
-    /// wait in `acquire`. `platform_wait` and `input` are this step's
-    /// measurement; `unaccounted` is `gap - previous total - platform wait`,
-    /// so a non-zero value is loop overhead or a stall outside both the
-    /// frame and the event poll. `tick_residual` is the VM tick not covered
-    /// by the input segments and the five polls; `host_residual` is the
-    /// engine frame not covered by sync/project/render. `pool_jobs` and
-    /// `pool_ms` are the decode pool's own work over the frame: the jobs it
-    /// completed and the time they took, so a frame that waited for decodes
-    /// is told apart from a frame that ran script.
-    fn slow_frame_line(&self, gap_ms: f64, pacing: FramePacing) -> String {
-        let phases = &self.phases;
-        let tick = &self.tick;
-        let report = &self.report;
-        let timings = self.timings.unwrap_or_default();
-        let unaccounted = self.unaccounted(gap_ms, pacing);
-        let tick_residual = self.tick_residual();
-        let host_residual = self.host_residual();
-        // The script compilation is named only when it was measured: a run
-        // that did not ask for the measurement has no number for it.
-        let front_end = match self.tick.front_end {
-            Some(front_end) => format!(" front_end={:.1}", front_end.total_ms),
-            None => String::new(),
-        };
-        format!(
-            "frame {} slow: presented={}, gap={gap_ms:.1} ms since the previous frame; \
-             the gap spans the previous frame, so these are its phases: \
-             sound={:.1} video={:.1} async={:.1} continuous={:.1} \
-             frame_tail={:.1} body={:.1}; its vm: tick={:.1} \
-             input_begin={:.1} input_events={:.1} input_end={:.1}{front_end} \
-             tick_residual={tick_residual:.1}; its pool: pool_jobs={} \
-             pool_ms={:.1}; its host: host_total={:.1} \
-             audio={:.1} host_sync={:.1} sync_upload={:.1} sync_prune={:.1} \
-             host_project={:.1} host_render={:.1} submit={:.1} \
-             host_residual={host_residual:.1} total={:.1}; its gpu: acquire={:.1} \
-             present={:.1} recreate={:.1} fence_wait={:.1}; this wait: \
-             platform_wait={:.1} input={:.1} unaccounted={unaccounted:.1} ms",
-            report.frame_index,
-            report.presented,
-            phases.sound_ms,
-            phases.video_ms,
-            phases.async_trigger_ms,
-            phases.continuous_handler_ms,
-            phases.frame_tail_ms,
-            phases.body_ms,
-            tick.tick_ms,
-            tick.input_begin_ms,
-            tick.input_events_ms,
-            tick.input_end_ms,
-            self.pool.jobs,
-            self.pool.elapsed_ms,
-            self.host_ms,
-            self.audio_ms,
-            report.sync_ms,
-            report.upload_ms,
-            report.prune_ms,
-            report.project_ms,
-            report.render_ms,
-            timings.submit_ms,
-            self.total_ms,
-            timings.acquire_ms,
-            timings.present_ms,
-            timings.recreate_ms,
-            timings.fence_wait_ms,
-            pacing.poll_ms,
-            pacing.input_ms,
-        )
-    }
-
-    /// Formats the detailed slow-frame report for `gap_ms`.
-    ///
-    /// The report answers what caused the slow frame: every measured cost
-    /// of the frame, ranked largest first and labelled with the section it
-    /// belongs to, so the dominant cost is the first entry instead of one
-    /// number among many. The residuals and the decode pool's job count
-    /// follow, and the totals close the report.
+    /// wait in `acquire`. `platform_wait_ms` and `input` are this step's
+    /// measurement; `unaccounted_ms` is `gap - previous total - platform
+    /// wait`, so a non-zero value is loop overhead or a stall outside both
+    /// the frame and the event poll. `tick_residual_ms` is the VM tick not
+    /// covered by the input segments and the five polls; `host_residual_ms`
+    /// is the engine frame not covered by sync/project/render. `pool_jobs`
+    /// and the pool's `elapsed` cost are the decode pool's own work over the
+    /// frame: the jobs it completed and the time they took, so a frame that
+    /// waited for decodes is told apart from a frame that ran script.
     ///
     /// The costs are the parts that do not overlap: the five polls, the
     /// input segments, the tick's residual, the pool's own work, the engine
@@ -554,7 +513,7 @@ impl FrameAttribution {
     /// parts add up to.
     ///
     /// The report is one string, and the log carries it as one entry.
-    fn slow_frame_detail(&self, gap_ms: f64, pacing: FramePacing) -> String {
+    fn slow_frame_report(&self, gap_ms: f64, pacing: FramePacing) -> String {
         let timings = self.timings.unwrap_or_default();
         let mut costs = vec![
             MeasuredCost {
@@ -685,59 +644,48 @@ impl FrameAttribution {
         // The largest cost leads, so the report names the dominant cost
         // without the reader comparing the numbers.
         costs.sort_by(|left, right| right.ms.total_cmp(&left.ms));
-        let mut out = String::new();
-        out.push_str(&format!(
-            "frame {} slow: presented={}, gap={gap_ms:.1} ms since the previous frame;",
+        let mut out = format!(
+            "app.frame: slow frame={} presented={} gap_ms={gap_ms:.1}",
             self.report.frame_index, self.report.presented
-        ));
+        );
         if let Some(dominant) = costs.first() {
             out.push_str(&format!(
-                " dominant cost: {}.{} = {:.1} ms",
+                " dominant={}.{} dominant_ms={:.1}",
                 dominant.section, dominant.name, dominant.ms
             ));
         }
         out.push('\n');
-        out.push_str("costs, largest first:\n");
-        for (index, cost) in costs.iter().enumerate() {
+        for cost in costs.iter() {
             out.push_str(&format!(
-                "  {}. {}.{} = {:.1} ms\n",
-                index + 1,
-                cost.section,
-                cost.name,
-                cost.ms
+                "  cost {}.{}={:.1}\n",
+                cost.section, cost.name, cost.ms
             ));
         }
         // The front end's phases are the breakdown of the one cost the VM
         // section holds for the script compilation.
         if let Some(front_end) = self.tick.front_end {
-            out.push_str("front end (the tick's script compilation), largest first:\n");
-            let mut phases = [
-                ("lexer", front_end.lexer_ms),
-                ("parser", front_end.parser_ms),
-                ("generator", front_end.generator_ms),
-                ("image", front_end.image_ms),
-            ];
-            phases.sort_by(|left, right| right.1.total_cmp(&left.1));
-            for (index, (name, ms)) in phases.iter().enumerate() {
-                out.push_str(&format!("  {}. {name} = {ms:.1} ms\n", index + 1));
-            }
             out.push_str(&format!(
-                "  residual = {:.1} ms; total = {:.1} ms\n",
+                "  front_end lexer_ms={:.1} parser_ms={:.1} generator_ms={:.1} \
+                 image_ms={:.1} residual_ms={:.1} total_ms={:.1}\n",
+                front_end.lexer_ms,
+                front_end.parser_ms,
+                front_end.generator_ms,
+                front_end.image_ms,
                 front_end.residual_ms(),
                 front_end.total_ms
             ));
         }
         out.push_str(&format!(
-            "residuals: tick_residual = {:.1} ms, host_residual = {:.1} ms, \
-             unaccounted = {:.1} ms; pool jobs = {}\n",
+            "  residual tick_residual_ms={:.1} host_residual_ms={:.1} \
+             unaccounted_ms={:.1} pool_jobs={}\n",
             self.tick_residual(),
             self.host_residual(),
             self.unaccounted(gap_ms, pacing),
             self.pool.jobs
         ));
         out.push_str(&format!(
-            "totals: body = {:.1} ms, tick = {:.1} ms, host_sync = {:.1} ms, \
-             host_total = {:.1} ms, total = {:.1} ms, platform_wait = {:.1} ms",
+            "  total body_ms={:.1} tick_ms={:.1} host_sync_ms={:.1} \
+             host_total_ms={:.1} total_ms={:.1} platform_wait_ms={:.1}",
             self.phases.body_ms,
             self.tick.tick_ms,
             self.report.sync_ms,
@@ -752,8 +700,8 @@ impl FrameAttribution {
 /// The VM's own analysis of the compiles it has done.
 ///
 /// The report is the slow-frame report's shape: the counts, the dominant
-/// phase, the phases ranked largest first, and the residual and the totals
-/// that close it. Every number is measured; nothing here is estimated.
+/// phase, the phases ranked largest first, and the residual that closes it.
+/// Every number is measured; nothing here is estimated.
 pub fn vm_report(stats: &CompileStats) -> String {
     let mut phases = [
         ("lexer", stats.lexer_ms),
@@ -764,23 +712,18 @@ pub fn vm_report(stats: &CompileStats) -> String {
     phases.sort_by(|left, right| right.1.total_cmp(&left.1));
     let residual =
         stats.total_ms - stats.lexer_ms - stats.parser_ms - stats.generator_ms - stats.image_ms;
-    let mut out = String::new();
-    out.push_str(&format!(
-        "vm analysis: compiles={} code_units={} bytes={}",
-        stats.compiles, stats.code_units, stats.bytes
-    ));
-    if stats.compiles == 0 {
-        out.push_str("; no compiles");
-    } else if let Some((name, ms)) = phases.first() {
-        out.push_str(&format!("; dominant phase: {name} = {ms:.1} ms"));
+    let mut out = format!(
+        "app.vm: compiles={} code_units={} bytes={} total_ms={:.1}",
+        stats.compiles, stats.code_units, stats.bytes, stats.total_ms
+    );
+    if let Some((name, ms)) = phases.first() {
+        out.push_str(&format!(" dominant={name} dominant_ms={ms:.1}"));
     }
     out.push('\n');
-    out.push_str("phases, largest first:\n");
-    for (index, (name, ms)) in phases.iter().enumerate() {
-        out.push_str(&format!("  {}. {name} = {ms:.1} ms\n", index + 1));
+    for (name, ms) in phases.iter() {
+        out.push_str(&format!("  cost {name}={ms:.1}\n"));
     }
-    out.push_str(&format!("residuals: residual = {residual:.1} ms\n"));
-    out.push_str(&format!("totals: compile = {:.1} ms", stats.total_ms));
+    out.push_str(&format!("  residual residual_ms={residual:.1}"));
     out
 }
 
@@ -1183,6 +1126,17 @@ impl GameHost {
         self
     }
 
+    /// The gap at which a frame is reported, in milliseconds.
+    ///
+    /// The default is [`DEFAULT_SLOW_FRAME_MS`]. A caller that measures a
+    /// frame budget sets its own: the budget of a 30 fps target is 33.3 ms,
+    /// and the default threshold hides exactly the frames such a budget is
+    /// about.
+    pub fn with_slow_frame_threshold(mut self, threshold_ms: f64) -> Self {
+        self.reporting.threshold_ms = threshold_ms;
+        self
+    }
+
     /// The L2 engine host.
     pub fn host(&self) -> &Host {
         &self.host
@@ -1330,7 +1284,7 @@ impl GameHost {
     /// spent it stops reporting and says so once. The note is emitted after
     /// the budget is spent and is not charged to it.
     fn report_slow_frame(&mut self, gap_ms: f64, pacing: FramePacing) {
-        if !self.last_frame.is_slow(gap_ms) {
+        if !self.last_frame.is_slow(gap_ms, self.reporting.threshold_ms) {
             return;
         }
         if !self.reporting.allows_report() {
@@ -1340,8 +1294,10 @@ impl GameHost {
             return;
         }
         let started = Instant::now();
-        log::warn!("{}", self.last_frame.slow_frame_line(gap_ms, pacing));
-        log::debug!("{}", self.last_frame.slow_frame_detail(gap_ms, pacing));
+        log::warn!(
+            "{}",
+            self.last_frame.slow_frame_report(gap_ms, pacing)
+        );
         self.reporting.charge(started.elapsed());
     }
 }
@@ -1739,7 +1695,7 @@ mod tests {
     #[test]
     fn fast_gap_emits_nothing() {
         let attribution = attribution_for(7, 480.0, 10.0);
-        assert!(!attribution.is_slow(16.0));
+        assert!(!attribution.is_slow(16.0, DEFAULT_SLOW_FRAME_MS));
     }
 
     /// The first frame has no predecessor, so a large gap for it emits
@@ -1747,16 +1703,16 @@ mod tests {
     #[test]
     fn first_frame_emits_nothing() {
         let attribution = FrameAttribution::default();
-        assert!(!attribution.is_slow(900.0));
+        assert!(!attribution.is_slow(900.0, DEFAULT_SLOW_FRAME_MS));
     }
 
-    /// The slow line names the **previous** frame and accounts the gap as
+    /// The report names the **previous** frame and accounts the gap as
     /// `previous total + platform wait + unaccounted`.
     #[test]
-    fn slow_line_names_the_previous_frame_and_balances_the_gap() {
+    fn the_report_names_the_previous_frame_and_balances_the_gap() {
         let attribution = attribution_for(7, 480.0, 10.0);
         let timings = attribution.timings.expect("timings recorded");
-        let line = attribution.slow_frame_line(
+        let report = attribution.slow_frame_report(
             520.0,
             FramePacing {
                 poll_ms: 15.0,
@@ -1764,46 +1720,70 @@ mod tests {
             },
         );
 
-        assert!(line.contains("frame 7 slow"), "line was: {line}");
+        let header = report.lines().next().expect("the report has a header");
         assert!(
-            line.contains("presented=false"),
-            "a slow gap names whether the frame it spans reached the surface: {line}"
+            header.starts_with("app.frame: slow frame=7 "),
+            "the header names the subsystem and the frame: {header}"
         );
-        assert!(line.contains("frame_tail=480.0"), "line was: {line}");
-        assert!(line.contains("body=480.0"), "line was: {line}");
-        assert!(line.contains("tick=487.5"), "line was: {line}");
-        assert!(line.contains("input_begin=1.0"), "line was: {line}");
-        assert!(line.contains("input_events=2.0"), "line was: {line}");
-        assert!(line.contains("input_end=0.5"), "line was: {line}");
-        assert!(line.contains("tick_residual=4.0"), "line was: {line}");
-        assert!(line.contains("pool_jobs=2"), "line was: {line}");
-        assert!(line.contains("pool_ms=12.0"), "line was: {line}");
-        assert!(line.contains("host_total=11.0"), "line was: {line}");
-        assert!(line.contains("host_render=10.0"), "line was: {line}");
-        assert!(line.contains("host_sync=0.5"), "line was: {line}");
-        assert!(line.contains("sync_upload=0.4"), "line was: {line}");
-        assert!(line.contains("sync_prune=0.1"), "line was: {line}");
-        assert!(line.contains("host_project=0.2"), "line was: {line}");
-        assert!(line.contains("submit=0.7"), "line was: {line}");
-        assert!(line.contains("host_residual=0.3"), "line was: {line}");
-        assert!(line.contains("acquire=1.5"), "line was: {line}");
-        assert!(line.contains("present=2.5"), "line was: {line}");
-        assert!(line.contains("fence_wait=0.5"), "line was: {line}");
-        assert!(line.contains("platform_wait=15.0"), "line was: {line}");
-        assert!(line.contains("input=4.0"), "line was: {line}");
+        assert!(
+            header.contains("presented=false"),
+            "a slow gap names whether the frame it spans reached the surface: {header}"
+        );
+        assert!(header.contains("gap_ms=520.0"), "header was: {header}");
+        assert!(
+            header.contains("dominant=phases.frame_tail dominant_ms=480.0"),
+            "the header names the dominant cost: {header}"
+        );
+        for cost in [
+            "cost phases.frame_tail=480.0",
+            "cost vm.input_begin=1.0",
+            "cost vm.input_events=2.0",
+            "cost vm.input_end=0.5",
+            "cost vm.tick_residual=4.0",
+            "cost pool.elapsed=12.0",
+            "cost host.audio=3.0",
+            "cost host.sync_upload=0.4",
+            "cost host.sync_prune=0.1",
+            "cost host.project=0.2",
+            "cost host.render=10.0",
+            "cost host.host_residual=0.3",
+            "cost gpu.acquire=1.5",
+            "cost gpu.present=2.5",
+            "cost gpu.submit=0.7",
+            "cost gpu.fence_wait=0.5",
+            "cost wait.input=4.0",
+            "cost wait.unaccounted=3.5",
+        ] {
+            assert!(report.contains(cost), "the report has no {cost}: {report}");
+        }
         // total was 480 + 7.5 + 10 + 1 + 3 = 501.5, so 520 - 501.5 - 15 = 3.5.
-        assert!(line.contains("unaccounted=3.5"), "line was: {line}");
-        assert!(line.contains("total=501.5"), "line was: {line}");
+        assert!(
+            report.contains(
+                concat!(
+                    "residual tick_residual_ms=4.0 host_residual_ms=0.3 ",
+                    "unaccounted_ms=3.5 pool_jobs=2"
+                ),
+            ),
+            "the report names the residuals and the pool's jobs: {report}"
+        );
+        assert!(
+            report.contains(
+                concat!(
+                    "total body_ms=480.0 tick_ms=487.5 host_sync_ms=0.5 ",
+                    "host_total_ms=11.0 total_ms=501.5 platform_wait_ms=15.0"
+                ),
+            ),
+            "the report names the totals: {report}"
+        );
         assert_eq!(timings.present_ms, 2.5);
     }
-
     /// After the next frame is recorded, the following slow gap names that
     /// new frame, not the old one: the attribution tracks the last frame.
     #[test]
-    fn slow_line_follows_the_most_recent_frame() {
+    fn the_report_follows_the_most_recent_frame() {
         let mut attribution = attribution_for(7, 480.0, 10.0);
-        let first = attribution.slow_frame_line(520.0, FramePacing::default());
-        assert!(first.contains("frame 7 slow"), "line was: {first}");
+        let first = attribution.slow_frame_report(520.0, FramePacing::default());
+        assert!(first.contains("frame=7 "), "report was: {first}");
 
         attribution.record(
             FramePhases {
@@ -1827,49 +1807,42 @@ mod tests {
                 total_ms: 300.0,
             },
         );
-        let second = attribution.slow_frame_line(320.0, FramePacing::default());
-        assert!(second.contains("frame 8 slow"), "line was: {second}");
-        assert!(second.contains("frame_tail=250.0"), "line was: {second}");
-        assert!(!second.contains("frame 7"), "line was: {second}");
+        let second = attribution.slow_frame_report(320.0, FramePacing::default());
+        assert!(second.contains("frame=8 "), "report was: {second}");
+        assert!(
+            second.contains("cost phases.frame_tail=250.0"),
+            "report was: {second}"
+        );
+        assert!(!second.contains("frame=7"), "report was: {second}");
     }
-
-    /// The ranked cost entries of a detailed report: the label and the
-    /// milliseconds.
-    fn ranked_costs(detail: &str) -> Vec<(String, f64)> {
+    /// The ranked cost entries of a report: the label and the milliseconds.
+    fn ranked_costs(report: &str) -> Vec<(String, f64)> {
         let mut costs = Vec::new();
-        for line in detail.lines() {
+        for line in report.lines() {
             // The front end's breakdown follows the ranked costs and is a
-            // breakdown of one of them, not costs of its own.
+            // breakdown of one of them, not costs of their own.
             if line.starts_with("front end") {
                 break;
             }
-            let trimmed = line.trim();
-            let Some((index, rest)) = trimmed.split_once(". ") else {
+            let Some(rest) = line.trim().strip_prefix("cost ") else {
                 continue;
             };
-            if index.parse::<usize>().is_err() {
-                continue;
-            }
-            let Some((label, value)) = rest.split_once(" = ") else {
+            let Some((label, value)) = rest.split_once('=') else {
                 continue;
             };
-            let Some(ms) = value
-                .strip_suffix(" ms")
-                .and_then(|ms| ms.parse::<f64>().ok())
-            else {
+            let Some(ms) = value.parse::<f64>().ok() else {
                 continue;
             };
             costs.push((label.to_owned(), ms));
         }
         costs
     }
-
-    /// The detailed report breaks the frame down: every measured cost is
-    /// listed, largest first, and the first line names the dominant one.
+    /// The report breaks the frame down: every measured cost is listed,
+    /// largest first, and the header names the dominant one.
     #[test]
-    fn the_detailed_report_ranks_the_costs_and_names_the_cause() {
+    fn the_report_ranks_the_costs_and_names_the_cause() {
         let attribution = attribution_for(7, 480.0, 10.0);
-        let detail = attribution.slow_frame_detail(
+        let report = attribution.slow_frame_report(
             520.0,
             FramePacing {
                 poll_ms: 15.0,
@@ -1877,49 +1850,52 @@ mod tests {
             },
         );
 
-        let first = detail.lines().next().expect("the report has a first line");
-        assert!(first.contains("frame 7 slow"), "first line was: {first}");
-        assert!(first.contains("gap=520.0 ms"), "first line was: {first}");
+        let first = report.lines().next().expect("the report has a first line");
+        assert!(first.contains("frame=7"), "first line was: {first}");
+        assert!(first.contains("gap_ms=520.0"), "first line was: {first}");
         assert!(
-            first.contains("dominant cost: phases.frame_tail = 480.0 ms"),
+            first.contains("dominant=phases.frame_tail dominant_ms=480.0"),
             "first line was: {first}"
         );
 
-        let costs = ranked_costs(&detail);
-        assert_eq!(costs.len(), 23, "every measured cost is listed: {detail}");
+        let costs = ranked_costs(&report);
+        assert_eq!(costs.len(), 23, "every measured cost is listed: {report}");
         assert_eq!(costs[0].0, "phases.frame_tail");
         assert_eq!(costs[1].0, "pool.elapsed");
         assert_eq!(costs[2].0, "host.render");
         for pair in costs.windows(2) {
             assert!(
                 pair[0].1 >= pair[1].1,
-                "the costs are ranked largest first: {detail}"
+                "the costs are ranked largest first: {report}"
             );
         }
         // Every section the frame's measurements come from is named.
         for section in ["phases.", "vm.", "pool.", "host.", "gpu.", "wait."] {
             assert!(
-                detail.contains(section),
-                "the report names no {section} cost: {detail}"
+                report.contains(section),
+                "the report names no {section} cost: {report}"
             );
         }
 
         assert!(
-            detail.contains(
-                "residuals: tick_residual = 4.0 ms, host_residual = 0.3 ms, \
-             unaccounted = 3.5 ms; pool jobs = 2"
+            report.contains(
+                concat!(
+                    "residual tick_residual_ms=4.0 host_residual_ms=0.3 ",
+                    "unaccounted_ms=3.5 pool_jobs=2"
+                ),
             ),
-            "the report names the residuals and the pool's jobs: {detail}"
+            "the report names the residuals and the pool's jobs: {report}"
         );
         assert!(
-            detail.contains(
-                "totals: body = 480.0 ms, tick = 487.5 ms, host_sync = 0.5 ms, \
-             host_total = 11.0 ms, total = 501.5 ms, platform_wait = 15.0 ms"
+            report.contains(
+                concat!(
+                    "total body_ms=480.0 tick_ms=487.5 host_sync_ms=0.5 ",
+                    "host_total_ms=11.0 total_ms=501.5 platform_wait_ms=15.0"
+                ),
             ),
-            "the report names the totals: {detail}"
+            "the report names the totals: {report}"
         );
     }
-
     /// The script compilation is one cost of the VM section, and its phases
     /// are the breakdown of it: the tick's residual holds what the
     /// compilation does not cover.
@@ -1937,40 +1913,35 @@ mod tests {
         // 480 ms and the compilation 2 ms, so the residual is 2.0 ms.
         assert_eq!(attribution.tick_residual(), 2.0);
 
-        let line = attribution.slow_frame_line(520.0, FramePacing::default());
-        assert!(line.contains("front_end=2.0"), "line was: {line}");
-        assert!(line.contains("tick_residual=2.0"), "line was: {line}");
-
-        let detail = attribution.slow_frame_detail(520.0, FramePacing::default());
+        let report = attribution.slow_frame_report(520.0, FramePacing::default());
         assert!(
-            detail.contains("vm.front_end = 2.0 ms"),
-            "the compilation is a cost of the vm section: {detail}"
+            report.contains("cost vm.front_end=2.0"),
+            "the compilation is a cost of the vm section: {report}"
+        );
+        assert!(
+            report.contains("cost vm.tick_residual=2.0"),
+            "the residual holds what the compilation does not cover: {report}"
         );
         // The phases are the breakdown of that one cost, not costs of their
         // own, so they are not in the ranked list.
-        let costs = ranked_costs(&detail);
-        assert_eq!(costs.len(), 24, "every measured cost is listed: {detail}");
+        let costs = ranked_costs(&report);
+        assert_eq!(costs.len(), 24, "every measured cost is listed: {report}");
         assert!(
             !costs.iter().any(|(name, _)| name.starts_with("front_end")),
-            "the phases are no costs of their own: {detail}"
+            "the phases are no costs of their own: {report}"
         );
         assert!(
-            detail.contains("front end (the tick's script compilation), largest first:"),
-            "the report breaks the compilation down: {detail}"
-        );
-        assert!(
-            detail.contains("1. parser = 1.0 ms"),
-            "detail was: {detail}"
-        );
-        assert!(detail.contains("2. lexer = 0.5 ms"), "detail was: {detail}");
-        assert!(
-            detail.contains("residual = 0.0 ms; total = 2.0 ms"),
-            "the breakdown closes with the residual and the total: {detail}"
+            report.contains(
+                concat!(
+                    "front_end lexer_ms=0.5 parser_ms=1.0 generator_ms=0.3 ",
+                    "image_ms=0.2 residual_ms=0.0 total_ms=2.0"
+                ),
+            ),
+            "the report breaks the compilation down: {report}"
         );
     }
-
     /// The VM's analysis names the dominant phase first, then the rest, and
-    /// closes with the residual and the totals.
+    /// closes with the residual.
     #[test]
     fn the_vm_analysis_names_the_dominant_phase_first() {
         let stats = CompileStats {
@@ -1988,27 +1959,27 @@ mod tests {
         assert!(report.contains("code_units=120"), "report was: {report}");
         assert!(report.contains("bytes=240"), "report was: {report}");
         assert!(
-            report.contains("dominant phase: parser = 5.0 ms"),
+            report.contains("dominant=parser dominant_ms=5.0"),
+            "report was: {report}"
+        );
+        assert!(report.contains("cost parser=5.0"), "report was: {report}");
+        assert!(
+            report.contains("cost generator=2.5"),
             "report was: {report}"
         );
         assert!(
-            report.contains("1. parser = 5.0 ms"),
+            report.contains("cost lexer=2.0"),
             "report was: {report}"
         );
         assert!(
-            report.contains("2. generator = 2.5 ms"),
+            report.contains("cost image=0.5"),
             "report was: {report}"
         );
         assert!(
-            report.contains("residuals: residual = 0.0 ms"),
-            "report was: {report}"
-        );
-        assert!(
-            report.contains("totals: compile = 10.0 ms"),
+            report.contains("residual residual_ms=0.0"),
             "report was: {report}"
         );
     }
-
     /// A run that has spent its reporting budget stops reporting and says so
     /// once.
     #[test]

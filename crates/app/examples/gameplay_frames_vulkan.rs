@@ -40,6 +40,12 @@ use platform::{
 /// The frames the run drives when the command line does not say.
 const DEFAULT_FRAMES: usize = 6000;
 
+/// The frame gap at which a frame is reported as slow, in milliseconds.
+///
+/// The budget of a 30 fps target is 33.3 ms, so the threshold is that: a
+/// run that measures the tail wants to see every frame that missed it.
+const SLOW_FRAME_MS: u64 = 34;
+
 /// The frames per second the run paces at when the command line does not say.
 const DEFAULT_FPS: u32 = 60;
 
@@ -334,6 +340,8 @@ struct RunConfig {
     cumulative: bool,
     /// The time the run waits after every frame.
     frame_delay_ms: u64,
+    /// The frame gap at which a frame is reported, in milliseconds.
+    slow_frame_ms: f64,
 }
 
 /// The harness: the game, the clock and the measurements.
@@ -353,6 +361,8 @@ struct Harness {
     cumulative: bool,
     /// The time the run waits after every frame.
     frame_delay_ms: u64,
+    /// The frame gap at which a frame is reported, in milliseconds.
+    slow_frame_ms: f64,
     /// The game, once the window exists.
     game: Option<GameHost>,
     /// The measurements and the failure, shared with the runner.
@@ -432,7 +442,10 @@ impl EventHandler for Harness {
         let base_dir = self.base_dir.clone();
         match GameHost::open(host, archives, base_dir) {
             Ok(game) => {
-                self.game = Some(game.with_slow_report_budget(None));
+                self.game = Some(
+                    game.with_slow_report_budget(None)
+                        .with_slow_frame_threshold(self.slow_frame_ms),
+                );
                 self.clock.reset();
                 // The first gap spans the first frame, the way the null
                 // harness's first gap spans its first frame: the run's clock
@@ -542,6 +555,7 @@ fn run_null(run: RunConfig, shared: Rc<RefCell<Shared>>) {
         clicks,
         cumulative,
         frame_delay_ms,
+        slow_frame_ms,
     } = run;
     let mut clock = Box::new(RunClock::new());
     let host = match Host::new(HostConfig::headless()) {
@@ -555,7 +569,10 @@ fn run_null(run: RunConfig, shared: Rc<RefCell<Shared>>) {
     let source = source as *const (dyn FrameTimeSource + 'static);
     let host = host.with_frame_time_source(source);
     let mut game = match GameHost::open(host, archives, base_dir) {
-        Ok(game) => game.with_slow_report_budget(None),
+        Ok(game) => {
+            game.with_slow_report_budget(None)
+                .with_slow_frame_threshold(slow_frame_ms)
+        }
         Err(error) => {
             shared.borrow_mut().failure = Some(format!("cannot open the game: {error}"));
             return;
@@ -653,6 +670,7 @@ fn main() {
     let mut click_x = 640.0f32;
     let mut click_y = 360.0f32;
     let mut scene_name = "scenario".to_owned();
+    let mut slow_frame_ms = SLOW_FRAME_MS;
     let mut vulkan = true;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -699,6 +717,9 @@ fn main() {
             }
             "--frame-delay-ms" => {
                 frame_delay_ms = number(&mut args, "frame delay", 0);
+            }
+            "--slow-frame-ms" => {
+                slow_frame_ms = number(&mut args, "slow frame threshold", SLOW_FRAME_MS);
             }
             "--clock" => {
                 let value = match args.next() {
@@ -774,6 +795,7 @@ fn main() {
         clicks,
         cumulative,
         frame_delay_ms,
+        slow_frame_ms: slow_frame_ms as f64,
     };
     if vulkan {
         let mut config = PlatformConfig::default();
@@ -788,6 +810,7 @@ fn main() {
             clock: Box::new(RunClock::new()),
             cumulative: run.cumulative,
             frame_delay_ms: run.frame_delay_ms,
+            slow_frame_ms: run.slow_frame_ms,
             game: None,
             shared: Rc::clone(&shared),
             clicks: run.clicks,

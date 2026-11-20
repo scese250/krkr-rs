@@ -32,6 +32,7 @@ fn launch(frame_report: bool) -> Launch {
         mode: RunMode::Headless { frames: FRAMES },
         dump_frame: None,
         slow_report_budget: None,
+        slow_frame_threshold_ms: None,
         frame_report,
     }
 }
