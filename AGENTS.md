@@ -129,6 +129,10 @@ overrides the wish to parallelize.**
 * **The release harness is heavy too.** A 3,600-frame Vulkan run is a
   measurement, not a smoke test: it is started alone, and its result is used
   only if the machine was quiet.
+* **A measurement never opens a window.** The user's desktop is theirs: a
+  headed run puts a window on it while they work. A measurement runs headless
+  (the null backend, or the Vulkan backend's offscreen surface when one
+  exists), and a harness that opens a window is a bug in the harness.
 
 ### 0.1 Roles — the integrator and the workers
 
