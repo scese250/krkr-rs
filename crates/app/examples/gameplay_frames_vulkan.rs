@@ -278,7 +278,7 @@ impl Clicks {
     ///
     /// The title menu is idle, so the run clicks its "start" and then clicks
     /// once per scenario step.
-    fn take(&mut self, now_ms: u64, frame: usize) -> Option<Vec<PlatformEvent>> {
+    fn take_due(&mut self, now_ms: u64, frame: usize) -> Option<Vec<PlatformEvent>> {
         let due = if self.period_frames == 0 {
             if self.started {
                 now_ms.saturating_sub(self.last_ms) >= self.period_ms
@@ -312,6 +312,28 @@ impl Clicks {
             }),
         ])
     }
+}
+
+/// The run's own parameters: what is mounted, how long the run drives and
+/// how the frames are paced.
+///
+/// The Vulkan path and the null path both read the same run, so the
+/// parameters have one owner.
+struct RunConfig {
+    /// The archives the game is mounted from.
+    archives: Vec<PathBuf>,
+    /// The game's base directory.
+    base_dir: PathBuf,
+    /// The frames the run drives.
+    frames: usize,
+    /// The interval the frames are paced at.
+    interval: Duration,
+    /// The click schedule.
+    clicks: Clicks,
+    /// Whether the frame's delta is the time since the run started.
+    cumulative: bool,
+    /// The time the run waits after every frame.
+    frame_delay_ms: u64,
 }
 
 /// The harness: the game, the clock and the measurements.
@@ -438,11 +460,8 @@ impl EventHandler for Harness {
         // shipping windowed loop feeds it.
         self.clock.set_delta(f64::from(dt_ms), self.cumulative);
         let now_ms = self.game_time_ms();
-        let events = match self.clicks.take(now_ms, self.index) {
-            Some(events) => events,
-            // No click is due this frame: the frame delivers no event.
-            None => Vec::new(),
-        };
+        // No click is due this frame: the frame delivers no event.
+        let events = self.clicks.take_due(now_ms, self.index).unwrap_or_default();
         self.shared.borrow_mut().clicks = self.clicks.count;
         let Some(game) = self.game.as_mut() else {
             return Flow::Exit;
@@ -514,16 +533,16 @@ fn report(name: &str, values: &[f64]) {
 }
 
 /// Runs the game headless on the null backend and returns the measurements.
-fn run_null(
-    archives: Vec<PathBuf>,
-    base_dir: PathBuf,
-    frames: usize,
-    interval: Duration,
-    clicks: Clicks,
-    cumulative: bool,
-    frame_delay_ms: u64,
-    shared: Rc<RefCell<Shared>>,
-) {
+fn run_null(run: RunConfig, shared: Rc<RefCell<Shared>>) {
+    let RunConfig {
+        archives,
+        base_dir,
+        frames,
+        interval,
+        clicks,
+        cumulative,
+        frame_delay_ms,
+    } = run;
     let mut clock = Box::new(RunClock::new());
     let host = match Host::new(HostConfig::headless()) {
         Ok(host) => host,
@@ -562,11 +581,8 @@ fn run_null(
         clock.set_delta(last_start.elapsed().as_secs_f64() * 1000.0, cumulative);
         last_start = Instant::now();
         let now_ms = (opened.elapsed().as_secs_f64() * 1000.0) as u64;
-        let events = match clicks.take(now_ms, frame) {
-            Some(events) => events,
-            // No click is due this frame: the frame delivers no event.
-            None => Vec::new(),
-        };
+        // No click is due this frame: the frame delivers no event.
+        let events = clicks.take_due(now_ms, frame).unwrap_or_default();
         let started = Instant::now();
         let outcome = game.step(clock.as_ref(), &events);
         let step_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -750,22 +766,31 @@ fn main() {
         Clicks::new(first_click_ms, click_ms)
     };
     clicks.at(click_x, click_y);
+    let run = RunConfig {
+        archives,
+        base_dir: dir,
+        frames,
+        interval: ticker_interval,
+        clicks,
+        cumulative,
+        frame_delay_ms,
+    };
     if vulkan {
         let mut config = PlatformConfig::default();
         config.title = "krkr-rs (vulkan)".to_owned();
         config.size = (1280, 720);
-        config.frame_interval = ticker_interval;
+        config.frame_interval = run.interval;
         let harness = Harness {
-            archives,
-            base_dir: dir,
-            frames,
+            archives: run.archives,
+            base_dir: run.base_dir,
+            frames: run.frames,
             presentation_budget,
             clock: Box::new(RunClock::new()),
-            cumulative,
-            frame_delay_ms,
+            cumulative: run.cumulative,
+            frame_delay_ms: run.frame_delay_ms,
             game: None,
             shared: Rc::clone(&shared),
-            clicks,
+            clicks: run.clicks,
             opened: None,
             index: 0,
             last_end: None,
@@ -776,16 +801,7 @@ fn main() {
             std::process::exit(1);
         }
     } else {
-        run_null(
-            archives,
-            dir,
-            frames,
-            ticker_interval,
-            clicks,
-            cumulative,
-            frame_delay_ms,
-            Rc::clone(&shared),
-        );
+        run_null(run, Rc::clone(&shared));
     }
     let shared = shared.borrow();
     if let Some(failure) = &shared.failure {

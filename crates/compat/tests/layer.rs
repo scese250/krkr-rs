@@ -647,7 +647,7 @@ fn unchanged_visible_write_does_not_invalidate() {
     );
 
     // The same value written again touches nothing.
-    let region = env.scene.take_layer_content_region(id);
+    let _ = env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.visible = true;");
     // reference/cpp/core/visual/LayerIntf.cpp:1183
@@ -735,7 +735,7 @@ fn unchanged_unguarded_property_write_still_invalidates() {
     // so the layer caches here.
     env.scene.inc_cache_enabled_count(id);
     env.run("l.hitType = 1;");
-    let region = env.scene.take_layer_content_region(id);
+    let _ = env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.hitType = 1;");
     assert!(
@@ -770,7 +770,7 @@ fn unchanged_set_pos_write_does_not_invalidate() {
 
     // A real move invalidates and reads back.
     // reference/cpp/core/visual/LayerIntf.cpp:2204-2216
-    let region = env.scene.take_layer_content_region(id);
+    let _ = env.scene.take_layer_content_region(id);
     env.run("l.setPos(5, 7);");
     assert_eq!(env.eval_int("l.left"), 5);
     assert_eq!(env.eval_int("l.top"), 7);
@@ -779,7 +779,7 @@ fn unchanged_set_pos_write_does_not_invalidate() {
         "the write marks the layer's region"
     );
 
-    let region = env.scene.take_layer_content_region(id);
+    let _ = env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.setPos(5, 7);");
     // reference/cpp/core/visual/LayerIntf.cpp:2203
@@ -837,7 +837,7 @@ fn unchanged_set_pos_with_bounds_write_does_not_invalidate() {
         "the write marks the layer's region"
     );
 
-    let region = env.scene.take_layer_content_region(id);
+    let _ = env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.setPos(5, 7, 20, 30);");
     // reference/cpp/core/visual/LayerIntf.cpp:2121, :2144
@@ -896,7 +896,7 @@ fn unchanged_set_size_write_does_not_invalidate() {
         "the write marks the layer's region"
     );
 
-    let region = env.scene.take_layer_content_region(id);
+    let _ = env.scene.take_layer_content_region(id);
     let revision = env.scene.structure_revision();
     env.run("l.setSize(48, 40);");
     // reference/cpp/core/visual/LayerIntf.cpp:2121

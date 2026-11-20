@@ -1721,8 +1721,8 @@ impl PlayerInst {
         let missing = composite_pose(
             &mut ops,
             scene,
-            nodes,
             DrawFrame {
+                nodes,
                 snapshot: snapshot.as_deref(),
                 storage,
                 settings: DrawSettings {
@@ -1833,8 +1833,11 @@ struct DrawSettings {
     mask_mode: i32,
 }
 
-/// The per-draw state shared by the node painters.
+/// The per-draw state shared by the node painters, and the pose's node tree
+/// they paint.
 struct DrawFrame<'a> {
+    /// The pose's node tree: the nodes the painters draw.
+    nodes: &'a [MotionNode],
     snapshot: Option<&'a MotionSnapshot>,
     storage: Option<&'a Storage>,
     settings: DrawSettings,
@@ -1856,14 +1859,14 @@ struct DrawFrame<'a> {
 fn composite_pose(
     ops: &mut Vec<DrawOp>,
     scene: &mut Scene,
-    nodes: &[MotionNode],
     mut frame: DrawFrame<'_>,
     bounds: (i32, i32, i32, i32),
 ) -> Vec<String> {
+    let nodes = frame.nodes;
     // The chunks the pose draws from are decoded before it is painted: they
     // are independent of each other, so the pool decodes them in parallel and
     // the painters wait for the pixels of the chunk they need.
-    prefetch_chunks(&mut frame, nodes);
+    prefetch_chunks(&mut frame);
     for index in 1..nodes.len() {
         if frame.settings.preview && nodes[index].child_owner.is_some() {
             continue;
@@ -1872,13 +1875,13 @@ fn composite_pose(
             continue;
         }
         if is_composite_group(&nodes[index]) {
-            draw_group(ops, scene, (0, 0), bounds, nodes, index, &mut frame, 1.0);
+            draw_group(ops, scene, (0, 0), bounds, index, &mut frame, 1.0);
             continue;
         }
         if node_drawable(&nodes[index]) {
             let opacity = nodes[index].accumulated.opacity;
             let blend = node_blend(nodes[index].accumulated.blend_mode);
-            draw_clipped_item(ops, scene, (0, 0), nodes, index, &mut frame, opacity, blend);
+            draw_clipped_item(ops, scene, (0, 0), index, &mut frame, opacity, blend);
         }
     }
     std::mem::take(&mut frame.missing)
@@ -2139,11 +2142,11 @@ fn draw_group(
     scene: &mut Scene,
     target_origin: (i32, i32),
     target_bounds: (i32, i32, i32, i32),
-    nodes: &[MotionNode],
     group: usize,
     frame: &mut DrawFrame<'_>,
     parent_opacity: f64,
 ) {
+    let nodes = frame.nodes;
     let Some(paint_box) = group_paint_box(nodes, group, frame) else {
         return;
     };
@@ -2193,7 +2196,6 @@ fn draw_group(
         draw_node(
             &mut surface_ops,
             scene,
-            nodes,
             group,
             frame,
             1.0,
@@ -2215,7 +2217,6 @@ fn draw_group(
                 scene,
                 origin,
                 (left, top, right, bottom),
-                nodes,
                 index,
                 frame,
                 group_opacity,
@@ -2234,7 +2235,6 @@ fn draw_group(
             &mut surface_ops,
             scene,
             origin,
-            nodes,
             index,
             frame,
             ratio.clamp(0.0, 1.0),
@@ -2264,7 +2264,6 @@ fn draw_group(
             draw_node(
                 &mut mask_ops,
                 scene,
-                nodes,
                 mask_index,
                 frame,
                 1.0,
@@ -2389,16 +2388,16 @@ fn draw_clipped_item(
     ops: &mut Vec<DrawOp>,
     scene: &mut Scene,
     out_origin: (i32, i32),
-    nodes: &[MotionNode],
     index: usize,
     frame: &mut DrawFrame<'_>,
     opacity: f64,
     blend: NodeBlend,
 ) {
+    let nodes = frame.nodes;
     let offset = (-out_origin.0, -out_origin.1);
     let node = &nodes[index];
     let Some(viewport) = node_viewport(nodes, node, frame) else {
-        draw_node(ops, scene, nodes, index, frame, opacity, blend, offset);
+        draw_node(ops, scene, index, frame, opacity, blend, offset);
         return;
     };
     let Some(paint) = node_paint_box(node, frame) else {
@@ -2418,7 +2417,7 @@ fn draw_clipped_item(
         return;
     }
     if paint.0 >= clip.0 && paint.1 >= clip.1 && paint.2 <= clip.2 && paint.3 <= clip.3 {
-        draw_node(ops, scene, nodes, index, frame, opacity, blend, offset);
+        draw_node(ops, scene, index, frame, opacity, blend, offset);
         return;
     }
     let Ok(width) = u32::try_from(right - left) else {
@@ -2442,7 +2441,6 @@ fn draw_clipped_item(
     draw_node(
         &mut leaf_ops,
         scene,
-        nodes,
         index,
         frame,
         1.0,
@@ -2535,13 +2533,13 @@ fn node_drawn_box(node: &MotionNode, frame: &DrawFrame<'_>) -> Option<(f64, f64,
 fn draw_node(
     ops: &mut Vec<DrawOp>,
     scene: &mut Scene,
-    nodes: &[MotionNode],
     index: usize,
     frame: &mut DrawFrame<'_>,
     opacity: f64,
     blend: NodeBlend,
     offset: (i32, i32),
 ) {
+    let nodes = frame.nodes;
     let node = &nodes[index];
     let icon = frame
         .snapshot
@@ -2970,7 +2968,8 @@ impl DrawFrame<'_> {
 /// The chunks are independent of each other, so the pool decodes them in
 /// parallel: the painters wait for the pixels of the chunk they need. A chunk
 /// the pose does not draw from is decoded when it is needed, not before.
-fn prefetch_chunks(frame: &mut DrawFrame<'_>, nodes: &[MotionNode]) {
+fn prefetch_chunks(frame: &mut DrawFrame<'_>) {
+    let nodes = frame.nodes;
     let Some(snapshot) = frame.snapshot else {
         return;
     };
@@ -4500,8 +4499,8 @@ mod tests {
         let missing = composite_pose(
             &mut ops,
             scene,
-            &player.nodes,
             DrawFrame {
+                nodes: &player.nodes,
                 snapshot: snapshot.as_deref(),
                 storage,
                 settings: DrawSettings {
@@ -6178,12 +6177,11 @@ mod tests {
         assert!(missing.is_empty());
         assert_eq!(&bitmap.rgba[..4], &[30u8, 10, 2, 255][..]);
         assert_eq!(player.tinted.len(), 1);
-        let cached = player
+        let cached = *player
             .tinted
             .values()
             .next()
-            .expect("the tinted source is cached")
-            .clone();
+            .expect("the tinted source is cached");
         let missing = composite_into(
             &mut scene,
             &mut player,
