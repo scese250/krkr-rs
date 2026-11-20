@@ -10,9 +10,9 @@ use api::error::RenderError;
 use api::geometry::{PixelRegion, RectF};
 use render::{
     PipelineConfig, RenderContent, RenderNode, RenderPipeline, RenderScene, RenderTarget,
-    RenderTargetDesc, begin_offscreen_render_state, begin_render_state, create_render_pipeline,
-    create_render_target, create_texture, destroy_render_target, read_render_target,
-    render_to_target, upload_texture,
+    RenderTargetDesc, TextureDesc, begin_offscreen_render_state, begin_render_state,
+    copy_render_target_to_texture, create_render_pipeline, create_render_target, create_texture,
+    destroy_render_target, read_render_target, render_to_target, upload_texture,
 };
 use testkit::headless_window;
 
@@ -568,6 +568,60 @@ fn dropping_a_render_target_releases_its_pixels() {
     ));
 }
 
+/// The copy fills the texture's own extent.
+///
+/// A texture smaller than the target holds the target's top-left pixels and
+/// nothing more: the part of the target the texture cannot hold is left
+/// out. The copy moves the bytes, so the texture's pixels are read the way
+/// a scene reads them: the texture is sampled into another target.
+#[test]
+fn the_copy_fills_the_texture_own_extent() {
+    let pipeline = RenderPipeline::null();
+    let (_surface, mut state) = begin_render_state(&pipeline, &headless_window()).expect("begin");
+    let source = create_render_target(&pipeline, RenderTargetDesc::new(2, 2)).expect("target");
+    let texture = create_texture(&pipeline, TextureDesc::new(1, 1)).expect("texture");
+
+    // The target holds one solid red quad.
+    let mut scene = RenderScene::with_root_node();
+    let root = scene.root;
+    let child = scene.push(RenderNode {
+        parent: Some(root),
+        content: RenderContent::Solid([1.0, 0.0, 0.0, 1.0]),
+        dst: RectF::new(0.0, 0.0, 2.0, 2.0),
+        ..RenderNode::default()
+    });
+    scene.node_mut(root).expect("root").children = vec![child];
+    render_to_target(&pipeline, &mut state, &source, &scene).expect("render");
+    copy_render_target_to_texture(&pipeline, &mut state, &source, &texture).expect("copy");
+
+    // The texture holds the target's top-left pixel: sampling it draws red.
+    let sampled = create_render_target(&pipeline, RenderTargetDesc::new(1, 1)).expect("target");
+    let mut scene = RenderScene::with_root_node();
+    let root = scene.root;
+    let child = scene.push(RenderNode {
+        parent: Some(root),
+        content: RenderContent::Texture(texture),
+        dst: RectF::new(0.0, 0.0, 1.0, 1.0),
+        ..RenderNode::default()
+    });
+    scene.node_mut(root).expect("root").children = vec![child];
+    render_to_target(&pipeline, &mut state, &sampled, &scene).expect("render");
+    let mut out = [0u8; 4];
+    read_render_target(
+        &pipeline,
+        &state,
+        &sampled,
+        PixelRegion::new(0, 0, 1, 1),
+        &mut out,
+    )
+    .expect("read");
+    assert_eq!(
+        out,
+        [255, 0, 0, 255],
+        "the texture holds the target's top-left pixel: {out:?}"
+    );
+}
+
 /// The GPU path has no copy of the destination to sample.
 ///
 /// A destination-dependent blend reads the destination, so the presented path
@@ -642,4 +696,53 @@ fn vulkan_offscreen_state_composites_the_cpu_paths_scene_or_skip() {
         gpu, cpu,
         "the GPU and the CPU must composite the same scene: {gpu:?} vs {cpu:?}"
     );
+}
+
+/// The offscreen path may be used again and again.
+///
+/// Every offscreen operation — the render, the copy into a texture and the
+/// read-back — shares one fence, and the fence is free once the work it
+/// guards is done. A path that held the fence would wait for a signal that
+/// never comes, so the operations run in a row: each one must finish, and
+/// the pixels a script reads must be the scene's.
+///
+/// A machine without a Vulkan device skips the test, exactly like the other
+/// Vulkan cases here.
+#[test]
+fn vulkan_offscreen_state_serves_several_operations_in_a_row_or_skip() {
+    let Ok(pipeline) = create_render_pipeline(PipelineConfig::vulkan()) else {
+        return;
+    };
+    let Ok(mut state) = begin_offscreen_render_state(&pipeline) else {
+        return;
+    };
+    let target = create_render_target(&pipeline, RenderTargetDesc::new(1, 1)).expect("target");
+    let texture = create_texture(&pipeline, TextureDesc::new(1, 1)).expect("texture");
+    let scene = one_pixel_scene(
+        BlendMode::SourceOver,
+        [0.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, 1.0],
+    );
+    let cpu = composite_one_pixel(
+        BlendMode::SourceOver,
+        [0.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, 1.0],
+    );
+    for _ in 0..3 {
+        render_to_target(&pipeline, &mut state, &target, &scene).expect("render");
+        copy_render_target_to_texture(&pipeline, &mut state, &target, &texture).expect("copy");
+        let mut gpu = [0u8; 4];
+        read_render_target(
+            &pipeline,
+            &state,
+            &target,
+            PixelRegion::new(0, 0, 1, 1),
+            &mut gpu,
+        )
+        .expect("read");
+        assert_eq!(
+            gpu, cpu,
+            "the pixels a script reads are the scene's: {gpu:?} vs {cpu:?}"
+        );
+    }
 }

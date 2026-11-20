@@ -13,17 +13,22 @@
 //! The run drives a route through the game's own pages. The title page's
 //! buttons are read from the layout the game ships (`uipsd/title.csv`), and
 //! the click that presses one of them is delivered in the game's logical
-//! pixels — the 1280x720 space the script sees — so the same click reaches
+//! pixels — the 1920x1080 space the script sees — so the same click reaches
 //! the same button whatever the backend's surface size is. The page the
 //! route loads is read back from the log, so the run proves the route it
 //! drove: the page the route names is the page the run reached.
 //!
 //! The null backend runs headless and is the default: a measurement never
-//! opens a window. The Vulkan backend opens a real window and is asked for
-//! explicitly.
+//! opens a window. The Vulkan backend has two shapes. The headless one
+//! (`--headless`) draws every frame into an offscreen target on the device
+//! and opens nothing; the windowed one presents to a real window. The
+//! windowed shape is the shipping-path harness, and a measurement uses the
+//! headless one, because a measurement never puts a window on the user's
+//! desktop.
 //!
 //! Run: KRKR_TEST_GAME=<dir> cargo run -p app --example gameplay_frames_vulkan -- \
-//!       [--backend vulkan|null] [--frames N] [--fps N] [--scene NAME] [--click-ms N]
+//!       [--backend vulkan|null] [--headless] [--frames N] [--fps N] \
+//!       [--scene NAME] [--click-ms N]
 //!
 //! `--fps 0` drives the frames as fast as the host runs them, so the gap is
 //! the engine's cost and not the presentation cadence; `--fps N` paces them
@@ -64,6 +69,14 @@ const SLOW_FRAME_MS: u64 = 250;
 
 /// The frames per second the run paces at when the command line does not say.
 const DEFAULT_FPS: u32 = 60;
+
+/// The size of the offscreen target the headless Vulkan host draws into.
+///
+/// The size is the game's logical screen, so the presentation mapping is the
+/// identity: a click in the game's logical pixels lands on the same device
+/// pixel, and the frame the run measures is the frame the game would show
+/// on a display of that size.
+const HEADLESS_SURFACE_SIZE: (u32, u32) = (1920, 1080);
 
 /// The game-time period between the clicks.
 const DEFAULT_CLICK_MS: u64 = 300;
@@ -156,8 +169,8 @@ impl FrameTimeSource for RunClock {
 ///
 /// The game lays its title menu out in the `uipsd/title.csv` file it ships:
 /// every row is `type,<name>,<class>,<state>,<x>,<y>,<width>,<height>`, the
-/// rows of the menu sit in the game's 1280x720 logical space 46 pixels apart,
-/// and each button is 256 pixels wide and 45 pixels high. The
+/// rows of the menu sit in the game's layout 46 pixels apart, and each
+/// button is 256 pixels wide and 45 pixels high. The
 /// `main/title.func` file says what a button does: the `system2` button jumps
 /// to the `*option` label of `title.ks`, which loads the settings page.
 struct TitleButton {
@@ -165,15 +178,33 @@ struct TitleButton {
     name: &'static str,
     /// The page the button's action loads.
     loads: &'static str,
-    /// The button's top edge, in the game's logical pixels.
+    /// The button's top edge, in the layout's pixels.
     top: i32,
 }
 
+/// The scale from the layout's screen to the game's logical screen.
+///
+/// The layout the game ships is drawn on a 1280x720 screen, and the game
+/// runs on a 1920x1080 one, so the layout is drawn 1.5 times as large: a
+/// button's row is 384 by 67.5 pixels on the game's screen.
+const LAYOUT_SCALE: f32 = 1.5;
+
+/// The click's offset inside a button, in the layout's pixels.
+///
+/// The click lands on the button's own picture, which sits in the left part
+/// of the button's row: 110 pixels from the left edge and 25 pixels below
+/// the row's top. In the game's logical pixels that is (165, 960) for the
+/// settings button, whose row is the screen band 922.5 to 990.
+const CLICK_OFFSET: (f32, f32) = (110.0, 25.0);
+
 impl TitleButton {
-    /// The point a click lands on to press the button: the middle of its
-    /// rectangle, in the game's logical pixels.
+    /// The point a click lands on to press the button: the game's logical
+    /// pixels.
     fn point(&self) -> (f32, f32) {
-        (128.0, self.top as f32 + 22.0)
+        (
+            CLICK_OFFSET.0 * LAYOUT_SCALE,
+            (self.top as f32 + CLICK_OFFSET.1) * LAYOUT_SCALE,
+        )
     }
 }
 
@@ -868,6 +899,49 @@ fn report(name: &str, values: &[f64]) {
     );
 }
 
+/// The dominant cost a slow-frame report names, `None` when it names none.
+///
+/// The report's header carries the cost that dominates the frame the gap
+/// spans, as `dominant=<section>.<name>`.
+fn dominant_cost(text: &str) -> Option<String> {
+    let header = text.lines().next()?;
+    let rest = header.strip_prefix(SLOW_FRAME_PREFIX)?;
+    let at = rest.find(" dominant=")?;
+    let tail = &rest[at + " dominant=".len()..];
+    let end = tail.find(' ')?;
+    Some(tail[..end].to_owned())
+}
+
+/// Prints what the slow frames were spent on.
+///
+/// Every slow-frame report names the cost that dominates the frame it
+/// spans, so the summary says what the tail of the run was made of, ranked
+/// by how many frames each cost dominated.
+fn report_dominant_costs(records: &[Captured]) {
+    let mut costs: Vec<(String, usize)> = Vec::new();
+    for record in records {
+        if !is_slow_frame(&record.text) {
+            continue;
+        }
+        let Some(dominant) = dominant_cost(&record.text) else {
+            continue;
+        };
+        match costs.iter_mut().find(|(name, _)| *name == dominant) {
+            Some((_, count)) => *count += 1,
+            None => costs.push((dominant, 1)),
+        }
+    }
+    if costs.is_empty() {
+        println!("the slow frames' dominant costs: no frame was slow");
+        return;
+    }
+    costs.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    println!("the slow frames' dominant costs:");
+    for (name, count) in costs {
+        println!("  {name}: {count} frames");
+    }
+}
+
 /// Prints the route the run drove and the frames around the transition.
 ///
 /// The pages the run loaded are the pages the log recorded, and the click
@@ -935,8 +1009,14 @@ fn report_route(shared: &Shared, records: &[Captured], scene: Scene) {
     }
 }
 
-/// Runs the game headless on the null backend and returns the measurements.
-fn run_null(run: RunConfig, shared: Rc<RefCell<Shared>>) {
+/// Runs the game offscreen on `backend` and returns the measurements.
+///
+/// The null backend composites the frame on the CPU and the Vulkan backend
+/// draws it on the device; both run the same loop, the same click schedule
+/// and the same reports, and neither opens a window: the frame goes into an
+/// offscreen target and the game reads it the way a windowed run reads the
+/// presented frame.
+fn run_offscreen(run: RunConfig, shared: Rc<RefCell<Shared>>, backend: BackendKind) {
     let RunConfig {
         archives,
         base_dir,
@@ -950,7 +1030,19 @@ fn run_null(run: RunConfig, shared: Rc<RefCell<Shared>>) {
         frame_counter,
     } = run;
     let mut clock = Box::new(RunClock::new());
-    let host = match Host::new(HostConfig::headless()) {
+    let mut config = HostConfig::headless().with_backend(backend);
+    if backend == BackendKind::Vulkan {
+        // The Vulkan backend draws into a target of the surface size, and
+        // the target is the size of the game's logical screen, so the
+        // presentation mapping is the identity and a click in the game's
+        // logical pixels lands on the same device pixel.
+        config = config.with_surface_size(HEADLESS_SURFACE_SIZE);
+    }
+    // The frame period is the cadence the loop paces at, and it is the
+    // budget a frame may spend waiting for the display. A headless host has
+    // no display, so the budget is never spent.
+    config.frame_interval = interval;
+    let host = match Host::new(config) {
         Ok(host) => host,
         Err(error) => {
             shared.borrow_mut().failure = Some(format!("cannot create the host: {error}"));
@@ -1079,6 +1171,7 @@ fn main() {
     let mut slow_frame_ms = SLOW_FRAME_MS;
     let mut vm_report = false;
     let mut vulkan = false;
+    let mut headless = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1165,6 +1258,7 @@ fn main() {
                     }
                 };
             }
+            "--headless" => headless = true,
             other => {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(2);
@@ -1239,7 +1333,7 @@ fn main() {
         settle_ms,
         frame_counter: Arc::clone(&frame_counter),
     };
-    if vulkan {
+    if vulkan && !headless {
         let mut config = PlatformConfig::default();
         config.title = "krkr-rs (vulkan)".to_owned();
         config.size = (1280, 720);
@@ -1269,7 +1363,15 @@ fn main() {
             std::process::exit(1);
         }
     } else {
-        run_null(run, Rc::clone(&shared));
+        // The run draws into an offscreen target and opens no window: the
+        // null backend composites on the CPU and the Vulkan backend draws on
+        // the device.
+        let backend = if vulkan {
+            BackendKind::Vulkan
+        } else {
+            BackendKind::Null
+        };
+        run_offscreen(run, Rc::clone(&shared), backend);
     }
     let shared = shared.borrow();
     if let Some(failure) = &shared.failure {
@@ -1277,6 +1379,14 @@ fn main() {
         std::process::exit(1);
     }
     println!("the backend: {}", if vulkan { "vulkan" } else { "null" });
+    println!(
+        "the mode: {}",
+        if vulkan && !headless {
+            "windowed"
+        } else {
+            "headless"
+        }
+    );
     println!(
         "the cadence: {}",
         if paced {
@@ -1331,6 +1441,7 @@ fn main() {
         Err(poisoned) => poisoned.into_inner().clone(),
     };
     report_route(&shared, &kept, scene);
+    report_dominant_costs(&kept);
     // The slowest frames: the frames the run spent its time in.
     let mut order: Vec<usize> = (0..shared.steps.len()).collect();
     order.sort_by(|left, right| shared.steps[*right].total_cmp(&shared.steps[*left]));

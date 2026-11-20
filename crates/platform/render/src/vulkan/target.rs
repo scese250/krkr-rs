@@ -16,6 +16,8 @@
 //! [`super::VulkanState`].
 #![allow(unsafe_code)]
 
+use std::cell::Cell;
+
 use ash::vk;
 
 use api::error::RenderError;
@@ -597,8 +599,51 @@ pub(crate) struct OffscreenSubmit<'a> {
     pub(crate) command_pool: vk::CommandPool,
     /// Command buffer the operation is recorded into.
     pub(crate) command_buffer: vk::CommandBuffer,
-    /// Fence waited on after the submit.
-    pub(crate) fence: vk::Fence,
+    /// The fence the submission signals, and whether a submission with it may
+    /// still be running.
+    pub(crate) fence: &'a OffscreenFence,
+}
+
+/// The fence the offscreen submissions signal, and whether a submission with
+/// it may still be running.
+///
+/// A fence is signalled only by a submission the queue accepted, so a
+/// submission the queue refused leaves the fence disarmed with nothing
+/// pending. Waiting for such a fence never returns, so the flag records
+/// whether work may still be in flight and every wait asks it first.
+pub(crate) struct OffscreenFence {
+    /// The fence the offscreen submissions signal.
+    pub(crate) handle: vk::Fence,
+    /// Whether a submission with the fence may still be running.
+    running: Cell<bool>,
+}
+
+impl OffscreenFence {
+    /// Tracks a fence that was created signalled: no submission has run, so
+    /// nothing is in flight.
+    pub(crate) fn new(handle: vk::Fence) -> Self {
+        Self {
+            handle,
+            running: Cell::new(false),
+        }
+    }
+
+    /// Whether a submission with the fence may still be running.
+    pub(crate) fn in_flight(&self) -> bool {
+        self.running.get()
+    }
+
+    /// Records that the queue accepted a submission with the fence: the
+    /// fence will signal when the work completes.
+    pub(crate) fn submitted(&self) {
+        self.running.set(true);
+    }
+
+    /// Records that the fence was observed signalled: the work is done and
+    /// the fence may be used again.
+    pub(crate) fn completed(&self) {
+        self.running.set(false);
+    }
 }
 
 /// Records `scene` into `target` and submits it synchronously.
@@ -1011,32 +1056,30 @@ fn allocate_sampled_set(
 /// for the copy and comes back to it, so the presentation samples it as it
 /// did before.
 ///
+/// The copy fills the texture's own extent: the part of the target the
+/// texture cannot hold is left out, and the part of the texture the target
+/// does not cover keeps the texture's own pixels.
+///
 /// # Errors
 ///
-/// Returns [`RenderError::InvalidArgument`] when the texture is smaller
-/// than the target or the two formats differ.
+/// Returns [`RenderError::InvalidArgument`] when the texture and the
+/// target have different formats.
 pub(crate) fn copy_to_texture(
     submit: &OffscreenSubmit<'_>,
     target: &mut VulkanRenderTarget,
     texture: &mut VulkanTexture,
 ) -> Result<(), RenderError> {
     let OffscreenSubmit { device, .. } = *submit;
-    if texture.desc.width < target.desc.width || texture.desc.height < target.desc.height {
-        return Err(RenderError::InvalidArgument {
-            message: format!(
-                "the {}x{} texture is smaller than the {}x{} render target",
-                texture.desc.width, texture.desc.height, target.desc.width, target.desc.height
-            ),
-        });
-    }
     if image_format(texture.desc.format) != image_format(target.desc.format) {
         return Err(RenderError::InvalidArgument {
             message: "the texture and the render target have different formats".to_owned(),
         });
     }
+    // The copy fills the texture's own extent: the part of the target the
+    // texture cannot hold is left out.
     let extent = vk::Extent3D {
-        width: target.desc.width,
-        height: target.desc.height,
+        width: target.desc.width.min(texture.desc.width),
+        height: target.desc.height.min(texture.desc.height),
         depth: 1,
     };
     // The texture's image holds pixels once it was uploaded, and is
@@ -1216,6 +1259,189 @@ fn barrier_to_transfer_src(
     );
 }
 
+/// The time the offscreen path waits for the GPU, in nanoseconds.
+///
+/// The offscreen work is one frame's worth of drawing and a copy, so a
+/// device that has not finished it in this long is not going to. The wait is
+/// bounded so that a device which never finishes is reported as an error
+/// instead of parking the caller.
+const OFFSCREEN_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// The device calls the offscreen path makes.
+///
+/// The trait is the seam the offscreen path's sequencing is exercised
+/// through: the Vulkan implementation forwards to the logical device, and the
+/// test implementation fails the calls on demand, so a refused submit and a
+/// wait that times out are driven without a device.
+trait OffscreenDevice {
+    /// Waits for `fence` to signal, for at most `timeout_ns`.
+    fn wait_for_fence(&self, fence: vk::Fence, timeout_ns: u64) -> Result<(), vk::Result>;
+
+    /// Resets the command pool.
+    fn reset_pool(&self, pool: vk::CommandPool) -> Result<(), vk::Result>;
+
+    /// Begins the command buffer.
+    fn begin_buffer(&self, buffer: vk::CommandBuffer) -> Result<(), vk::Result>;
+
+    /// Ends the command buffer.
+    fn end_buffer(&self, buffer: vk::CommandBuffer) -> Result<(), vk::Result>;
+
+    /// Disarms the fence.
+    fn reset_fence(&self, fence: vk::Fence) -> Result<(), vk::Result>;
+
+    /// Submits the command buffer and signals `fence` when it completes.
+    fn submit(
+        &self,
+        queue: vk::Queue,
+        buffer: vk::CommandBuffer,
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result>;
+}
+
+impl OffscreenDevice for ash::Device {
+    fn wait_for_fence(&self, fence: vk::Fence, timeout_ns: u64) -> Result<(), vk::Result> {
+        // SAFETY: the fence belongs to the caller and is live.
+        unsafe { self.wait_for_fences(&[fence], true, timeout_ns) }
+    }
+
+    fn reset_pool(&self, pool: vk::CommandPool) -> Result<(), vk::Result> {
+        // SAFETY: the pool belongs to the caller and none of its command
+        // buffers is pending.
+        unsafe { self.reset_command_pool(pool, vk::CommandPoolResetFlags::empty()) }
+    }
+
+    fn begin_buffer(&self, buffer: vk::CommandBuffer) -> Result<(), vk::Result> {
+        let info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: the buffer is allocated from the caller's pool and is not
+        // in use.
+        unsafe { self.begin_command_buffer(buffer, &info) }
+    }
+
+    fn end_buffer(&self, buffer: vk::CommandBuffer) -> Result<(), vk::Result> {
+        // SAFETY: the buffer is recording.
+        unsafe { self.end_command_buffer(buffer) }
+    }
+
+    fn reset_fence(&self, fence: vk::Fence) -> Result<(), vk::Result> {
+        // SAFETY: the fence belongs to the caller and is live.
+        unsafe { self.reset_fences(&[fence]) }
+    }
+
+    fn submit(
+        &self,
+        queue: vk::Queue,
+        buffer: vk::CommandBuffer,
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        let command_buffers = [buffer];
+        let info = vk::SubmitInfo::default().command_buffers(&command_buffers);
+        // SAFETY: the command buffer is executable and the fence is live.
+        unsafe { self.queue_submit(queue, &[info], fence) }
+    }
+}
+
+/// Waits for the offscreen fence, for at most [`OFFSCREEN_TIMEOUT_NS`].
+///
+/// The wait is bounded: a fence that does not signal in that time is
+/// reported as an error, so a device that never finishes cannot park the
+/// caller. The tracker is left as it is, because a wait that timed out
+/// leaves the work possibly running: the next call waits for it again
+/// instead of recording over it.
+fn wait_for_fence<D>(device: &D, fence: vk::Fence, what: &str) -> Result<(), RenderError>
+where
+    D: OffscreenDevice + ?Sized,
+{
+    match device.wait_for_fence(fence, OFFSCREEN_TIMEOUT_NS) {
+        Ok(()) => Ok(()),
+        Err(vk::Result::TIMEOUT) => Err(RenderError::Framebuffer {
+            message: format!(
+                "the offscreen fence did not signal within {} ms: {what} did not finish",
+                OFFSCREEN_TIMEOUT_NS / 1_000_000,
+            ),
+        }),
+        Err(error) => Err(RenderError::Framebuffer {
+            message: format!("failed to wait for {what}: {error}"),
+        }),
+    }
+}
+
+/// Records the offscreen work, submits it and waits for it to complete.
+///
+/// The waits are bounded and guarded. The fence is waited for only when a
+/// submission with it may still be running, and a wait that does not end in
+/// a signal is an error rather than a park, so a device that never finishes
+/// blocks the caller for a bounded time and no longer.
+fn submit_offscreen<D, F>(
+    device: &D,
+    queue: vk::Queue,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    fence: &OffscreenFence,
+    record: F,
+) -> Result<(), RenderError>
+where
+    D: OffscreenDevice + ?Sized,
+    F: FnOnce(vk::CommandBuffer) -> Result<(), RenderError>,
+{
+    // Wait for the previous submission, but only when the queue accepted
+    // one: a submission the queue refused leaves the fence disarmed with
+    // nothing pending, and waiting for such a fence would never return.
+    if fence.in_flight() {
+        wait_for_fence(device, fence.handle, "the previous offscreen submission")?;
+        fence.completed();
+    }
+
+    device
+        .reset_pool(command_pool)
+        .map_err(|error| RenderError::Framebuffer {
+            message: format!("failed to reset the offscreen command pool: {error}"),
+        })?;
+    device
+        .begin_buffer(command_buffer)
+        .map_err(|error| RenderError::Framebuffer {
+            message: format!("failed to begin the offscreen command buffer: {error}"),
+        })?;
+
+    if let Err(error) = record(command_buffer) {
+        // The buffer is left recording. Ending it discards the half-recorded
+        // commands, so the next call resets a finished buffer. The
+        // recording's own failure is the one reported.
+        if let Err(end_error) = device.end_buffer(command_buffer) {
+            log::error!(
+                "platform.render: the offscreen command buffer could not be ended after a \
+                 failed recording: {end_error}"
+            );
+        }
+        return Err(error);
+    }
+
+    device
+        .end_buffer(command_buffer)
+        .map_err(|error| RenderError::Framebuffer {
+            message: format!("failed to end the offscreen command buffer: {error}"),
+        })?;
+    device
+        .reset_fence(fence.handle)
+        .map_err(|error| RenderError::Framebuffer {
+            message: format!("failed to reset the offscreen fence: {error}"),
+        })?;
+    if let Err(error) = device.submit(queue, command_buffer, fence.handle) {
+        // The queue refused the submission: nothing is pending and the fence
+        // stays disarmed, so the next call must not wait for it. The tracker
+        // holds no work, so the next call records and submits again and
+        // reports its own failure.
+        return Err(RenderError::Framebuffer {
+            message: format!("failed to submit the offscreen work: {error}"),
+        });
+    }
+    // The queue accepted the submission, so the fence will signal.
+    fence.submitted();
+    wait_for_fence(device, fence.handle, "the offscreen work")?;
+    fence.completed();
+    Ok(())
+}
+
 /// Records a fallible `record` closure and submits it synchronously.
 fn record_and_submit<F>(submit: &OffscreenSubmit<'_>, record: F) -> Result<(), RenderError>
 where
@@ -1228,54 +1454,234 @@ where
         command_buffer,
         fence,
     } = *submit;
-    // SAFETY: the caller guarantees no command buffers from this pool are in
-    // flight; the fence was created signalled so the first wait returns.
-    unsafe {
-        device
-            .wait_for_fences(&[fence], true, u64::MAX)
-            .map_err(|error| RenderError::Framebuffer {
-                message: format!("failed to wait for the offscreen fence: {error}"),
-            })?;
-        device
-            .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
-            .map_err(|error| RenderError::Framebuffer {
-                message: format!("failed to reset the offscreen command pool: {error}"),
-            })?;
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        device
-            .begin_command_buffer(command_buffer, &begin_info)
-            .map_err(|error| RenderError::Framebuffer {
-                message: format!("failed to begin the offscreen command buffer: {error}"),
-            })?;
+    submit_offscreen(device, queue, command_pool, command_buffer, fence, record)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use api::error::RenderError;
+    use ash::vk;
+
+    use super::*;
+
+    /// A device that records the calls the offscreen path makes and fails the
+    /// ones a test asks it to fail.
+    #[derive(Default)]
+    struct FakeDevice {
+        /// The number of waits the path issued.
+        waits: Cell<usize>,
+        /// The timeout the last wait used.
+        timeout_ns: Cell<u64>,
+        /// The result the waits return.
+        wait_result: Cell<vk::Result>,
+        /// The number of submits the path issued.
+        submits: Cell<usize>,
+        /// The result the submits return.
+        submit_result: Cell<vk::Result>,
+        /// The number of command buffers the path ended.
+        ends: Cell<usize>,
     }
 
-    record(command_buffer)?;
+    impl OffscreenDevice for FakeDevice {
+        fn wait_for_fence(&self, _fence: vk::Fence, timeout_ns: u64) -> Result<(), vk::Result> {
+            self.waits.set(self.waits.get() + 1);
+            self.timeout_ns.set(timeout_ns);
+            if self.wait_result.get() == vk::Result::SUCCESS {
+                Ok(())
+            } else {
+                Err(self.wait_result.get())
+            }
+        }
 
-    // SAFETY: the command buffer is recording and was begun above.
-    unsafe {
-        device
-            .end_command_buffer(command_buffer)
-            .map_err(|error| RenderError::Framebuffer {
-                message: format!("failed to end the offscreen command buffer: {error}"),
-            })?;
-        device
-            .reset_fences(&[fence])
-            .map_err(|error| RenderError::Framebuffer {
-                message: format!("failed to reset the offscreen fence: {error}"),
-            })?;
-        let command_buffers = [command_buffer];
-        let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
-        device
-            .queue_submit(queue, &[submit], fence)
-            .map_err(|error| RenderError::Framebuffer {
-                message: format!("failed to submit the offscreen work: {error}"),
-            })?;
-        device
-            .wait_for_fences(&[fence], true, u64::MAX)
-            .map_err(|error| RenderError::Framebuffer {
-                message: format!("failed to wait for the offscreen work: {error}"),
-            })?;
+        fn reset_pool(&self, _pool: vk::CommandPool) -> Result<(), vk::Result> {
+            Ok(())
+        }
+
+        fn begin_buffer(&self, _buffer: vk::CommandBuffer) -> Result<(), vk::Result> {
+            Ok(())
+        }
+
+        fn end_buffer(&self, _buffer: vk::CommandBuffer) -> Result<(), vk::Result> {
+            self.ends.set(self.ends.get() + 1);
+            Ok(())
+        }
+
+        fn reset_fence(&self, _fence: vk::Fence) -> Result<(), vk::Result> {
+            Ok(())
+        }
+
+        fn submit(
+            &self,
+            _queue: vk::Queue,
+            _buffer: vk::CommandBuffer,
+            _fence: vk::Fence,
+        ) -> Result<(), vk::Result> {
+            self.submits.set(self.submits.get() + 1);
+            if self.submit_result.get() == vk::Result::SUCCESS {
+                Ok(())
+            } else {
+                Err(self.submit_result.get())
+            }
+        }
     }
-    Ok(())
+
+    /// The fence the offscreen path tracks.
+    fn tracked_fence() -> OffscreenFence {
+        OffscreenFence::new(vk::Fence::null())
+    }
+
+    /// Runs one offscreen submission that records nothing.
+    fn submit_once(device: &FakeDevice, fence: &OffscreenFence) -> Result<(), RenderError> {
+        submit_offscreen(
+            device,
+            vk::Queue::null(),
+            vk::CommandPool::null(),
+            vk::CommandBuffer::null(),
+            fence,
+            |_command_buffer| Ok(()),
+        )
+    }
+
+    /// A refused submit leaves the fence disarmed with nothing pending, so
+    /// the next call must not wait for it: waiting for a fence that can
+    /// never signal is the park this path must not have.
+    #[test]
+    fn a_refused_submit_leaves_the_next_call_waiting_for_nothing() {
+        let device = FakeDevice::default();
+        let fence = tracked_fence();
+        device.submit_result.set(vk::Result::ERROR_DEVICE_LOST);
+
+        let first = submit_once(&device, &fence);
+        assert!(first.is_err(), "the refused submit is reported as an error");
+        assert_eq!(
+            device.waits.get(),
+            0,
+            "the first call waited for nothing: the fence was never armed"
+        );
+        assert!(
+            !fence.in_flight(),
+            "the refused submit left no work in flight"
+        );
+
+        let second = submit_once(&device, &fence);
+        assert!(second.is_err(), "the next call reports its own failure");
+        assert_eq!(
+            device.waits.get(),
+            0,
+            "the next call did not wait on a fence that can never signal"
+        );
+    }
+
+    /// A wait that does not end in a signal is an error, and the wait is
+    /// bounded: the caller is told that the device did not finish instead of
+    /// being parked for ever.
+    #[test]
+    fn a_wait_that_times_out_is_an_error() {
+        let device = FakeDevice::default();
+        let fence = tracked_fence();
+        device.wait_result.set(vk::Result::TIMEOUT);
+
+        let error = submit_once(&device, &fence).expect_err("the timeout is an error");
+        assert!(
+            matches!(&error, RenderError::Framebuffer { .. }),
+            "the timeout is a framebuffer error: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("did not signal"),
+            "the error names the missing signal: {message}"
+        );
+        assert_eq!(device.waits.get(), 1, "the path waited once");
+        assert_eq!(
+            device.timeout_ns.get(),
+            OFFSCREEN_TIMEOUT_NS,
+            "the wait is bounded"
+        );
+        assert!(
+            fence.in_flight(),
+            "the work may still be running after a timeout"
+        );
+    }
+
+    /// A timed-out wait leaves the work possibly running, so the next call
+    /// waits for it again, with the same bound, instead of recording over
+    /// work the device is still doing.
+    #[test]
+    fn the_next_call_after_a_timeout_waits_again() {
+        let device = FakeDevice::default();
+        let fence = tracked_fence();
+        device.wait_result.set(vk::Result::TIMEOUT);
+
+        assert!(submit_once(&device, &fence).is_err(), "the timeout");
+        let submits = device.submits.get();
+        assert!(submit_once(&device, &fence).is_err(), "the timeout again");
+        assert_eq!(device.waits.get(), 2, "the next call waited again");
+        assert_eq!(
+            device.timeout_ns.get(),
+            OFFSCREEN_TIMEOUT_NS,
+            "the wait is bounded"
+        );
+        assert_eq!(
+            device.submits.get(),
+            submits,
+            "the next call did not record over work that may still be running"
+        );
+    }
+
+    /// A submission the queue accepted is waited for once, and the fence is
+    /// free afterwards: the next call does not wait for the completed work.
+    #[test]
+    fn an_accepted_submission_is_waited_for_once() {
+        let device = FakeDevice::default();
+        let fence = tracked_fence();
+
+        submit_once(&device, &fence).expect("the submission");
+        assert_eq!(device.waits.get(), 1, "the work was waited for");
+        assert_eq!(device.submits.get(), 1, "the work was submitted");
+        assert!(!fence.in_flight(), "the work is done");
+
+        submit_once(&device, &fence).expect("the second submission");
+        assert_eq!(
+            device.waits.get(),
+            2,
+            "each submission is waited for once: the completed work is not waited for again"
+        );
+        assert_eq!(device.submits.get(), 2, "the second work was submitted");
+    }
+
+    /// A recording that fails ends the command buffer, so the next call
+    /// resets a finished buffer, and leaves the fence free.
+    #[test]
+    fn a_failed_recording_ends_the_buffer_and_frees_the_fence() {
+        let device = FakeDevice::default();
+        let fence = tracked_fence();
+
+        let failed = submit_offscreen(
+            &device,
+            vk::Queue::null(),
+            vk::CommandPool::null(),
+            vk::CommandBuffer::null(),
+            &fence,
+            |_command_buffer| {
+                Err(RenderError::Framebuffer {
+                    message: "the recording failed".to_owned(),
+                })
+            },
+        );
+        assert!(failed.is_err(), "the recording failure is reported");
+        assert_eq!(device.ends.get(), 1, "the buffer was ended");
+        assert_eq!(device.submits.get(), 0, "nothing was submitted");
+        assert_eq!(device.waits.get(), 0, "the fence was never armed");
+        assert!(!fence.in_flight(), "the fence is free");
+
+        submit_once(&device, &fence).expect("the next submission");
+        assert_eq!(
+            device.waits.get(),
+            1,
+            "the next call waited for its own work only"
+        );
+        assert_eq!(device.submits.get(), 1, "the next call submitted");
+    }
 }

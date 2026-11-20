@@ -588,16 +588,17 @@ pub fn read_render_target(
 
 /// Copies a target's pixels into a texture.
 ///
-/// The copy stays on the device: the pixels never reach the host. The
-/// texture must hold the target's whole image, and the copy replaces the
-/// texture's pixels.
+/// The copy stays on the device: the pixels never reach the host. The copy
+/// fills the texture from the target's top-left corner: the part of the
+/// target the texture cannot hold is left out, and the part of the texture
+/// the target does not cover keeps the texture's own pixels.
 ///
 /// # Errors
 ///
-/// Returns [`RenderError::InvalidArgument`] when the texture is smaller than
-/// the target or the formats differ, [`RenderError::Framebuffer`] when the
-/// target was never rendered into, and [`RenderError::Unsupported`] for an
-/// unimplemented backend.
+/// Returns [`RenderError::InvalidArgument`] when the texture and the target
+/// have different formats, [`RenderError::Framebuffer`] when the target was
+/// never rendered into, and [`RenderError::Unsupported`] for an unimplemented
+/// backend.
 pub fn copy_render_target_to_texture(
     p: &RenderPipeline,
     state: &mut RenderState,

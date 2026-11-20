@@ -184,6 +184,14 @@ present a frame — `render`, `resize` and `recover_surface` report
 reachable on a machine that has a GPU but no display, and what lets the GPU
 path be compared with the CPU path on one scene.
 
+The offscreen fence is **tracked and bounded**, unlike the frame's and the
+per-image waits, which stay unbounded by design. A submission that the queue
+refused leaves the fence disarmed, so the offscreen path records whether a
+submission may still be running and consults that record before every wait: a
+fence that cannot signal is never waited on. The wait itself is bounded at
+five seconds, so a device that never finishes is a `RenderError::Framebuffer`
+and not a thread parked for ever.
+
 The Vulkan backend creates the device on its own, with the surface only when
 the caller presents to a window: the queue family is chosen for what the
 device is for (graphics and presentation for a surface, graphics alone for an

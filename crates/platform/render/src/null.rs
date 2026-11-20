@@ -318,14 +318,18 @@ impl NullRenderPipeline {
     /// Copies the pixels of an offscreen `target` into the CPU storage of
     /// `texture`.
     ///
-    /// The copy replaces the texture's pixels: the null backend has no
-    /// device of its own, so the bytes are moved on the host.
+    /// The copy fills the texture from the target's top-left corner: the
+    /// part of the target the texture cannot hold is left out, and the part
+    /// of the texture the target does not cover keeps the texture's own
+    /// pixels. The null backend has no device of its own, so the bytes are
+    /// moved on the host.
     ///
     /// # Errors
     ///
     /// [`RenderError::InvalidArgument`] when the state does not belong to
-    /// this backend or the texture is smaller than the target, and
-    /// [`RenderError::Framebuffer`] when the target is not owned by the state.
+    /// this backend or the texture and the target have different formats,
+    /// and [`RenderError::Framebuffer`] when the target is not owned by the
+    /// state.
     pub fn copy_render_target_to_texture(
         &self,
         state: &mut RenderState,
@@ -345,15 +349,16 @@ impl NullRenderPipeline {
             })?;
         let source_desc = source.desc;
         let texture_desc = *texture.desc();
-        if texture_desc.width < source_desc.width || texture_desc.height < source_desc.height {
+        if source_desc.format != texture_desc.format {
             return Err(RenderError::InvalidArgument {
-                message: format!(
-                    "the {}x{} texture is smaller than the {}x{} render target",
-                    texture_desc.width, texture_desc.height, source_desc.width, source_desc.height
-                ),
+                message: "the texture and the render target have different formats".to_owned(),
             });
         }
         let bytes_per_pixel = source_desc.format.bytes_per_pixel() as usize;
+        // The copy fills the texture's own extent: the part of the target
+        // the texture cannot hold is left out.
+        let width = source_desc.width.min(texture_desc.width) as usize;
+        let height = source_desc.height.min(texture_desc.height) as usize;
         let total = usize::try_from(texture_desc.base_byte_len()).map_err(|_| {
             RenderError::OutOfMemory {
                 message: "texture is too large for the host address space".to_owned(),
@@ -365,19 +370,19 @@ impl NullRenderPipeline {
             uploads: 0,
             bytes_uploaded: 0,
         });
-        // The target's rows replace the texture's rows; the columns the
-        // target does not cover keep the texture's own.
-        for row in 0..source_desc.height as usize {
+        // The target's rows fill the texture's rows; the columns the target
+        // does not cover keep the texture's own.
+        let row_bytes = width * bytes_per_pixel;
+        for row in 0..height {
             let start = row * source_desc.width as usize * bytes_per_pixel;
-            let end = start + source_desc.width as usize * bytes_per_pixel;
             let offset = row * texture_desc.width as usize * bytes_per_pixel;
-            image.pixels[offset..offset + (end - start)]
-                .copy_from_slice(&source.pixels[start..end]);
+            image.pixels[offset..offset + row_bytes]
+                .copy_from_slice(&source.pixels[start..start + row_bytes]);
         }
         image.uploads = image.uploads.saturating_add(1);
         image.bytes_uploaded = image
             .bytes_uploaded
-            .saturating_add(source.pixels.len() as u64);
+            .saturating_add((row_bytes * height) as u64);
         Ok(())
     }
 
@@ -863,8 +868,55 @@ mod tests {
 
     /// A render target's pixels are copied into a texture without the host
     /// reading them: the copy moves the bytes the target holds.
+    ///
+    /// The copy fills the texture's own extent, so the part of the target
+    /// the texture cannot hold is left out.
     #[test]
     fn a_render_target_is_copied_into_a_texture() {
+        let pipeline = NullRenderPipeline::new();
+        let mut state = pipeline.begin_offscreen().expect("offscreen state");
+        let target = pipeline
+            .create_render_target(RenderTargetDesc::new(2, 2))
+            .expect("target");
+        let texture = pipeline
+            .create_texture(TextureDesc::new(1, 1))
+            .expect("texture");
+        // The target holds one solid red quad.
+        let mut scene = RenderScene::with_root_node();
+        let root = scene.root;
+        let child = scene.push(RenderNode {
+            parent: Some(root),
+            content: RenderContent::Solid([1.0, 0.0, 0.0, 1.0]),
+            dst: RectF::new(0.0, 0.0, 2.0, 2.0),
+            ..RenderNode::default()
+        });
+        if let Some(node) = scene.node_mut(root) {
+            node.children = vec![child];
+        }
+        pipeline
+            .render_to_target(&mut state, &target, &scene)
+            .expect("render");
+        pipeline
+            .copy_render_target_to_texture(&mut state, &target, &texture)
+            .expect("copy");
+
+        let StateKind::Null(null) = &state.kind else {
+            panic!("the null backend's state");
+        };
+        let image = null
+            .textures
+            .get(&texture.key())
+            .expect("the texture's storage");
+        assert_eq!(
+            image.pixels,
+            vec![255u8, 0, 0, 255],
+            "the texture holds the target's pixels"
+        );
+    }
+
+    /// A texture as large as the target holds the whole target.
+    #[test]
+    fn a_texture_as_large_as_the_target_holds_every_pixel() {
         let pipeline = NullRenderPipeline::new();
         let mut state = pipeline.begin_offscreen().expect("offscreen state");
         let target = pipeline
@@ -901,8 +953,10 @@ mod tests {
             .expect("the texture's storage");
         assert_eq!(
             image.pixels,
-            vec![255u8, 0, 0, 255],
-            "the texture holds the target's pixels"
+            vec![
+                255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ],
+            "the texture holds the whole target"
         );
     }
 

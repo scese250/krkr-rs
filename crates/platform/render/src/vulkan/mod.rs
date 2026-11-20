@@ -1360,8 +1360,9 @@ pub(crate) struct VulkanDevice {
     /// Command buffer used for one synchronous offscreen render or readback.
     pub(crate) offscreen_command: vk::CommandBuffer,
     /// Fence waited on after one synchronous offscreen render or readback
-    /// (created signalled).
-    pub(crate) offscreen_fence: vk::Fence,
+    /// (created signalled), and the record of whether a submission with it
+    /// may still be running.
+    pub(crate) offscreen_fence: target::OffscreenFence,
     /// GPU textures keyed by [`Texture`] identity.
     pub(crate) textures: Map<u64, texture::VulkanTexture>,
     /// GPU offscreen targets keyed by [`RenderTarget`] identity.
@@ -1615,7 +1616,7 @@ impl VulkanDevice {
             queue: *graphics_queue,
             command_pool: *offscreen_pool,
             command_buffer: *offscreen_command,
-            fence: *offscreen_fence,
+            fence: offscreen_fence,
         };
         // The offscreen render owns a uniform slot of its own and runs while a
         // live frame may still be in flight.
@@ -1672,7 +1673,7 @@ impl VulkanDevice {
             queue: self.graphics_queue,
             command_pool: self.offscreen_pool,
             command_buffer: self.offscreen_command,
-            fence: self.offscreen_fence,
+            fence: &self.offscreen_fence,
         };
         target::read(&submit, memory_properties, gpu, &mut readback, region, out)
     }
@@ -1713,7 +1714,7 @@ impl VulkanDevice {
             queue: self.graphics_queue,
             command_pool: self.offscreen_pool,
             command_buffer: self.offscreen_command,
-            fence: self.offscreen_fence,
+            fence: &self.offscreen_fence,
         };
         let Some(gpu_target) = self.render_targets.get_mut(&target.key()) else {
             return Err(RenderError::Framebuffer {
@@ -1754,7 +1755,7 @@ impl Drop for VulkanDevice {
             self.upload.destroy(&self.device);
             self.readback.get_mut().destroy(&self.device);
             self.device.destroy_command_pool(self.offscreen_pool, None);
-            self.device.destroy_fence(self.offscreen_fence, None);
+            self.device.destroy_fence(self.offscreen_fence.handle, None);
             self.device.destroy_device(None);
         }
     }
@@ -2146,7 +2147,7 @@ fn create_frame(device: &ash::Device, queue_family_index: u32) -> Result<VulkanF
 fn create_offscreen_resources(
     device: &ash::Device,
     queue_family_index: u32,
-) -> Result<(vk::CommandPool, vk::CommandBuffer, vk::Fence), RenderError> {
+) -> Result<(vk::CommandPool, vk::CommandBuffer, target::OffscreenFence), RenderError> {
     let pool_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(queue_family_index)
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -2201,7 +2202,7 @@ fn create_offscreen_resources(
         }
     })?;
 
-    Ok((pool, command_buffer, fence))
+    Ok((pool, command_buffer, target::OffscreenFence::new(fence)))
 }
 
 /// The recovery a swapchain operation needs.
