@@ -951,7 +951,20 @@ pub(super) fn resolved_bitmap_pixels(
             state.height
         ));
     }
-    Ok((state.width, state.height, state.rgba.clone()))
+    let (width, height) = (state.width, state.height);
+    // The pose the layer shows lives on the backend, so the pixels are read
+    // back when a script asks for them.
+    let pixels = match scene.read_pixels(bitmap) {
+        Ok(Some(pixels)) => pixels,
+        Ok(None) => {
+            let Some(state) = scene.bitmap(bitmap) else {
+                return Err(format!("{operation}: the bitmap {bitmap} does not exist"));
+            };
+            state.rgba.clone()
+        }
+        Err(error) => return Err(format!("{operation}: {error}")),
+    };
+    Ok((width, height, pixels))
 }
 
 /// Copy `source`'s MainImage and ProvinceImage into `dest`, following the

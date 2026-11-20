@@ -98,7 +98,7 @@ raw-window-handle = "0.6"
 | crate | why the host needs it |
 |---|---|
 | `engine` | the engine itself |
-| `render` | the pipeline, the surface, the render state, the texture and the `RenderScene` types the engine's API names |
+| `render` | the pipeline, the surface, the offscreen target, the render state, the texture and the `RenderScene` types the engine's API names |
 | `api` | the shared DTOs and the typed error enums (`InputEvent`, `BlendMode`, `RenderError`, `FsError`, `AudioSpec`) |
 | `fs` | the file-system object the storage namespace is built over |
 | `raw-window-handle` | the window handle the surface is created for, when the host has its own windowing |
@@ -132,7 +132,7 @@ feature.
 |---|---|
 | `compat` (the compatibility surface) | the script-visible names are not reachable through the engine; a host that wants them adds `crates/compat` and `crates/vm` |
 | `vm`, `tjs` (the script VM) | the engine has no script engine and never evaluates a script |
-| `platform` (window, event loop, audio device, clock) | the host supplies the surface, the events, the elapsed time and the audio device |
+| `platform` (window, event loop, audio device, clock) | the host supplies the frame target, the events, the elapsed time and the audio device |
 | `media` (image, audio and video decoding) | the host supplies an `ImageDecoder` and the decoded PCM it wants mixed |
 | `app`, `android` (the composition roots) | the wiring is the host's own |
 | `winit`, `cpal`, FFmpeg, MediaCodec | no windowing, audio or video backend is selected by the engine |
@@ -151,11 +151,12 @@ everything between them.
 ### The bottom render objects
 
 The engine draws through the L1 render pipeline, so the host creates the
-pipeline, the surface and the render state and hands them over:
+pipeline, the frame target and the render state and hands them over:
 
 ```rust
 let pipeline = render::create_render_pipeline(render::PipelineConfig::null())?;
 let (surface, render_state) = render::begin_render_state(&pipeline, &handle)?;
+let target = engine::FrameTarget::Surface(surface);
 ```
 
 * `create_render_pipeline` takes a `render::PipelineConfig` and returns a
@@ -165,6 +166,11 @@ let (surface, render_state) = render::begin_render_state(&pipeline, &handle)?;
   both.
 * `begin_render_state` returns the `(Surface, RenderState)` pair. The
   engine takes both over and stores them; the host keeps no copy.
+* `FrameTarget` says where the frames are drawn: `Surface(surface)` presents
+  every frame, and `Offscreen(target)` draws it into a target a host with no
+  window reads back with `Engine::read_offscreen_frame`. The target is
+  created by the host at the surface size, and the engine refuses one of
+  another size.
 * The surface size is the **device** size in physical pixels. It is set on
   `EngineParts::surface_size` and can be changed later with
   `Engine::resize`.
@@ -221,7 +227,7 @@ The whole example: create the bottom objects, create the engine, put one
 layer on the screen, drive one frame with an injected clock, tear down.
 
 ```rust
-use engine::{Engine, EngineParts, GameFrame, InjectedFrameTime, Rect};
+use engine::{Engine, EngineParts, FrameTarget, GameFrame, InjectedFrameTime, Rect};
 use raw_window_handle::{RawWindowHandle, WebWindowHandle};
 use render::{PipelineConfig, begin_render_state, create_render_pipeline};
 
@@ -242,10 +248,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = RawWindowHandle::Web(WebWindowHandle::new(0));
     let (surface, render_state) = begin_render_state(&pipeline, &handle)?;
 
-    // 2. The engine. It takes the surface and the render state over.
+    // 2. The engine. It takes the frame target and the render state over.
     let mut engine = Engine::new(EngineParts {
         pipeline,
-        surface,
+        target: FrameTarget::Surface(surface),
         render_state,
         surface_size: (640, 480),
         headless: true,
@@ -338,7 +344,7 @@ The frame runs in this order:
 9. project the scene into the VM-space `RenderScene`;
 10. run `hooks.after_project(drawn_layers)`;
 11. upload and project again if the hook changed the scene;
-12. one `render::render` call.
+12. one `render::render` call — into the surface, or into the offscreen target.
 
 ### The upward hook
 
@@ -367,7 +373,7 @@ frame is abandoned without drawing.
 |---|---|
 | `frame_index` | frames drawn so far, counting this one |
 | `elapsed_ms` | the frame clock, with its fractional part |
-| `presented` | whether the frame reached the surface |
+| `presented` | whether the frame reached its destination: the display for a surface, the offscreen target otherwise |
 | `stats` | the null backend's counters, or `None` on a GPU backend |
 | `sync_ms`, `upload_ms`, `prune_ms` | the bitmap-to-texture costs |
 | `project_ms` | the projection cost |
@@ -382,8 +388,9 @@ reports it; the host does not have to retry anything.
 The order the windowed loop in `crates/app/src/runner.rs` uses:
 
 1. **Apply the pending resize.** The device framebuffer size changed, so
-   `Engine::resize` rebinds the surface. The scene's window and layer sizes
-   do not change: an OS resize moves no value a script observes.
+   `Engine::resize` rebinds the surface, or replaces the offscreen target
+   with one of the new size. The scene's window and layer sizes do not
+   change: an OS resize moves no value a script observes.
 2. **Fold the input events into the input state.**
    `InputState::begin_frame`, one `apply` per event, `end_frame`. See
    [§9](#9-input-the-state-and-the-frame-protocol).
@@ -733,11 +740,12 @@ does it in the frame hook, mapping only the position-carrying events (pointer
 move and touch) and passing every other event through unchanged.
 
 **A device resize moves nothing in the scene.** `Engine::resize(size)`
-rebinds the surface to a new device size; the window's client size and the
-primary layer's rect are untouched, and the presentation refits the screen
-into the new framebuffer. The other direction is a script-side window size:
-the engine surfaces one through `Engine::take_window_resize()`, and the host
-applies it to its own window.
+rebinds the surface to a new device size, or replaces the offscreen target
+with one of that size; the window's client size and the primary layer's rect
+are untouched, and the presentation refits the screen into the new
+framebuffer. The other direction is a script-side window size: the engine
+surfaces one through `Engine::take_window_resize()`, and the host applies it
+to its own window.
 
 The code map is [`translate.md`](translate.md); the architecture is
 [`docs/arch/l2.md`](../../arch/l2.md) §4.
@@ -861,8 +869,8 @@ full list is in `crates/app/src/main.rs`.
 
 **Bottom objects**
 
-- [ ] The pipeline, the surface and the render state are created by the host
-      and handed to `Engine::new` in one `EngineParts`.
+- [ ] The pipeline, the frame target and the render state are created by the
+      host and handed to `Engine::new` in one `EngineParts`.
 - [ ] The surface size is the device size in physical pixels.
 - [ ] A window handle is available for the surface, and a display handle too
       when the backend needs one.

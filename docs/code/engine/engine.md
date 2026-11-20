@@ -3,8 +3,8 @@
 Source: `crates/engine/src/engine.rs`
 
 `Engine` is the object the composition root drives. It holds the logical
-[`Scene`](scene.md), the projected L1 `RenderScene`, the surface/render-state
-pair, the bitmap→texture table, the [`TimerState`](timer.md), the
+[`Scene`](scene.md), the projected L1 `RenderScene`, the frame target and the
+render state, the bitmap→texture table, the [`TimerState`](timer.md), the
 [`InputState`](input.md), the [`FrameClock`](clock.md) and the VM↔device
 [`PixelTranslation`](translate.md) — and it owns the **frame**: the clock, the
 timer pump, the projection and the single draw call.
@@ -38,7 +38,7 @@ map for the module.
 | `render_scene: RenderScene` | the projected draw tree (an L1-shaped value) |
 | `render_scene_revision: Option<u64>` | the `Scene::structure_revision` the projection was built from; `None` forces a rebuild |
 | `drawn_layers: Vec<u32>` | the layer ids the latest projection emitted |
-| `surface: Surface`, `render_state: RenderState` | the L1 surface and its GPU/staging bookkeeping |
+| `target: FrameTarget`, `render_state: RenderState` | where the frame is drawn — a surface to present to, or an offscreen target to draw into — and its GPU/staging bookkeeping |
 | `textures: Map<u32, Texture>` | bitmap id → uploaded texture |
 | `timer: TimerState` | the timer registry the frame advances |
 | `input: InputState` | the script-visible input state |
@@ -58,9 +58,14 @@ map for the module.
 ### Construction
 
 ```rust
+pub enum FrameTarget {
+    Surface(Surface),
+    Offscreen(RenderTarget),
+}
+
 pub struct EngineParts {
     pub pipeline: RenderPipeline,
-    pub surface: Surface,
+    pub target: FrameTarget,
     pub render_state: RenderState,
     pub surface_size: (u32, u32),
     pub headless: bool,
@@ -76,6 +81,12 @@ impl Engine {
 surface action the engine does before its first frame, adopts the extent the
 backend actually took (a compositor or DPI clamp can differ from the request)
 and fits the presentation.
+
+An **offscreen target** is the other destination: a host with no window has
+no surface to present to, so the frame is drawn into a target and the caller
+reads it back. The caller creates the target at the surface size, and the
+engine refuses one of another size — the target holds the frame, and a target
+of another size would crop the picture the presentation maps.
 
 ### The frame
 
@@ -106,10 +117,11 @@ impl Engine {
 * The clock is the [`FrameClock`](clock.md) object the engine owns, and it is
   the tick count the script reads through `System.getTickCount`: the script
   and the frame share one clock.
-* `resize(size, …)` rebinds the surface to a new framebuffer size. The
-  logical screen is untouched: the scene keeps its window client sizes and
-  primary-layer rects, and the presentation refits the screen into the new
-  framebuffer, so an OS resize moves no value a script observes.
+* `resize(size, …)` rebinds the surface to a new framebuffer size, or replaces
+  the offscreen target with one of that size. The logical screen is untouched:
+  the scene keeps its window client sizes and primary-layer rects, and the
+  presentation refits the screen into the new framebuffer, so an OS resize
+  moves no value a script observes.
 
 ### The upward edges
 
@@ -142,7 +154,11 @@ tree.
 `input_mut()`, `timer()`, `timer_mut()`, `is_headless()`, `surface_size()`,
 `vm_size()`, `object_counts()`, `translation()`, `take_window_resize()`,
 `frame_index()`, `elapsed_ms()`, `last_frame()`, `last_frame_timings()`,
-`debug_overlay_enabled()`.
+`debug_overlay_enabled()`, `read_offscreen_frame()`.
+
+`read_offscreen_frame()` answers with the RGBA8 device pixels of the last
+frame drawn into the offscreen target, and with `None` for a host that
+presents to a surface.
 
 `vm_size()` is the **script-visible screen size**: the first window's
 primary-layer rect, the window's client size while it has no primary layer,
@@ -168,11 +184,13 @@ pub struct FrameReport {
 }
 ```
 
-`stats` is the null backend's counters (`None` on a GPU backend). `presented ==
-false` means the scene was updated but the backend kept the previous surface
-contents; the engine counts the frame into the current `PresentationStall` —
-the reference presents on every vsync wake, and a wake that produced no frame
-is a skipped, reported frame
+`stats` is the null backend's counters (`None` on a GPU backend). A frame
+drawn into an offscreen target has no surface to present to: it reaches the
+target, which holds it until the next frame changes it, and the report says
+the frame was presented. `presented == false` means the scene was updated
+but the backend kept the previous surface contents; the engine counts the
+frame into the current `PresentationStall` — the reference presents on every
+vsync wake, and a wake that produced no frame is a skipped, reported frame
 (`reference/cpp/core/visual/impl/VSyncTimingThread.cpp:114,141-142`). The
 engine does not retry a presentation inside the same frame: the backend already
 rebuilds its swapchain at the start of the next frame when it needs to, and a
@@ -209,23 +227,25 @@ into it and `frame` put it at the injected value.
 6. **if the sizes cannot be fitted** → count the frame as not presented, skip
    everything that draws and return a report with no statistics;
 7. `refresh_overlay(now_ms)`;
-8. upload the dirty bitmap regions, prune the textures whose bitmap is gone;
+8. draw the layers' draw lists — a layer's pose is drawn on the backend, into
+   the layer's own pose surface;
+9. upload the dirty bitmap regions, prune the textures whose bitmap is gone;
    both walk the scene's dirty and removal sets, not the bitmap and texture
    tables;
-9. project the scene when `Scene::structure_revision` changed (or the
-   presentation/texture table invalidated the projection);
-10. `hooks.after_project(&drawn_layers)`;
-11. `sync_presentation()` again;
-12. upload the dirty bitmap regions again (a CPU-blended transition frame is a bitmap
+10. project the scene when `Scene::structure_revision` changed (or the
+    presentation/texture table invalidated the projection);
+11. `hooks.after_project(&drawn_layers)`;
+12. `sync_presentation()` again;
+13. upload the dirty bitmap regions again (a CPU-blended transition frame is a bitmap
     the hook rewrote without changing the tree) and prune again;
-13. project again if the hook changed the scene's structure;
-14. one `render` call;
-15. recover a lost surface, then record the frame in the presentation stall —
+14. project again if the hook changed the scene's structure;
+15. one `render` call — into the surface, or into the offscreen target;
+16. recover a lost surface, then record the frame in the presentation stall —
     a presented frame closes the run and reports its span and causes, a
     skipped one records its cause (warned once per cause) and the stall's age
     when it is due, and the next frame's render call rebuilds a stale
     swapchain;
-16. bump the frame counter and return the `FrameReport`.
+17. bump the frame counter and return the `FrameReport`.
 
 The projection is rebuilt **in place**: the node list is cleared (retaining its
 capacity) and refilled, so only the projected nodes' own allocations are
@@ -278,7 +298,7 @@ script window size    ──► scene window client ──► take_window_resize
                        ├─► project_scene_report ─► RenderScene (VM px)
                        ├─► set root.transform = Fit presentation
                        ├─► GameFrame::after_project(drawn_layers)
-                       └─► render::render ─► one presented frame
+                       └─► render::render ─► the frame, presented or drawn into the target
 ```
 
 ---
@@ -318,7 +338,10 @@ warning with a named cause, or a counted skipped frame.
 * **`TimerState::advance` is crate-private**; the pump's public face is
   `timer::deliver_due`, which the compatibility layer does not call.
 * **The framebuffer is not a readback source.** `getPixel`, `piledCopy` and
-  `saveLayerImage` read the CPU layer bitmap, which is VM-exact.
+  `saveLayerImage` read the layer's own image, which is VM-exact. A layer
+  whose pose lives on the backend brings the pose into the pixels a script
+  reads from that image; the subtree a `piledCopy` composes is the image and
+  its children.
 
 ---
 
@@ -330,6 +353,9 @@ warning with a named cause, or a counted skipped frame.
 * `crates/engine/tests/engine.rs` — the frame: clock behaviour, projection
   cadence, upload retry, presentation faults, a skipped frame still running
   the hook and its due timers, and the window-resize handoff.
+* `crates/engine/tests/offscreen.rs` — the offscreen frame path: the frame is
+  drawn into the target, the target keeps the last frame, a target of another
+  size is refused, and the Vulkan path reads the frame back.
 * `crates/engine/src/engine.rs` `mod tests` — a failed upload leaves every
   bitmap dirty; a resize event reports the extent the surface accepted; a
   frame the backend did not present is reported; a frame the display never

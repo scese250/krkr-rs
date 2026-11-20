@@ -193,6 +193,12 @@ reaches into the registry itself. The registry's names are the faces' own
 family names; a name L3 resolved (a storage path, a candidate list) is an
 alias on that registry and stays out of the registered-name list.
 
+A layer's pose may live on the backend rather than in its image, so the
+pixels a script reads cross the seam as an action on the scene:
+`Scene::read_pixels` brings the pose into the image's pixels and answers
+with them. The scene owns the action and asks the engine, which owns the
+backend; L3 never names a backend and never reads a pose surface.
+
 The storage group carries one protocol item beyond the namespace's own types:
 `StorageMedia`, the provider that serves one storage scheme. L3 implements it
 (the `var://` and `psb://` providers), L2 holds the registered providers and

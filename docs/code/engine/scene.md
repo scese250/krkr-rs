@@ -30,11 +30,16 @@ pub struct Scene {
     pub layers: Vec<LayerState>,
     pub bitmaps: Vec<BitmapState>,
     pub fonts: Vec<FontState>,
+    pub host_draws_lists: bool,
     // private:
     next_window / next_layer / next_bitmap / next_font: u32,
     window_index / layer_index / bitmap_index / font_index: Map<u32, usize>,
     image_cache: DecodedImageCache,
     preloads: Vec<PreloadDecode>,
+    pose_surfaces: Map<u32, PoseSurface>,
+    pose_sync: Option<PoseSync>,
+    pose_revisions: Map<u32, u64>,
+    pose_pixels: Map<u32, (u64, Vec<u8>)>,
     structure_revision: u64,
     content_revision: u64,
 }
@@ -42,6 +47,11 @@ pub struct Scene {
 
 The four public vectors may be edited directly by a caller; the id lookups
 then fall back to a linear scan and still return the correct result.
+
+`Scene::host_draws_lists` says whether the host draws the layers' draw lists
+itself. The engine draws them on its backend, so it turns the flag on and the
+compatibility layer leaves the lists to it; a host that leaves the flag off
+has the list drawn on the CPU.
 
 `Scene::composite_transition_frames` is the one host-selected field: it says
 whether a running transition draws from `LayerState::transition_frame` (the
@@ -53,7 +63,7 @@ projected scene.
 | type | owns |
 |---|---|
 | `WindowState` | the client size, visibility, opacity, the primary layer, the focus domains and their focus, and the window's layer list |
-| `LayerState` | the parent/child links, the focus domain, the rect, visibility, opacity, the generic `BlendMode`, the sibling sort key, the image placement, the province plane, the hit-test mode, the clip rect, the focus and hint properties, the cache slots (`cache_bitmap`, `cache_content`, `transition_self`, `transition_frame`, `cache_enabled_count`, `cache_recalc`), the content region (`content_region`) and the `pending_paint` / `shutdown` flags |
+| `LayerState` | the parent/child links, the focus domain, the rect, visibility, opacity, the generic `BlendMode`, the sibling sort key, the image placement, the province plane, the hit-test mode, the clip rect, the focus and hint properties, the cache slots (`cache_bitmap`, `cache_content`, `transition_self`, `transition_frame`, `cache_enabled_count`, `cache_recalc`), the content region (`content_region`), the draw list the layer shows (`draws`) and the `pending_paint` / `shutdown` flags |
 | `TransitionFrame` / `TransitionSource` | the frame a composited transition draws on a layer: its pixel size, whether it covers the layer rect, and the two source draws (`bitmap`, `src`, `dst`, `alpha`) |
 | `BitmapState` | the RGBA8 pixels, the dimensions, the dirty flag and dirty region, the script-ownership flag and the pending decode (`pending`) |
 | `FontState` | the requested face, height, colour and the style flags |
@@ -194,6 +204,36 @@ the cache holds it, **without copying the pixels**: a caller that only wants
 the entry's recency — a pre-load that touches the graphics it already holds
 — pays nothing for the touch.
 
+### The pose
+
+A layer's **pose** is a draw list: the textured draws and the composites a
+caller composited onto the layer. The list is per-frame content — the pose
+that was composed replaces the one before it, and the renderer draws it once.
+
+The pose may live on the backend. The engine draws the lists on its own
+backend, into a **pose surface** per bitmap, and the projection draws that
+surface over the layer's own image; the layer's image is then not written per
+frame. The surface holds the pose the earlier frames left there, so the pose
+accumulates on it exactly as it accumulates on the CPU.
+
+| method | what it does |
+|---|---|
+| `set_layer_draws(layer_id, draws)` | replaces the layer's draw list. |
+| `layer_draws(layer_id)` | the layer's draw list. |
+| `layers_with_draws()` | the layers that carry a draw list, in layer order. |
+| `add_draw_source(pixels)` | registers a source the lists draw from, and answers with its id. |
+| `release_draw_source(id)` | releases one source; answers whether it was there. |
+| `prune_draw_sources(keep)` | releases every source the `keep` list does not name. |
+| `draw_ops_into(dst, ops)` | draws a list onto the caller's own bitmap — the CPU path. |
+| `draw_layer_draws_gpu(pipeline, state, layer_id)` | draws the layer's list on the backend, into the layer's own pose surface. |
+| `layer_pose(layer_id)` | the texture the layer's pose is sampled from, and the rectangle it covers in the layer's own pixels. |
+| `read_pose_pixels(pipeline, state, bitmap_id)` | reads the pose surface back, un-premultiplied. |
+| `compose_pose_pixels(bitmap_id, pose)` | the image's pixels with the pose composited over them. |
+| `read_pixels(bitmap_id)` | the pixels a script reads: the image's pixels with the pose over them. |
+| `read_pixel(bitmap_id, x, y)` | one pixel of those, borrowed out of the cached pixels. |
+| `drop_pose_surface(pipeline, state, bitmap_id)` | drops the pose surface, so the image carries the pose alone. |
+| `set_pose_sync(sync)` | installs the backend that reads a pose surface back. |
+
 ---
 
 ## 3. Invariants
@@ -243,6 +283,15 @@ the entry's recency — a pre-load that touches the graphics it already holds
 * **A script-owned bitmap outlives the layer that shows it.** `script_owned`
   marks a bitmap a script `Bitmap` object owns; destroying the layer must not
   free it.
+* **A pose that lives on the backend is not written into the image.** The
+  pose surface holds the pose the earlier frames left there, so the pose
+  accumulates on it as it accumulates on the CPU, and the layer's image keeps
+  the content the pose is drawn over.
+* **The pixels a script reads are the image's pixels with the pose over
+  them.** The image is not written: the pose is composited over a copy of it,
+  so a second read brings the same pixels and the pose is not composited
+  twice. The pixels are cached with the pose's revision, so a read that finds
+  the cache current does not reach the backend.
 * **A pending bitmap carries the probed size and no pixels.** The size comes
   from the header probe, so it is known before the decode finishes; the pixels
   arrive when the scene resolves the image, and every read of the pixels waits
@@ -464,6 +513,9 @@ calling thread instead.
 * `crates/engine/tests/imagedecode.rs` — the decode pool and the job pool
   under it: the workers, the queue, the byte accounting, the demanded-job
   order, the outcomes a waiter sees and the cast of a job's value.
+* `crates/engine/tests/motion_draw_list_gpu.rs` — the pose on the backend:
+  the GPU path and the CPU path draw the same picture, and the pixels a
+  script reads are the image's pixels with the pose composited over them.
 * `crates/engine/tests/oop_semantics.rs` — the value semantics of the state
   types.
 * `crates/engine/src/scene.rs` `mod tests` — the unit-level invariants.

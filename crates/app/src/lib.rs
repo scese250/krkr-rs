@@ -7,8 +7,9 @@
 //! [`Texture`] table, the timer registry and the script-visible input state
 //! — belongs to the engine, so the host holds no frame state of its own and
 //! drives one engine frame per [`Host::step`]. The stateless L1 services are
-//! created where they are used: the pipeline and the surface by
-//! [`Host::new`], the file system and the media backend by
+//! created where they are used: the pipeline and the frame's destination
+//! (the surface of a windowed host, the offscreen target of a headless one)
+//! by [`Host::new`], the file system and the media backend by
 //! [`GameHost::open_with_preload`].
 //!
 //! There are no globals, statics or hidden caches: every value is a local
@@ -39,12 +40,16 @@ use api::config::{CacheLimit, FrameRateLimit};
 use api::error::RenderError;
 use api::host::SurfaceEvent;
 use engine::Scene;
+// The engine's frame target: the frame is presented to a surface, or drawn
+// into an offscreen target on a host with no window.
+use engine::engine::FrameTarget;
 use overlay::Overlay;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use render::{
     FrameTimings, PipelineConfig, PresentedFrame, PresentedFrameSlot, RenderScene, RenderState,
-    Surface, Texture, TextureFormat, begin_render_state, begin_render_state_with_display,
-    create_render_pipeline, install_presented_frame_slot,
+    RenderTargetDesc, Surface, Texture, TextureFormat, begin_offscreen_render_state,
+    begin_render_state, begin_render_state_with_display, create_render_pipeline,
+    create_render_target, install_presented_frame_slot,
 };
 
 pub(crate) use audio::install_audio_decoder_metered;
@@ -160,8 +165,11 @@ pub struct HostConfig {
     pub validation: bool,
     /// Whether the host runs offscreen with no native window.
     ///
-    /// When `true` the host uses [`platform::headless_window_handle`]
-    /// and requires the null backend. When `false`, [`window_handle`]
+    /// When `true` the host runs without a window: with the null backend it
+    /// uses [`platform::headless_window_handle`] and its own surface, and
+    /// with the Vulkan backend it draws every frame into an offscreen target
+    /// of the surface size, which [`Host::read_offscreen_frame`] reads back.
+    /// When `false`, [`window_handle`]
     /// must be `Some`; a real backend with no handle is an error.
     ///
     /// [`window_handle`]: HostConfig::window_handle
@@ -238,6 +246,15 @@ impl HostConfig {
         self
     }
 
+    /// Returns this configuration with a different surface size.
+    ///
+    /// The size is the framebuffer in pixels: the surface a windowed host
+    /// presents to, and the offscreen target a headless host draws into.
+    pub fn with_surface_size(mut self, size: (u32, u32)) -> Self {
+        self.surface_size = size;
+        self
+    }
+
     /// Returns this configuration with the debug overlay enabled or disabled.
     pub fn with_debug_overlay(mut self, debug_overlay: bool) -> Self {
         self.debug_overlay = debug_overlay;
@@ -301,10 +318,11 @@ impl Host {
     ///
     /// # Errors
     ///
-    /// Returns [`HostError::Config`] for a headless configuration with a real
-    /// backend and for a non-headless one with no window handle. Returns
-    /// [`HostError::Render`] when the
-    /// requested backend cannot be created or when surface creation fails. A
+    /// Returns [`HostError::Config`] for a non-headless configuration with no
+    /// window handle. Returns [`HostError::Render`] when the
+    /// requested backend cannot be created, when the surface creation fails,
+    /// and when the offscreen target of a headless Vulkan host cannot be
+    /// created. A
     /// `--backend vulkan` host reports [`RenderError::Unsupported`] for a
     /// backend this build does not implement, and
     /// [`RenderError::DeviceUnavailable`] when the Vulkan loader, instance or
@@ -318,25 +336,34 @@ impl Host {
             frame_interval: config.frame_interval,
         })?;
 
-        let headless_handle;
-        let handle: &RawWindowHandle = if config.headless {
-            if config.backend != BackendKind::Null {
-                return Err(HostError::Config(
-                    "headless hosts require the null backend".to_owned(),
-                ));
-            }
-            headless_handle = platform::headless_window_handle();
-            &headless_handle
+        // The frames are drawn either into a presentation surface or into an
+        // offscreen target. A headless host with the Vulkan backend has no
+        // window, so it draws into a target of the surface size; the null
+        // backend keeps its headless surface.
+        let (target, mut render_state): (FrameTarget, RenderState) = if config.headless
+            && config.backend == BackendKind::Vulkan
+        {
+            let render_state = begin_offscreen_render_state(&pipeline)?;
+            let size = (config.surface_size.0.max(1), config.surface_size.1.max(1));
+            let target = create_render_target(&pipeline, RenderTargetDesc::new(size.0, size.1))?;
+            (FrameTarget::Offscreen(target), render_state)
         } else {
-            config.window_handle.as_ref().ok_or_else(|| {
-                HostError::Config(
-                    "no window handle; set `headless` for an offscreen host".to_owned(),
-                )
-            })?
-        };
-        let (surface, mut render_state): (Surface, RenderState) = match &config.display_handle {
-            Some(display) => begin_render_state_with_display(&pipeline, display, handle)?,
-            None => begin_render_state(&pipeline, handle)?,
+            let headless_handle;
+            let handle: &RawWindowHandle = if config.headless {
+                headless_handle = platform::headless_window_handle();
+                &headless_handle
+            } else {
+                config.window_handle.as_ref().ok_or_else(|| {
+                    HostError::Config(
+                        "no window handle; set `headless` for an offscreen host".to_owned(),
+                    )
+                })?
+            };
+            let (surface, render_state): (Surface, RenderState) = match &config.display_handle {
+                Some(display) => begin_render_state_with_display(&pipeline, display, handle)?,
+                None => begin_render_state(&pipeline, handle)?,
+            };
+            (FrameTarget::Surface(surface), render_state)
         };
         // The CPU presentation is installed into the render state before the
         // state is handed to the engine: the engine presents every frame
@@ -356,7 +383,7 @@ impl Host {
 
         let mut engine = engine::Engine::new(engine::EngineParts {
             pipeline,
-            surface,
+            target,
             render_state,
             surface_size: config.surface_size,
             headless: config.headless,
@@ -514,6 +541,20 @@ impl Host {
         self.engine.translation()
     }
 
+    /// Reads the frame the last frame drew into the offscreen target.
+    ///
+    /// The pixels are RGBA8 in device pixels: the target holds the picture
+    /// the projected tree was drawn into, at the host's surface size. A host
+    /// that presents to a surface has no target, so it reads nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::Render`] when the read-back fails, which is the
+    /// case when no frame has been drawn into the target yet.
+    pub fn read_offscreen_frame(&self) -> Result<Option<Vec<u8>>, HostError> {
+        Ok(self.engine.read_offscreen_frame()?)
+    }
+
     /// Returns the logical screen size the presentation fits into the window:
     /// the first scene window's primary layer when it has one, and the
     /// framebuffer size otherwise.
@@ -565,5 +606,79 @@ impl Host {
         self.presented_slot
             .as_ref()
             .and_then(|slot| slot.with_frame(visit))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackendKind, Host, HostConfig, HostError, InjectedFrameTime};
+    use api::blend::BlendMode;
+    use api::error::RenderError;
+    use engine::Rect;
+
+    /// The size of the frame the host draws.
+    const SIZE: (u32, u32) = (64, 48);
+
+    /// The colour of the layer that covers the frame.
+    const COLOUR: [u8; 4] = [24, 28, 40, 255];
+
+    /// Fills the host's scene with one opaque layer that covers the frame.
+    fn fill_scene(host: &mut Host) {
+        let scene = host.scene_mut();
+        let window = scene.add_window("test", SIZE);
+        let layer = scene.add_layer(window, None);
+        let pixels = COLOUR.repeat((SIZE.0 * SIZE.1) as usize);
+        let bitmap = scene.add_bitmap(SIZE.0, SIZE.1, pixels);
+        if let Some(layer) = scene.layer_mut(layer) {
+            layer.visible = true;
+            layer.rect = Rect::new(0, 0, SIZE.0, SIZE.1);
+            layer.bitmap = Some(bitmap);
+            layer.image_width = SIZE.0;
+            layer.image_height = SIZE.1;
+            layer.blend = BlendMode::Replace;
+        }
+    }
+
+    /// The headless Vulkan host draws its frame into an offscreen target.
+    ///
+    /// The host has no window, so the frame is drawn into a target of the
+    /// surface size and read back, on a machine that has a GPU but no
+    /// display.
+    ///
+    /// A machine without a Vulkan device has no GPU path to measure, so the
+    /// test skips there, exactly like the Vulkan cases in the render
+    /// backend's own tests.
+    #[test]
+    fn the_headless_vulkan_host_draws_into_an_offscreen_target() {
+        let config = HostConfig::headless()
+            .with_backend(BackendKind::Vulkan)
+            .with_surface_size(SIZE);
+        let mut host = match Host::new(config) {
+            Ok(host) => host,
+            Err(HostError::Render(RenderError::DeviceUnavailable { .. }))
+            | Err(HostError::Render(RenderError::Unsupported { .. })) => return,
+            Err(error) => panic!("the headless Vulkan host: {error}"),
+        };
+        fill_scene(&mut host);
+
+        let report = host
+            .step(&InjectedFrameTime::new(16.0))
+            .expect("the frame runs");
+        assert_eq!(report.frame_index, 1);
+        assert!(report.presented, "the frame reached the target");
+
+        let pixels = host
+            .read_offscreen_frame()
+            .expect("the read-back succeeds")
+            .expect("the host draws into a target");
+        assert_eq!(pixels.len(), (SIZE.0 * SIZE.1 * 4) as usize);
+        // The GPU path samples the texture in the target's own colour space,
+        // so the round trip is within a level or two of the layer's colour.
+        for (channel, expected) in pixels[0..4].iter().zip(COLOUR) {
+            assert!(
+                channel.abs_diff(expected) <= 2,
+                "the target holds the picture the frame drew: {pixels:?}"
+            );
+        }
     }
 }

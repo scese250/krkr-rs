@@ -927,7 +927,8 @@ fn miss_reports_every_searched_location() {
         ))
     );
     assert!(
-        logs.iter().all(|line| !line.contains("engine.storage: miss")),
+        logs.iter()
+            .all(|line| !line.contains("engine.storage: miss")),
         "a hit must not log: {logs:?}"
     );
 }
@@ -971,7 +972,8 @@ fn resolver_cache_lists_each_auto_path_once() {
     );
     assert_eq!(after_second.misses, 2);
     assert!(
-        logs.iter().any(|line| line.contains("engine.storage: miss")),
+        logs.iter()
+            .any(|line| line.contains("engine.storage: miss")),
         "the cached miss is still reported: {logs:?}"
     );
 }

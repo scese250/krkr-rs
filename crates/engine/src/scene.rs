@@ -20,8 +20,16 @@ use std::sync::Arc;
 
 use api::blend::BlendMode;
 use api::config::CacheLimit;
-use api::geometry::PixelRegion;
+use api::error::RenderError;
+use api::geometry::{PixelRegion, RectF};
 use api::media::DecodedImage;
+
+use render::scene::{RenderContent, RenderNode};
+use render::{
+    RenderPipeline, RenderState, RenderTarget, RenderTargetDesc, Texture, TextureDesc,
+    copy_render_target_to_texture, create_render_target, create_texture, destroy_render_target,
+    drop_texture, read_render_target, render_to_target, upload_texture,
+};
 
 use crate::hasher::{Map, Set, map, set};
 use crate::imagedecode::{ImageOutcome, ImageSizeError, ImageState, PendingImage};
@@ -573,8 +581,64 @@ fn install_blank(bitmap: &mut BitmapState) {
     match blank_transparent(width, height) {
         Some(blank) => bitmap.rgba = blank,
         None => {
-            log::error!("engine: a blank {width}x{height} image could not be allocated");
+            log::error!("engine.scene: a blank {width}x{height} image could not be allocated");
             bitmap.rgba = Vec::new();
+        }
+    }
+}
+
+///
+/// The surface holds premultiplied pixels and the layer's image holds
+/// straight-alpha pixels, so the read-back is divided by its alpha. A pixel
+/// with no alpha has no colour to keep.
+fn unpremultiply_region(pixels: &mut [u8]) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 0 {
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            let value = u32::from(*channel) * 255 / alpha;
+            *channel = value.min(255) as u8;
+        }
+    }
+}
+
+/// Composites the pose over the image's pixels.
+///
+/// The pose is in the straight-alpha form the image holds, so the image's
+/// pixels are composited with the same alpha-correct rule the CPU pass
+/// uses. The pose covers the image's top-left corner: the surface is
+/// anchored at the layer's origin.
+fn composite_pose_over(
+    image: &mut [u8],
+    image_width: u32,
+    pose: &[u8],
+    pose_width: u32,
+    pose_height: u32,
+) {
+    for y in 0..pose_height as usize {
+        for x in 0..pose_width as usize {
+            let index = (y * image_width as usize + x) * 4;
+            let Some(slot) = image.get_mut(index..index + 4) else {
+                return;
+            };
+            let source_index = (y * pose_width as usize + x) * 4;
+            let Some(source) = pose.get(source_index..source_index + 4) else {
+                return;
+            };
+            let Ok(pixel) = <&mut [u8; 4]>::try_from(slot) else {
+                return;
+            };
+            crate::raster::blend_pixel_at(
+                pixel,
+                [source[0], source[1], source[2], source[3]],
+                255,
+                255,
+            );
         }
     }
 }
@@ -966,6 +1030,132 @@ pub struct Scene {
     draw_sources: crate::layer_ops::DrawSources,
     /// The id the next registered source receives.
     next_draw_source: u32,
+    /// The surfaces the layers' poses are drawn into, by the bitmap the
+    /// pose is composed onto.
+    ///
+    /// A surface holds the pose the layer shows, in the premultiplied form
+    /// the backend's composite works in. The layer's own image holds the
+    /// content the pose is drawn over, and the two are brought together
+    /// when a script asks for the pixels.
+    pose_surfaces: Map<u32, PoseSurface>,
+    /// The backend that reads a layer's pose surface back.
+    ///
+    /// The engine installs it: the read-back is a backend operation, and the
+    /// engine owns the pipeline and the render state. The closure takes the
+    /// bitmap the pose belongs to, and answers with the pixels the pose
+    /// shows.
+    pose_sync: Option<PoseSync>,
+    /// The pose's revision, by the bitmap the pose is composed onto.
+    ///
+    /// The revision moves every time the pose is redrawn, so the pixels a
+    /// reader holds are the pose's only while it stays.
+    pose_revisions: Map<u32, u64>,
+    /// The pose's synced pixels, by the bitmap the pose is composed onto.
+    ///
+    /// The pixels are the image's pixels with the pose over them, and the
+    /// revision is the pose's revision they were synced at. The cache holds
+    /// them so a reader borrows them instead of copying the whole image.
+    pose_pixels: Map<u32, (u64, Vec<u8>)>,
+    /// The textures the draw sources are sampled from, by source id.
+    ///
+    /// A source is not a layer image, so the frame does not upload it: the
+    /// backend that draws a list uploads the sources it draws from.
+    draw_textures: Map<u32, Texture>,
+    /// Whether the host draws the layers' draw lists itself.
+    ///
+    /// The compatibility layer sets a layer's draw list and asks the scene
+    /// to draw it. A host that draws the lists on its backend — the engine's
+    /// frame — says so, and the compatibility layer leaves the list to it, so
+    /// the list is drawn once.
+    /// Whether the host draws the layers' draw lists itself.
+    ///
+    /// The host that draws the lists on its backend says so, and the caller
+    /// that sets a list leaves it to the host instead of drawing it on the
+    /// CPU.
+    pub host_draws_lists: bool,
+}
+
+/// The backend that reads a layer's pose surface back.
+///
+/// The closure takes the bitmap the pose belongs to, and answers with the
+/// pixels the pose shows. The composition root builds it: the read-back is a
+/// backend operation, and the engine owns the pipeline and the render state.
+/// The seam that reads a pose's pixels back from the backend.
+type PoseSyncFn = Box<dyn FnMut(u32) -> Result<Option<Vec<u8>>, String> + Send>;
+
+/// The seam the composition root installs: it answers with the pixels a
+/// script reads for a bitmap whose pose lives on the backend.
+pub struct PoseSync(PoseSyncFn);
+
+impl PoseSync {
+    /// Builds the seam from a closure.
+    ///
+    /// The closure is `Send`, so the scene that holds it stays `Send`: the
+    /// engine's decode pool resolves bitmaps off the calling thread and moves
+    /// the scene with them.
+    pub fn new(sync: impl FnMut(u32) -> Result<Option<Vec<u8>>, String> + Send + 'static) -> Self {
+        Self(Box::new(sync))
+    }
+}
+
+impl std::ops::Deref for PoseSync {
+    type Target = PoseSyncFn;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PoseSync {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl std::fmt::Debug for PoseSync {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PoseSync")
+    }
+}
+
+/// The offscreen surface a layer's draw list is drawn into.
+///
+/// The surface holds the pose in the premultiplied form the backend's
+/// composite works in, so the pose accumulates on it from frame to frame
+/// exactly as it accumulates on the CPU. The surface starts transparent:
+/// the pose is independent of the layer's own content, and source-over is
+/// associative, so the pose over the pose of the earlier frames is the same
+/// as the pose over the content.
+///
+/// The surface is anchored at the layer's origin and grows only when the
+/// pose's region outgrows it: the pose animates, so the region changes
+/// every frame, and a surface that followed the region would be created and
+/// destroyed every frame.
+struct PoseSurface {
+    /// The surface the pose is drawn into.
+    target: RenderTarget,
+    /// The texture the surface's pixels are copied into, so the layer's
+    /// render tree samples the pose.
+    texture: Texture,
+    /// The width of the surface in pixels.
+    width: u32,
+    /// The height of the surface in pixels.
+    height: u32,
+    /// Whether the pose was drawn onto the surface.
+    ///
+    /// The surface holds undefined pixels until something is drawn into it,
+    /// so the first draw starts it transparent.
+    drawn: bool,
+}
+
+impl std::fmt::Debug for PoseSurface {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PoseSurface")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Scene {
@@ -996,6 +1186,12 @@ impl Default for Scene {
             removed_bitmaps: BTreeSet::new(),
             draw_sources: crate::hasher::map(),
             next_draw_source: 0,
+            pose_surfaces: crate::hasher::map(),
+            pose_sync: None,
+            pose_revisions: crate::hasher::map(),
+            pose_pixels: crate::hasher::map(),
+            draw_textures: crate::hasher::map(),
+            host_draws_lists: false,
         }
     }
 }
@@ -1704,14 +1900,12 @@ impl Scene {
             // alone and leave the rest of the content as it was.
             //
             // The cache count is the transition's consumer count: the
-            // reference keeps the recalculation region while the caching is
-            // enabled
-            // (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`),
-            // and the transition holds the count for as long as it runs
-            // (`:7869-7876`). The content is the other half of the test: a
-            // layer that never ran a transition still holds a composited
-            // content, and clearing its region left the composite
-            // reconstructing a part of it and leaving the rest stale.
+            // recalculation region is kept while the caching is enabled, and
+            // the transition holds the count for as long as it runs. The
+            // content is the other half of the test: a layer that never ran a
+            // transition still holds a composited content, and clearing its
+            // region left the composite reconstructing a part of it and
+            // leaving the rest stale.
             let keeps_region = scope == ChangeScope::Content
                 || layer.cache_content.is_some()
                 || layer.cache_enabled_count != 0;
@@ -3504,8 +3698,8 @@ impl Scene {
         if preserved < copy_h {
             let missing_rows = copy_h - preserved;
             log::error!(
-                "engine: bitmap #{id} declares {old_w}x{old_h} but holds {available} pixel bytes; \
-                 a resize to {new_w}x{new_h} keeps the fill for {missing_rows} of {copy_h} \
+                "engine.scene: bitmap id={id} declares {old_w}x{old_h} but holds {available} pixel \
+                 bytes; a resize to {new_w}x{new_h} keeps the fill for {missing_rows} of {copy_h} \
                  preserved rows"
             );
         }
@@ -4361,6 +4555,428 @@ impl Scene {
     /// scene's, so the two are borrowed at once.
     pub fn draw_ops_into(&self, dst: &mut BitmapState, ops: &[crate::layer_ops::DrawOp]) {
         crate::layer_ops::draw_ops(dst, ops, &self.draw_sources);
+    }
+
+    /// Draws the layer's draw list on the backend and brings the result back
+    /// into the layer's own image.
+    ///
+    /// The list is the pose the layer shows. The backend draws it into an
+    /// offscreen surface that holds the layer's own pixels, so the draws
+    /// composite onto the pixels the layer already shows — the accumulation
+    /// the earlier frames left there — exactly as the CPU pass composites
+    /// them onto the layer's image. The surface is read back and the region
+    /// it covers replaces the layer's image there, so the image keeps holding
+    /// the pose and a script that reads a pixel reads the pose's pixels.
+    ///
+    /// The surface holds the layer's pixels in the premultiplied form the
+    /// backend's composite works in, and the pixels read back are
+    /// un-premultiplied, so the image holds the same straight-alpha pixels
+    /// the CPU pass leaves there.
+    ///
+    /// Returns whether the list was drawn. A backend that cannot draw the
+    /// list reports the failure; the caller draws the list on the CPU
+    /// instead.
+    pub fn draw_layer_draws_gpu(
+        &mut self,
+        pipeline: &RenderPipeline,
+        state: &mut RenderState,
+        layer_id: u32,
+    ) -> Result<bool, RenderError> {
+        let Some(bitmap_id) = self.layer(layer_id).and_then(|layer| layer.bitmap) else {
+            return Ok(false);
+        };
+        let Some(layer_index) = self.layer_position(layer_id) else {
+            return Ok(false);
+        };
+        // The list is taken out for the call, because the call writes the
+        // scene's own fields while the list is read.
+        let ops = std::mem::take(&mut self.layers[layer_index].draws);
+        let drawn = self.draw_ops_gpu(pipeline, state, &ops, bitmap_id);
+        self.layers[layer_index].draws = ops;
+        drawn
+    }
+
+    /// The layers that carry a draw list, in layer order.
+    pub fn layers_with_draws(&self) -> Vec<u32> {
+        self.layers
+            .iter()
+            .filter(|layer| !layer.draws.is_empty())
+            .map(|layer| layer.id)
+            .collect()
+    }
+
+    /// Draws a list on the backend and leaves the pose on the layer's
+    /// surface.
+    ///
+    /// The steps are the backend's own: the sources are uploaded, the
+    /// surface the pose is drawn into is created, the list is drawn into
+    /// it, and the surface's pixels are copied into the texture the layer's
+    /// render tree samples.
+    ///
+    /// The surface holds the pose the earlier frames left there, so the pose
+    /// accumulates on it exactly as it accumulates on the CPU. The layer's
+    /// own image is not written: the render tree draws the pose over the
+    /// image, and a script that reads the pixels brings the two together on
+    /// demand.
+    fn draw_ops_gpu(
+        &mut self,
+        pipeline: &RenderPipeline,
+        state: &mut RenderState,
+        ops: &[crate::layer_ops::DrawOp],
+        bitmap_id: u32,
+    ) -> Result<bool, RenderError> {
+        if ops.is_empty() {
+            return Ok(false);
+        }
+        let Some(bitmap) = self.bitmap(bitmap_id) else {
+            return Ok(false);
+        };
+        let (bitmap_width, bitmap_height) = (bitmap.width, bitmap.height);
+        if bitmap_width == 0 || bitmap_height == 0 {
+            return Ok(false);
+        }
+        // The sources the list reads are uploaded into textures the backend
+        // samples. A source that has no texture is not drawn.
+        let textures = self.draw_source_textures(pipeline, state, ops)?;
+        // The surface the pose is drawn into: it holds the pose the earlier
+        // frames left there.
+        let (target, texture) =
+            self.pose_surface(pipeline, state, bitmap_id, bitmap_width, bitmap_height)?;
+        // The tree the backend draws: the pose's own draws, in the layer's
+        // own coordinates, over the pose the earlier frames left there.
+        let mut tree = crate::layer_ops::draw_ops_scene(ops, &textures);
+        // The surface holds undefined pixels until something is drawn into
+        // it, so the first draw starts it transparent: the surface then
+        // holds the pose and nothing else.
+        if !self.surface_drawn(bitmap_id) {
+            let start = RenderNode {
+                content: RenderContent::Solid([0.0, 0.0, 0.0, 0.0]),
+                dst: RectF::new(0.0, 0.0, bitmap_width as f32, bitmap_height as f32),
+                blend: BlendMode::Replace,
+                ..RenderNode::default()
+            };
+            let start_id = tree.push(start);
+            let root = tree.root;
+            if let Some(root) = tree.node_mut(root) {
+                root.children.insert(0, start_id);
+            }
+            self.mark_surface_drawn(bitmap_id);
+        }
+        render_to_target(pipeline, state, &target, &tree)?;
+        // The copy: the surface's pixels into the texture the layer's render
+        // tree samples. The pose never travels back to the host.
+        copy_render_target_to_texture(pipeline, state, &target, &texture)?;
+        // The pose is new: the pixels a reader holds are the pose's only
+        // until it is drawn again.
+        let revision = self.pose_revisions.entry(bitmap_id).or_insert(0);
+        *revision = revision.wrapping_add(1);
+        Ok(true)
+    }
+
+    /// The textures the draw sources are sampled from.
+    ///
+    /// A source that already has a texture of its own size keeps it; a
+    /// source whose texture is missing or has another size gets a new one.
+    /// The pixels are uploaded every time, because a source is per-frame
+    /// content: the surfaces a pose composited hold the frame's own pixels.
+    fn draw_source_textures(
+        &mut self,
+        pipeline: &RenderPipeline,
+        state: &mut RenderState,
+        ops: &[crate::layer_ops::DrawOp],
+    ) -> Result<Map<u32, Texture>, RenderError> {
+        let mut textures: Map<u32, Texture> = map();
+        for op in ops {
+            let Some(id) = op.source() else {
+                continue;
+            };
+            if textures.contains_key(&id) {
+                continue;
+            }
+            // The source is cloned out of the table, because the table is
+            // written below and the borrow would outlive it.
+            let Some(source) = self.draw_sources.get(&id).cloned() else {
+                continue;
+            };
+            if source.width == 0 || source.height == 0 {
+                continue;
+            }
+            let existing = self.draw_textures.get(&id).cloned();
+            let texture = match existing {
+                Some(texture)
+                    if texture.width() == source.width && texture.height() == source.height =>
+                {
+                    texture
+                }
+                _ => {
+                    let texture =
+                        create_texture(pipeline, TextureDesc::new(source.width, source.height))?;
+                    self.draw_textures.insert(id, texture.clone());
+                    texture
+                }
+            };
+            upload_texture(
+                pipeline,
+                state,
+                &texture,
+                PixelRegion::new(0, 0, source.width, source.height),
+                source.rgba.as_slice(),
+            )?;
+            textures.insert(id, texture);
+        }
+        Ok(textures)
+    }
+
+    /// The surface a layer's pose is drawn into.
+    ///
+    /// The surface is the size of the layer's image, which covers every
+    /// pixel the pose can reach, and it is created once: the pose animates,
+    /// so the region the draws cover changes every frame, and a surface
+    /// that followed the region would be created and destroyed every frame.
+    fn pose_surface(
+        &mut self,
+        pipeline: &RenderPipeline,
+        state: &mut RenderState,
+        bitmap_id: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(RenderTarget, Texture), RenderError> {
+        let fits = self
+            .pose_surfaces
+            .get(&bitmap_id)
+            .is_some_and(|surface| surface.width >= width && surface.height >= height);
+        if !fits {
+            if let Some(surface) = self.pose_surfaces.remove(&bitmap_id) {
+                destroy_render_target(pipeline, state, surface.target);
+                drop_texture(pipeline, state, surface.texture);
+            }
+            let target = create_render_target(pipeline, RenderTargetDesc::new(width, height))?;
+            let texture = create_texture(pipeline, TextureDesc::new(width, height))?;
+            self.pose_surfaces.insert(
+                bitmap_id,
+                PoseSurface {
+                    target,
+                    texture,
+                    width,
+                    height,
+                    drawn: false,
+                },
+            );
+        }
+        let Some(surface) = self.pose_surfaces.get(&bitmap_id) else {
+            return Err(RenderError::InvalidArgument {
+                message: "the pose surface of a layer disappeared".to_owned(),
+            });
+        };
+        Ok((surface.target.clone(), surface.texture.clone()))
+    }
+
+    /// Whether the pose was drawn onto the surface.
+    fn surface_drawn(&self, bitmap_id: u32) -> bool {
+        self.pose_surfaces
+            .get(&bitmap_id)
+            .is_some_and(|surface| surface.drawn)
+    }
+
+    /// Records that the pose was drawn onto the surface.
+    fn mark_surface_drawn(&mut self, bitmap_id: u32) {
+        if let Some(surface) = self.pose_surfaces.get_mut(&bitmap_id) {
+            surface.drawn = true;
+        }
+    }
+
+    /// The texture the layer's pose is sampled from, and the rectangle it
+    /// covers in the layer's own pixels.
+    ///
+    /// The pose lives on the backend, so the layer's render tree draws it
+    /// over the layer's own image.
+    pub fn layer_pose(&self, layer_id: u32) -> Option<(Texture, RectF)> {
+        let bitmap_id = self.layer(layer_id).and_then(|layer| layer.bitmap)?;
+        let surface = self.pose_surfaces.get(&bitmap_id)?;
+        Some((
+            surface.texture.clone(),
+            RectF::new(0.0, 0.0, surface.width as f32, surface.height as f32),
+        ))
+    }
+
+    /// Reads the pose surface back, and un-premultiplies what it holds.
+    ///
+    /// The pose lives on the backend, so the pixels are read back when a
+    /// script asks for them. A layer that shows no pose reads nothing.
+    pub fn read_pose_pixels(
+        &mut self,
+        pipeline: &RenderPipeline,
+        state: &mut RenderState,
+        bitmap_id: u32,
+    ) -> Result<Option<Vec<u8>>, RenderError> {
+        let Some(surface) = self.pose_surfaces.get(&bitmap_id) else {
+            return Ok(None);
+        };
+        let target = surface.target.clone();
+        let (width, height) = (surface.width, surface.height);
+        // The read-back: the surface's pixels are premultiplied, and the
+        // image holds straight-alpha pixels.
+        let mut pose = vec![0u8; width as usize * height as usize * 4];
+        read_render_target(
+            pipeline,
+            state,
+            &target,
+            PixelRegion::new(0, 0, width, height),
+            &mut pose,
+        )?;
+        unpremultiply_region(&mut pose);
+        Ok(Some(pose))
+    }
+
+    /// The image's pixels with the pose composited over them.
+    ///
+    /// The image is not written: the pose is composited over the image's own
+    /// pixels, so a second read brings the same pixels and the pose is not
+    /// composited twice.
+    pub fn compose_pose_pixels(
+        &mut self,
+        bitmap_id: u32,
+        pose: &[u8],
+    ) -> Result<Option<Vec<u8>>, RenderError> {
+        let Some(surface) = self.pose_surfaces.get(&bitmap_id) else {
+            return Ok(None);
+        };
+        let (pose_width, pose_height) = (surface.width, surface.height);
+        let Some(image) = self.bitmap(bitmap_id) else {
+            return Ok(None);
+        };
+        let width = image.width;
+        if pose_width > width || pose_height > image.height {
+            return Ok(None);
+        }
+        let expected = pose_width as usize * pose_height as usize * 4;
+        if pose.len() != expected {
+            return Ok(None);
+        }
+        let mut pixels = image.rgba.clone();
+        composite_pose_over(&mut pixels, width, pose, pose_width, pose_height);
+        Ok(Some(pixels))
+    }
+
+    /// Drops the pose surface of a bitmap, so the layer's image carries
+    /// the pose alone.
+    ///
+    /// A host that cannot draw the pose on the backend draws it on the CPU,
+    /// and the image is then the whole picture: the pose surface would
+    /// double it. The structure changes, so the layer's render tree is
+    /// projected again without the pose.
+    pub fn drop_pose_surface(
+        &mut self,
+        pipeline: &RenderPipeline,
+        state: &mut RenderState,
+        bitmap_id: u32,
+    ) -> bool {
+        let Some(surface) = self.pose_surfaces.remove(&bitmap_id) else {
+            return false;
+        };
+        destroy_render_target(pipeline, state, surface.target);
+        drop_texture(pipeline, state, surface.texture);
+        self.touch_structure();
+        true
+    }
+
+    /// Installs the backend that reads a pose surface back.
+    pub fn set_pose_sync(&mut self, sync: PoseSync) {
+        self.pose_sync = Some(sync);
+    }
+
+    /// The pixels a script reads for a bitmap: the layer's image with the
+    /// pose composited over it.
+    ///
+    /// The pose lives on the backend, so the pixels are read back when a
+    /// script asks for them. A host that draws no pose has nothing to add,
+    /// and the image's own pixels are the answer.
+    ///
+    /// A layer that shows no pose reads nothing: the check is the first
+    /// thing that happens, and the seam is not called.
+    ///
+    /// The pixels are a copy of the cached ones, so a second read copies the
+    /// cache and not the device.
+    pub fn read_pixels(&mut self, bitmap_id: u32) -> Result<Option<Vec<u8>>, String> {
+        if !self.sync_pose_pixels(bitmap_id)? {
+            return Ok(None);
+        }
+        Ok(self
+            .pose_pixels
+            .get(&bitmap_id)
+            .map(|(_, pixels)| pixels.clone()))
+    }
+
+    /// One pixel a script reads for a bitmap: the layer's image with the pose
+    /// composited over it.
+    ///
+    /// The pixel is borrowed out of the cached pixels, so a single-pixel read
+    /// copies nothing.
+    pub fn read_pixel(
+        &mut self,
+        bitmap_id: u32,
+        x: i32,
+        y: i32,
+    ) -> Result<Option<[u8; 4]>, String> {
+        if !self.sync_pose_pixels(bitmap_id)? {
+            return Ok(None);
+        }
+        // The image's own size: the cached pixels have its layout.
+        let Some((width, height)) = self
+            .bitmap(bitmap_id)
+            .map(|image| (image.width, image.height))
+        else {
+            return Ok(None);
+        };
+        let (Ok(column), Ok(row)) = (u32::try_from(x), u32::try_from(y)) else {
+            return Ok(None);
+        };
+        if column >= width || row >= height {
+            return Ok(None);
+        }
+        let index = (row as usize * width as usize + column as usize) * 4;
+        let Some(pixel) = self
+            .pose_pixels
+            .get(&bitmap_id)
+            .and_then(|(_, pixels)| pixels.get(index..index + 4))
+        else {
+            return Ok(None);
+        };
+        Ok(Some([pixel[0], pixel[1], pixel[2], pixel[3]]))
+    }
+
+    /// Brings the cached pixels up to date, and says whether there are any.
+    ///
+    /// A layer that shows no pose reads nothing: the check is the first
+    /// thing that happens, and the seam is not called. A cache that is
+    /// current answers from it, and the seam is not called either. Only a
+    /// stale cache reads the pose surface back.
+    ///
+    /// The answer is whether the cache holds pixels: a bitmap that shows no
+    /// pose has none.
+    fn sync_pose_pixels(&mut self, bitmap_id: u32) -> Result<bool, String> {
+        if !self.pose_surfaces.contains_key(&bitmap_id) {
+            return Ok(false);
+        }
+        let revision = self.pose_revisions.get(&bitmap_id).copied().unwrap_or(0);
+        if let Some((cached, _)) = self.pose_pixels.get(&bitmap_id)
+            && *cached == revision
+        {
+            return Ok(true);
+        }
+        // The seam: the engine reads the surface back and composites the
+        // pose over the image's pixels.
+        let Some(mut sync) = self.pose_sync.take() else {
+            return Ok(false);
+        };
+        let result = sync(bitmap_id);
+        self.pose_sync = Some(sync);
+        let Some(pixels) = result? else {
+            self.pose_pixels.remove(&bitmap_id);
+            return Ok(false);
+        };
+        self.pose_pixels.insert(bitmap_id, (revision, pixels));
+        Ok(true)
     }
 
     /// Draws the layer's draw list into the layer's own image.

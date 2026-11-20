@@ -315,6 +315,72 @@ impl NullRenderPipeline {
         read_region(&image.desc, &image.pixels, region, out)
     }
 
+    /// Copies the pixels of an offscreen `target` into the CPU storage of
+    /// `texture`.
+    ///
+    /// The copy replaces the texture's pixels: the null backend has no
+    /// device of its own, so the bytes are moved on the host.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidArgument`] when the state does not belong to
+    /// this backend or the texture is smaller than the target, and
+    /// [`RenderError::Framebuffer`] when the target is not owned by the state.
+    pub fn copy_render_target_to_texture(
+        &self,
+        state: &mut RenderState,
+        target: &RenderTarget,
+        texture: &Texture,
+    ) -> Result<(), RenderError> {
+        let null = null_state_mut(state)?;
+        let NullState {
+            render_targets,
+            textures,
+            ..
+        } = null;
+        let source = render_targets
+            .get(&target.key())
+            .ok_or_else(|| RenderError::Framebuffer {
+                message: "render target is not owned by this render state".to_owned(),
+            })?;
+        let source_desc = source.desc;
+        let texture_desc = *texture.desc();
+        if texture_desc.width < source_desc.width || texture_desc.height < source_desc.height {
+            return Err(RenderError::InvalidArgument {
+                message: format!(
+                    "the {}x{} texture is smaller than the {}x{} render target",
+                    texture_desc.width, texture_desc.height, source_desc.width, source_desc.height
+                ),
+            });
+        }
+        let bytes_per_pixel = source_desc.format.bytes_per_pixel() as usize;
+        let total = usize::try_from(texture_desc.base_byte_len()).map_err(|_| {
+            RenderError::OutOfMemory {
+                message: "texture is too large for the host address space".to_owned(),
+            }
+        })?;
+        let image = textures.entry(texture.key()).or_insert_with(|| NullImage {
+            desc: texture_desc,
+            pixels: vec![0; total],
+            uploads: 0,
+            bytes_uploaded: 0,
+        });
+        // The target's rows replace the texture's rows; the columns the
+        // target does not cover keep the texture's own.
+        for row in 0..source_desc.height as usize {
+            let start = row * source_desc.width as usize * bytes_per_pixel;
+            let end = start + source_desc.width as usize * bytes_per_pixel;
+            let offset = row * texture_desc.width as usize * bytes_per_pixel;
+            image.pixels[offset..offset + (end - start)]
+                .copy_from_slice(&source.pixels[start..end]);
+        }
+        image.uploads = image.uploads.saturating_add(1);
+        image.bytes_uploaded = image
+            .bytes_uploaded
+            .saturating_add(source.pixels.len() as u64);
+        Ok(())
+    }
+
     /// Installs the slot the presented frames are composited into.
     ///
     /// Every frame the backend presents is composited on the CPU and stored
@@ -793,6 +859,51 @@ mod tests {
             node.children = vec![child];
         }
         scene
+    }
+
+    /// A render target's pixels are copied into a texture without the host
+    /// reading them: the copy moves the bytes the target holds.
+    #[test]
+    fn a_render_target_is_copied_into_a_texture() {
+        let pipeline = NullRenderPipeline::new();
+        let mut state = pipeline.begin_offscreen().expect("offscreen state");
+        let target = pipeline
+            .create_render_target(RenderTargetDesc::new(2, 2))
+            .expect("target");
+        let texture = pipeline
+            .create_texture(TextureDesc::new(2, 2))
+            .expect("texture");
+        // The target holds one solid red quad.
+        let mut scene = RenderScene::with_root_node();
+        let root = scene.root;
+        let child = scene.push(RenderNode {
+            parent: Some(root),
+            content: RenderContent::Solid([1.0, 0.0, 0.0, 1.0]),
+            dst: RectF::new(0.0, 0.0, 2.0, 2.0),
+            ..RenderNode::default()
+        });
+        if let Some(node) = scene.node_mut(root) {
+            node.children = vec![child];
+        }
+        pipeline
+            .render_to_target(&mut state, &target, &scene)
+            .expect("render");
+        pipeline
+            .copy_render_target_to_texture(&mut state, &target, &texture)
+            .expect("copy");
+
+        let StateKind::Null(null) = &state.kind else {
+            panic!("the null backend's state");
+        };
+        let image = null
+            .textures
+            .get(&texture.key())
+            .expect("the texture's storage");
+        assert_eq!(
+            image.pixels,
+            vec![255u8, 0, 0, 255],
+            "the texture holds the target's pixels"
+        );
     }
 
     #[test]

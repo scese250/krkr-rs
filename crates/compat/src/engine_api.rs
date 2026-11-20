@@ -21,6 +21,11 @@
 // The layer geometry operations L3 drives (`internal_set_image_size`,
 // `set_layer_image_size`, `layer_size_changed`, the cache-count pair) are
 // methods on the re-exported `Scene`.
+//
+// `Scene::read_pixels` is one of them: a layer's pose may live on the
+// backend, so the pixels a script reads are the image's pixels with the
+// pose composited over them. L3 asks the scene for them before it reads a
+// pixel, and the scene asks the engine, which owns the backend.
 pub(crate) use engine::{
     BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
     TransitionFrame,

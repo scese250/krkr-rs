@@ -769,6 +769,29 @@ fn append_window<F>(
                 ..RenderNode::default()
             });
             state.next_z = state.next_z.saturating_add(1);
+
+            // The pose the layer shows lives on the backend: the pose
+            // surface is drawn over the layer's own image, so the
+            // presentation needs no CPU pixels. The surface mirrors the
+            // image's layout, so it is placed where the image is.
+            if let Some((pose, _)) = scene.layer_pose(layer_id) {
+                state.nodes.push(RenderNode {
+                    parent: Some(parent_node),
+                    content: RenderContent::Texture(pose),
+                    dst,
+                    src,
+                    opacity,
+                    visible: true,
+                    z: state.next_z,
+                    // The pose surface holds premultiplied pixels, so it
+                    // composites with the premultiplied source-over.
+                    blend: BlendMode::AddAlpha,
+                    hold_alpha: layer.hold_alpha,
+                    clip: composed_clip(&node_composed),
+                    ..RenderNode::default()
+                });
+                state.next_z = state.next_z.saturating_add(1);
+            }
         };
 
         if !state.nodes.is_empty() {

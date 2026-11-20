@@ -925,6 +925,10 @@ impl GameHost {
         // fast if none exists; a headless host gets the null backend.
         let audio = AudioOutput::open(host.is_headless())?;
         let mut host = Box::new(host);
+        // The pose the motion player draws lives on the backend, so the
+        // scene asks the engine to read it back when a script reads the
+        // pixels of a layer that shows a pose.
+        install_pose_sync(&mut host);
         let fs = FileSystem::host(base_dir.clone());
         // A directory-only launch (no explicit `--archive`) mounts every
         // `*.xp3` found under the base directory
@@ -1365,6 +1369,30 @@ fn log_startup(
     );
 }
 
+/// Installs the seam that reads a pose surface back into the CPU image.
+///
+/// The pose the motion player draws lives on the backend, so a script that
+/// reads the pixels of a layer that shows a pose asks the scene for them,
+/// and the scene asks the engine, which owns the backend. The seam reaches
+/// the engine, which lives in the boxed host from here on.
+#[allow(unsafe_code)] // the seam reaches the engine, which outlives it
+fn install_pose_sync(host: &mut Box<Host>) {
+    // The engine's address, as a number: the seam is `Send`, so it carries
+    // the address and not a pointer.
+    let engine = host.engine_mut() as *mut engine::Engine as usize;
+    host.engine_mut()
+        .install_pose_sync(engine::scene::PoseSync::new(move |bitmap| {
+            let engine = engine as *mut engine::Engine;
+            // SAFETY: the engine lives in the boxed host, which outlives the
+            // scene that holds this seam, and the read-back touches only the
+            // engine's own pipeline and render state. The closure is called
+            // only from the thread that owns the engine, which is the thread
+            // that owns the scene that holds it: the engine is
+            // single-threaded, so the call never crosses a thread boundary.
+            unsafe { (*engine).sync_pose_pixels(bitmap) }.map_err(|error| error.to_string())
+        }));
+}
+
 /// The path an archive is mounted under.
 ///
 /// A relative path is resolved against the mount root, the same way the
@@ -1769,21 +1797,17 @@ mod tests {
         }
         // total was 480 + 7.5 + 10 + 1 + 3 = 501.5, so 520 - 501.5 - 15 = 3.5.
         assert!(
-            report.contains(
-                concat!(
-                    "residual tick_residual_ms=4.0 host_residual_ms=0.3 ",
-                    "unaccounted_ms=3.5 pool_jobs=2"
-                ),
-            ),
+            report.contains(concat!(
+                "residual tick_residual_ms=4.0 host_residual_ms=0.3 ",
+                "unaccounted_ms=3.5 pool_jobs=2"
+            ),),
             "the report names the residuals and the pool's jobs: {report}"
         );
         assert!(
-            report.contains(
-                concat!(
-                    "total body_ms=480.0 tick_ms=487.5 host_sync_ms=0.5 ",
-                    "host_total_ms=11.0 total_ms=501.5 platform_wait_ms=15.0"
-                ),
-            ),
+            report.contains(concat!(
+                "total body_ms=480.0 tick_ms=487.5 host_sync_ms=0.5 ",
+                "host_total_ms=11.0 total_ms=501.5 platform_wait_ms=15.0"
+            ),),
             "the report names the totals: {report}"
         );
         assert_eq!(timings.present_ms, 2.5);
@@ -1889,21 +1913,17 @@ mod tests {
         }
 
         assert!(
-            report.contains(
-                concat!(
-                    "residual tick_residual_ms=4.0 host_residual_ms=0.3 ",
-                    "unaccounted_ms=3.5 pool_jobs=2"
-                ),
-            ),
+            report.contains(concat!(
+                "residual tick_residual_ms=4.0 host_residual_ms=0.3 ",
+                "unaccounted_ms=3.5 pool_jobs=2"
+            ),),
             "the report names the residuals and the pool's jobs: {report}"
         );
         assert!(
-            report.contains(
-                concat!(
-                    "total body_ms=480.0 tick_ms=487.5 host_sync_ms=0.5 ",
-                    "host_total_ms=11.0 total_ms=501.5 platform_wait_ms=15.0"
-                ),
-            ),
+            report.contains(concat!(
+                "total body_ms=480.0 tick_ms=487.5 host_sync_ms=0.5 ",
+                "host_total_ms=11.0 total_ms=501.5 platform_wait_ms=15.0"
+            ),),
             "the report names the totals: {report}"
         );
     }
@@ -1942,12 +1962,10 @@ mod tests {
             "the phases are no costs of their own: {report}"
         );
         assert!(
-            report.contains(
-                concat!(
-                    "front_end lexer_ms=0.5 parser_ms=1.0 generator_ms=0.3 ",
-                    "image_ms=0.2 residual_ms=0.0 total_ms=2.0"
-                ),
-            ),
+            report.contains(concat!(
+                "front_end lexer_ms=0.5 parser_ms=1.0 generator_ms=0.3 ",
+                "image_ms=0.2 residual_ms=0.0 total_ms=2.0"
+            ),),
             "the report breaks the compilation down: {report}"
         );
     }
@@ -1978,14 +1996,8 @@ mod tests {
             report.contains("cost generator=2.5"),
             "report was: {report}"
         );
-        assert!(
-            report.contains("cost lexer=2.0"),
-            "report was: {report}"
-        );
-        assert!(
-            report.contains("cost image=0.5"),
-            "report was: {report}"
-        );
+        assert!(report.contains("cost lexer=2.0"), "report was: {report}");
+        assert!(report.contains("cost image=0.5"), "report was: {report}");
         assert!(
             report.contains("residual residual_ms=0.0"),
             "report was: {report}"

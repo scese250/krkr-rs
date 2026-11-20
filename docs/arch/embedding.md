@@ -37,7 +37,7 @@ L2 is included.
 | `api` | L1 | the shared value types (`BlendMode`, `RectF`, `InputEvent`, `AudioSpec`, `FontMetrics`) and the typed error enums (`FsError`, `MediaError`, `RenderError`, `AudioError`, `GlyphError`) |
 | `fs` | L1 | the stateless file system — a host-directory backend and an in-memory backend — and the XP3 container parse |
 | `media` | L1 | the stateless codecs: image decode/encode, audio decode, video decode, TLG, YUV |
-| `render` | L1 | the render pipeline (a null backend and a Vulkan backend), the surface, the render state, the texture, the draw tree, the font system |
+| `render` | L1 | the render pipeline (a null backend and a Vulkan backend), the surface, the offscreen target, the render state, the texture, the draw tree, the font system |
 | `platform` | L1 | the window and its event loop, the ticker, the audio output device, the system font directories, the process metrics |
 | `psd` | L1 | the PSB container and the PSD image decoder, as plain functions over bytes |
 
@@ -190,7 +190,7 @@ and projection, so its change is in the frame being drawn.
 A failure is a message: it reaches the caller as `EngineError::Frame` and
 the frame is abandoned without drawing.
 
-### 3.3 The render surface — values you construct
+### 3.3 The render objects — values you construct
 
 ```rust
 // crates/platform/render/src/lib.rs
@@ -211,10 +211,11 @@ pub fn begin_render_state_with_display(
 (`TextureFormat::Rgba8Srgb`), the validation flag and the frame interval
 that bounds the presentation wait.
 
-The engine takes the pipeline, the surface and the render state over in one
-`engine::EngineParts` and keeps no copy. The surface size it is given is the
-**device** size in physical pixels; it can be changed later with
-`Engine::resize`.
+The engine takes the pipeline, the frame target and the render state over in
+one `engine::EngineParts` and keeps no copy. The target says where the frames
+are drawn: a surface to present to, or an offscreen target a host with no
+window reads back. The surface size it is given is the **device** size in
+physical pixels; it can be changed later with `Engine::resize`.
 
 There is no plug point here: `RenderPipeline` holds a private backend
 discriminant, so a third-party render backend cannot be registered from
@@ -440,7 +441,7 @@ what to draw.
 ```rust
 use std::time::Duration;
 
-use engine::{Engine, EngineParts, GameFrame, InjectedFrameTime};
+use engine::{Engine, EngineParts, FrameTarget, GameFrame, InjectedFrameTime};
 use platform::{
     EventHandler, Flow, FramePacing, PlatformConfig, PlatformError, PlatformEvent, PlatformWindow,
 };
@@ -514,11 +515,11 @@ impl EventHandler for MyApp {
                 }
             };
 
-        // The engine takes the pipeline, the surface and the render state
+        // The engine takes the pipeline, the frame target and the render state
         // over. The surface size is the device size in physical pixels.
         match Engine::new(EngineParts {
             pipeline,
-            surface,
+            target: FrameTarget::Surface(surface),
             render_state,
             surface_size: window.size(),
             headless: false,
@@ -689,17 +690,19 @@ counts as zero.
 7. fit the presentation again, because the hook may have resized a window's
    primary layer;
 8. refresh the render-only overlay, if you installed one;
-9. upload the dirty bitmap regions and prune the textures whose bitmap is
-   gone;
-10. project the scene when its structure revision changed;
-11. run `GameFrame::after_project(drawn_layers)`;
-12. fit the presentation again, upload again, and project again if the hook
+9. draw the layers' draw lists — a layer's pose is drawn on the backend, into
+   the layer's own pose surface;
+10. upload the dirty bitmap regions and prune the textures whose bitmap is
+    gone;
+11. project the scene when its structure revision changed;
+12. run `GameFrame::after_project(drawn_layers)`;
+13. fit the presentation again, upload again, and project again if the hook
     changed the scene's structure;
-13. **one** render call — and only when the scene changed: a frame with
-    nothing to show does not draw at all, and the previous frame's contents
-    stay on screen;
-14. recover a lost surface, record the frame in the presentation stall, bump
-   the frame counter and return the report.
+14. **one** render call — into the surface, or into the offscreen target — and
+    only when the scene changed: a frame with nothing to show does not draw
+    at all, and the previous frame's contents stay on screen;
+15. recover a lost surface, record the frame in the presentation stall, bump
+    the frame counter and return the report.
 
 A size pair that cannot be fitted skips everything that draws and returns a
 report with no statistics.
@@ -712,7 +715,7 @@ report with no statistics.
 |---|---|
 | `frame_index` | the frames drawn so far, counting this one |
 | `elapsed_ms` | the frame clock this frame ran at |
-| `presented` | whether the frame reached the display |
+| `presented` | whether the frame reached its destination: the display for a surface, the offscreen target otherwise |
 | `stats` | the null backend's per-frame counters, `None` on a GPU backend |
 | `sync_ms`, `upload_ms`, `prune_ms` | the bitmap-to-texture costs |
 | `project_ms` | the projection cost |
@@ -782,11 +785,11 @@ position-carrying events (the pointer move and the touch) and passing every
 other event through unchanged.
 
 **A device resize moves nothing in the scene.** `Engine::resize(size)`
-rebinds the surface to a new device size; the window's client size and the
-primary layer's rect are untouched, and the presentation refits the screen
-into the new framebuffer. The other direction — a script-side window size —
-travels through `Engine::take_window_resize()`, and you apply it to your
-own window.
+rebinds the surface to a new device size, or replaces the offscreen target
+with one of that size; the window's client size and the primary layer's rect
+are untouched, and the presentation refits the screen into the new
+framebuffer. The other direction — a script-side window size — travels through
+`Engine::take_window_resize()`, and you apply it to your own window.
 
 ---
 

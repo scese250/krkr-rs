@@ -87,15 +87,20 @@ fn content_bytes(scene: &Scene, content: u32) -> Vec<u8> {
         .clone()
 }
 
-/// A change to one contributor marks that contributor's own area, and the
-/// ancestors hold it, so the composite of the root redraws the area alone.
+/// A change to one contributor marks the area the ancestor holds, so the
+/// composite of the root redraws the area alone.
+///
+/// The region belongs to the content a layer holds: a layer that holds no
+/// content has nothing to reconstruct and keeps no region, and the ancestor
+/// that holds the composite keeps the area.
 #[test]
 fn a_change_marks_the_area_of_the_layer_that_changed() {
     let (mut scene, root, contributors) = scene();
     let changed = contributors[3];
     let area = Rect::new(0, 0, 88, 97);
-    // The contributor caches too, so it keeps a region of its own.
-    scene.inc_cache_enabled_count(changed);
+    // The tree composites once, so the root holds the content the region
+    // marks.
+    render_layer_subtree(&mut scene, root).expect("the tree composites");
 
     assert_eq!(
         scene.layer_content_region(root),
@@ -111,8 +116,8 @@ fn a_change_marks_the_area_of_the_layer_that_changed() {
 
     assert_eq!(
         scene.layer_content_region(changed),
-        Some(area),
-        "the layer marks its own rectangle"
+        None,
+        "a contributor that holds no content keeps no region of its own"
     );
     assert_eq!(
         scene.layer_content_region(root),

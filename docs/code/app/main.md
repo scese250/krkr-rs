@@ -26,7 +26,7 @@ krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan]
 
 | option | value | default | effect |
 |---|---|---|---|
-| `--headless` | — | off | run the offscreen frame loop; needs neither a display nor a GPU |
+| `--headless` | — | off | run the offscreen frame loop; it needs no display, and no GPU unless `--backend vulkan` asks for one |
 | `--frames N` | frames | 120 | how many frames the headless loop steps |
 | `--fps N` | `1..=1000` | 60 | the frame-rate limit; paces the windowed loop and the headless step |
 | `--backend` | `null`, `vulkan` (`vk`) | `null` | the render backend to create |
@@ -51,15 +51,18 @@ configuration failure prints the message plus the usage and exits with code
 `2`; a failed run exits with code `1`.
 
 `--backend vulkan` needs a real window with a display connection (Wayland /
-X11 / XCB); the windowed host passes both the window and the display handle
-so a Vulkan surface can be created. The headless path has no display and
-therefore uses the null backend.
+X11 / XCB) for a **windowed** run: the windowed host passes both the window
+and the display handle so a Vulkan surface can be created. A **headless** run
+has no window, so it draws every frame into an offscreen target of the
+surface size, which `Host::read_offscreen_frame` reads back.
 
 `--backend null` needs no GPU: the scene is composited by the CPU software
 rasterizer, and a windowed run shows that frame through the platform's
-software presenter. `--dump-frame PATH` writes the presented frame as a PNG
-(it needs the null backend), so a run's picture can be inspected without a
-display.
+software presenter. `--dump-frame PATH` writes the presented frame as a PNG;
+the dumped frame is the one the CPU rasterizer composited, so the option
+needs the null backend and the launcher refuses it with the Vulkan one. A
+headless Vulkan frame is read back through `Host::read_offscreen_frame`
+instead, so a host can inspect the picture without a display.
 
 `--slow-report-ms N` sets the **report budget**: the total wall-clock time
 the run may spend producing slow-frame reports. The budget measures the
@@ -177,18 +180,19 @@ after the windowed event loop exits.
 
 ### The headless loop
 
-`run_headless` builds a headless `HostConfig` (null backend, the requested
-overlay and cache policy), opens a `GameHost` when the launch names a game,
-and steps `frames` frames.
+`run_headless` builds a headless `HostConfig` (the requested backend, the
+requested overlay and cache policy), opens a `GameHost` when the launch names
+a game, and steps `frames` frames.
 The step waits for the frame's deadline, so the frames are as far apart as
 the limit says, and the engine's clock — which advances by the time the loop
 measured between the frames — is the wall clock: the script's tick count
 measures the same time here as it does in a windowed run.
-It prints the null backend's counters and the scene summary — the window
-count, the layer count, the bitmap count and, per window, how many layers
-the window's root list can actually reach. That last number is the
-reachability the reference's draw path uses, so a scene with many unreached
-layers renders as an empty window and the summary says so.
+It prints the counters the backend reports — the null backend reports them, a
+GPU backend reports none — and the scene summary — the window count, the
+layer count, the bitmap count and, per window, how many layers the window's
+root list can actually reach. That last number is the reachability the
+reference's draw path uses, so a scene with many unreached layers renders as
+an empty window and the summary says so.
 
 ### The frame-time distribution
 

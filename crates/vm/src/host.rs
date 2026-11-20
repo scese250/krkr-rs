@@ -607,7 +607,9 @@ mod tests {
         // also emits a `... at position` console record, which does not match
         // exactly.
         assert!(
-            lines.iter().any(|line| line == "DEBUG vm.tjs: boom-message"),
+            lines
+                .iter()
+                .any(|line| line == "DEBUG vm.tjs: boom-message"),
             "the caught exception must reach the engine log: {lines:?}"
         );
     }

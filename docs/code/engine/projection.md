@@ -107,6 +107,10 @@ For every window, in `Scene::windows` order, and for every layer in
    and opacity, source 2 over it at the frame's alpha (source-over, because it
    fades), each with its own `dst`/`src` inside the frame (`Scroll`) or the
    whole frame (`CrossFade`).
+8. **Emit the pose.** A layer whose pose lives on the backend draws its own
+   image and then the pose over it: the pose surface mirrors the image's
+   layout, so it is placed where the image is, and it composites with the
+   premultiplied source-over. The layer is reported once, for both nodes.
 
 The scene root carries `background = [0, 0, 0, 1]` (opaque black) and a
 single monotonic `z` sequence shared by all windows of the scene, so siblings
@@ -130,6 +134,8 @@ across windows are globally ordered by insertion.
   once, the second source's node is the layer's `nearest` node for its
   children, and a whole-subtree frame covers the children exactly like a cache
   bitmap (they are reported, not emitted).
+* **A layer's pose is a second node of the same layer**: its own image is
+  drawn first, and the pose surface over it.
 * **A transition draw takes precedence over the cached subtree.** While a
   layer owns a transition frame or effect draw, its own `cache_bitmap` is
   not drawn: the frame/effect replaces the image the cache holds. A frame
@@ -209,6 +215,9 @@ project_scene_report(scene, |id| textures.get(&id).cloned())
   agree with the CPU blend within the documented tolerance, see
   [trans.md](trans.md) §6.1), and an engine frame that draws a composited
   transition without a display bitmap.
+* `crates/engine/tests/motion_draw_list_gpu.rs` — the pose on the backend
+  against the CPU path: the two draw the same picture, and they differ only
+  where a pixel is sampled from the other texel.
 
 ---
 

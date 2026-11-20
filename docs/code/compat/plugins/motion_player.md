@@ -522,15 +522,17 @@ same way when it renders.
 ### The draw pipeline
 
 `Player.draw(target)` evaluates the node tree and paints it into the target
-layer's image through the engine's layer system:
+layer through the engine's layer system:
 
-* the target image is **not cleared** by the ordinary draw path: the pose is
-  painted over whatever the target already holds, so pixels the pose does not
+* the target is **not cleared** by the ordinary draw path: the pose is
+  painted over what the target already holds, so pixels the pose does not
   cover survive and the target's alpha accumulates from frame to frame
   (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1125-1134`,
-  `reference/cpp/core/visual/tvpgl.cpp:602-616`). `Player.clearEnabled`
-  selects the render path — an item is drawn through a scratch surface of its
-  own instead of straight onto the target
+  `reference/cpp/core/visual/tvpgl.cpp:602-616`). The pose is drawn on the
+  backend, so the accumulation is on the layer's own pose surface and the
+  target's image keeps the content the pose is drawn over.
+  `Player.clearEnabled` selects the render path — an item is drawn through a
+  scratch surface of its own instead of straight onto the target
   (`reference/cpp/plugins/motionplayer/PlayerRenderInternal.cpp:443-451`) —
   and `Player.setClearColor` writes a colour nothing reads
   (`reference/cpp/plugins/motionplayer/PlayerRender.cpp:11`,
@@ -588,7 +590,7 @@ layer's image through the engine's layer system:
 * `getLayerNames` reports the label map's keys: a layer without a label
   contributes none, and a label several nodes share appears once.
 * the target layer's own geometry, opacity and visibility are left alone; the
-  draw only writes pixels and marks the image modified
+  draw registers the pose and marks the image modified
   (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1094-1135`,
   `PlayerDrawDispatch.cpp:236-285`).
 

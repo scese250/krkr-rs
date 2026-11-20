@@ -316,9 +316,11 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
             launch.runtime.preload_archives,
         )?
         .with_slow_report_budget(launch.slow_report_budget)
-        .with_slow_frame_threshold(launch.slow_frame_threshold_ms.unwrap_or(
-            crate::game::DEFAULT_SLOW_FRAME_MS,
-        ));
+        .with_slow_frame_threshold(
+            launch
+                .slow_frame_threshold_ms
+                .unwrap_or(crate::game::DEFAULT_SLOW_FRAME_MS),
+        );
         println!(
             "krkr headless game: backend={} frames={} archives={}",
             game.host().backend().name(),
@@ -774,8 +776,7 @@ impl EventHandler for DesktopApp {
                                     self.slow_frame_threshold_ms
                                         .unwrap_or(crate::game::DEFAULT_SLOW_FRAME_MS),
                                 )
-                        })
-                        {
+                        }) {
                             Ok(game) => Running::Game(Box::new(game)),
                             Err(error) => {
                                 eprintln!("krkr: failed to open game: {error}");

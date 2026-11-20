@@ -64,7 +64,7 @@ therefore contains no `#[cfg(target_os = …)]` of its own.
 `Host` is the assembled **engine host**: the L2 `Engine` and the frame it
 owns. It has no frame state of its own; `Host::step` drives exactly one
 engine frame. The stateless L1 services are created where they are used — the
-pipeline and the surface by `Host::new`, the file system and the media
+pipeline and the frame target by `Host::new`, the file system and the media
 backend by `GameHost::open_with_preload` — so the host holds no copy of a
 service it does not exercise.
 
@@ -92,6 +92,12 @@ ticker. See [main.md](main.md) §4.
 // construction and frames
 pub struct Host;                          // the engine host
 pub struct HostConfig;                    // #[non_exhaustive]; default() and headless()
+impl HostConfig {
+    pub fn with_surface_size(self, size: (u32, u32)) -> Self;
+}
+impl Host {
+    pub fn read_offscreen_frame(&self) -> Result<Option<Vec<u8>>, HostError>;
+}
 pub enum HostError { Render(..), Config(String), Overlay(String), Frame(String) }
 pub type StepReport = engine::FrameReport;
 
@@ -134,7 +140,7 @@ distinguishable instead of being flattened into a message.
              │                                                                       │
   L1 fs ─────┤ FileSystem::host(base_dir)  ──▶ Storage (L2)                           │
   L1 media ──┤ Media::new()                ──▶ image codec / audio decoder / video   │
-  L1 render ─┤ RenderPipeline + Surface     ──▶ Engine (L2)                          │
+  L1 render ─┤ RenderPipeline + target      ──▶ Engine (L2)                          │
   L1 platform┤ platform::run(DesktopApp)    ──▶ the event loop and the ticker        │
              │                                                                       │
   L2 engine ─┤ Engine::run(clock, hooks)    ◀── the frame; the hook is VmHook        │
@@ -169,8 +175,8 @@ substitute:
 
 | error | raised when |
 |---|---|
-| `HostError::Config` | a headless host was asked for a real backend, or a windowed host has no window handle |
-| `HostError::Render` | the backend could not be created, or a surface action failed |
+| `HostError::Config` | a windowed host has no window handle |
+| `HostError::Render` | the backend could not be created, a surface action failed, or the offscreen target of a headless Vulkan host could not be created |
 | `HostError::Overlay` | the debug panel could not be built or uploaded |
 | `HostError::Frame` | the frame hook failed, so the frame was abandoned before drawing |
 | `GameError::Mount` | an explicitly named archive could not be mounted |

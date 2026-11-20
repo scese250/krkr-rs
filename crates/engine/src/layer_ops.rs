@@ -26,8 +26,10 @@
 use std::sync::Arc;
 
 use api::blend::{BlendMode, DstBlend};
-use api::geometry::PixelRegion;
+use api::geometry::{Affine2, PixelRegion, RectF};
+use render::Texture;
 use render::blend::PhotoshopBlend;
+use render::scene::{RenderContent, RenderNode, RenderScene};
 
 use crate::hasher::Map;
 use crate::raster::blend_pixel_at;
@@ -281,6 +283,136 @@ fn unit_axis_aligned_origin(
         return None;
     }
     Some((x as i32, y as i32))
+}
+
+/// The render tree a draw list is drawn as.
+///
+/// The list is the generic form of a pose, and the tree is the generic form
+/// the backend draws: an image draw is a textured quad placed by its own
+/// affine map, a composite is a textured quad at its own position, and a fill
+/// is a solid quad. The tree carries no layer properties, so a backend that
+/// draws it draws the same picture the CPU pass draws.
+///
+/// A draw whose source has no texture is not in the tree: the source was
+/// released before the list was drawn. The draw's own order is the tree's
+/// draw order, so the draws composite in the order the list names them.
+pub fn draw_ops_scene(ops: &[DrawOp], textures: &Map<u32, Texture>) -> RenderScene {
+    let mut scene = RenderScene::with_root_node();
+    let root = scene.root;
+    for op in ops {
+        let node = match op {
+            DrawOp::Image(draw) => {
+                let Some(texture) = textures.get(&draw.source) else {
+                    continue;
+                };
+                let Some(blend) = draw_blend(draw.mode, draw.source_over) else {
+                    continue;
+                };
+                RenderNode {
+                    content: RenderContent::Texture(texture.clone()),
+                    src: source_region(draw.rect),
+                    dst: RectF::new(0.0, 0.0, 1.0, 1.0),
+                    affine: Some(affine_from_corners(draw.corners)),
+                    opacity: f32::from(draw.opacity) / 255.0,
+                    blend,
+                    ..RenderNode::default()
+                }
+            }
+            DrawOp::Composite(draw) => {
+                let Some(texture) = textures.get(&draw.source) else {
+                    continue;
+                };
+                let Some(blend) = draw_blend(draw.mode, draw.source_over) else {
+                    continue;
+                };
+                let (x0, y0, x1, y1) = draw.rect;
+                let (x, y) = (draw.x, draw.y);
+                RenderNode {
+                    content: RenderContent::Texture(texture.clone()),
+                    src: source_region(draw.rect),
+                    dst: RectF::new(x as f32, y as f32, (x1 - x0) as f32, (y1 - y0) as f32),
+                    opacity: f32::from(draw.opacity) / 255.0,
+                    blend,
+                    ..RenderNode::default()
+                }
+            }
+            DrawOp::Fill(draw) => {
+                let [origin, right, _corner, down] = draw.points.as_slice() else {
+                    continue;
+                };
+                RenderNode {
+                    content: RenderContent::Solid([
+                        f32::from(draw.color[0]),
+                        f32::from(draw.color[1]),
+                        f32::from(draw.color[2]),
+                        f32::from(draw.color[3]) / 255.0,
+                    ]),
+                    dst: RectF::new(0.0, 0.0, 1.0, 1.0),
+                    affine: Some(affine_from_corners([*origin, *right, *down])),
+                    ..RenderNode::default()
+                }
+            }
+        };
+        let id = scene.push(node);
+        if let Some(parent) = scene.node_mut(root) {
+            parent.children.push(id);
+        }
+    }
+    scene
+}
+
+/// The source rectangle of a draw, as the render tree's region.
+///
+/// The rectangle is the source's own sub-rectangle, so the tree samples the
+/// texels the draw names. A rectangle that reaches outside the source is
+/// clamped to it, so the tree never names a texel the source does not hold.
+fn source_region(rect: RectI) -> PixelRegion {
+    let (x0, y0, x1, y1) = rect;
+    let (x0, y0) = (x0.max(0), y0.max(0));
+    let (x1, y1) = (x1.max(x0), y1.max(y0));
+    PixelRegion::from_min_max(x0 as u32, y0 as u32, x1 as u32, y1 as u32)
+}
+
+/// The affine that places the unit quad on the three corners.
+///
+/// The corners are the origin, the origin's neighbour on the first axis and
+/// the origin's neighbour on the second, so the map is the one the CPU pass
+/// uses: `x = tx + m11·u + m12·v` and `y = ty + m21·u + m22·v`. The map is
+/// general, so a sheared placement is placed as it is.
+fn affine_from_corners(corners: [(f64, f64); 3]) -> Affine2 {
+    let [origin, right, down] = corners;
+    Affine2 {
+        m11: (right.0 - origin.0) as f32,
+        m12: (down.0 - origin.0) as f32,
+        m21: (right.1 - origin.1) as f32,
+        m22: (down.1 - origin.1) as f32,
+        tx: origin.0 as f32,
+        ty: origin.1 as f32,
+    }
+}
+
+/// The blend a draw composites with, in the render tree's vocabulary.
+///
+/// The plain source-over is the tree's own source-over. The operation modes
+/// the motion player's nodes use map onto the tree's fixed-function modes;
+/// the alpha face's source-over is the tree's source-over as well, because
+/// the tree's composite is the tree's own: the tree does not divide the
+/// colour by the resulting alpha.
+///
+/// A mode the tree has no blend for is `None`: the draw is not drawn, and
+/// the caller reports it.
+fn draw_blend(mode: i64, source_over: bool) -> Option<BlendMode> {
+    if source_over {
+        return Some(BlendMode::SourceOver);
+    }
+    match mode {
+        2 => Some(BlendMode::SourceOver),
+        14 => Some(BlendMode::Additive),
+        15 => Some(BlendMode::Subtractive),
+        16 => Some(BlendMode::Multiply),
+        17 => Some(BlendMode::Screen),
+        _ => None,
+    }
 }
 
 /// The corner map, resampler and background of [`affine_blit`].

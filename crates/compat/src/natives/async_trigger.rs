@@ -714,9 +714,7 @@ pub fn async_trigger_poll(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         if elapsed_ms >= ASYNC_DISPATCH_LOG_MS {
-            log::debug!(
-                "compat.async: on_fire id={id:?} ms={elapsed_ms:.1}"
-            );
+            log::debug!("compat.async: on_fire id={id:?} ms={elapsed_ms:.1}");
         }
         if let Err(error) = result {
             log::warn!("AsyncTrigger {id:?}: onFire failed ({error})");

@@ -5,8 +5,8 @@
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
-//!   [`app::Host`] and prints the null backend [`render::FrameStats`]. It needs
-//!   neither a display nor a GPU.
+//!   [`app::Host`] and prints the counters the backend reports. It needs no
+//!   display; it needs a GPU only when `--backend vulkan` asks for one.
 //! * Without `--headless` the process opens a window through the L1
 //!   [`platform`] event loop and drives [`app::Host::step`] on the configured
 //!   cadence. This binary is the composition root: it wires the L1
@@ -41,10 +41,11 @@
 //!   picture the window shows; it is written again whenever a frame is
 //!   presented, and the file therefore holds the most recent one. The frame
 //!   comes from the null backend, so the option needs `--backend null`.
-//! * `--backend vulkan` requests the Vulkan pipeline. It needs a real
-//!   window with a display connection (Wayland/X11/XCB); the windowed host
-//!   passes both the window and display handle so a surface can be created.
-//!   The headless path has no display and uses `--backend null`.
+//! * `--backend vulkan` requests the Vulkan pipeline. A windowed run needs a
+//!   real window with a display connection (Wayland/X11/XCB); the windowed host
+//!   passes both the window and display handle so a surface can be created. A
+//!   headless run has no display and draws into an offscreen target instead,
+//!   which the host reads back with [`app::Host::read_offscreen_frame`].
 //! * `--slow-report-ms N` bounds the wall-clock time the run may spend
 //!   reporting slow frames. The option is absent by default, which leaves the
 //!   reports unbounded, and `0` reports no slow frame at all. The budget is
@@ -97,7 +98,7 @@ const OPTIONS: &[OptionDoc] = &[
     OptionDoc {
         flag: "--headless",
         value: "",
-        help: "Run offscreen (no window/GPU).",
+        help: "Run offscreen (no window; a GPU only with --backend vulkan).",
     },
     OptionDoc {
         flag: "--frames",

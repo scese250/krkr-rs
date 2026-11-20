@@ -13,6 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use api::media::{DecodedImage, ImageInfo};
+use engine::engine::FrameTarget;
 use engine::imagedecode::{
     DecodePool, ImageDecodeError, ImageDecoder, ImageOutcome, ImageSizeError, ImageState,
     PendingImage,
@@ -649,7 +650,7 @@ fn headless_parts() -> EngineParts {
     let (surface, render_state) = begin_render_state(&pipeline, &handle).expect("surface");
     EngineParts {
         pipeline,
-        surface,
+        target: FrameTarget::Surface(surface),
         render_state,
         surface_size: (64, 64),
         headless: true,

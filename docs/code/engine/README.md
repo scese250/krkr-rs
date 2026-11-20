@@ -86,7 +86,8 @@ pub use fs::xp3::normalize_in_archive_name;
 
 pub use crate::clock::{FrameClock, FrameTimeSource, InjectedFrameTime};
 pub use crate::engine::{
-    Engine, EngineError, EngineOverlay, EngineParts, FrameReport, GameFrame, ObjectCounts,
+    Engine, EngineError, EngineOverlay, EngineParts, FrameReport, FrameTarget, GameFrame,
+    ObjectCounts,
 };
 pub use crate::hasher::Map;
 pub use crate::imagedecode::DecodePool;

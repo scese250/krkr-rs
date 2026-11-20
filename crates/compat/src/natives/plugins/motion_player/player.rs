@@ -1758,7 +1758,9 @@ impl PlayerInst {
             }
         }
         scene.set_layer_draws(layer_id, ops);
-        scene.draw_layer_draws(layer_id);
+        if !scene.host_draws_lists {
+            scene.draw_layer_draws(layer_id);
+        }
         // The sources the pose registered are per-frame content: the tinted
         // icons the cache holds and the surfaces this pose composited. The
         // rest of the table goes.

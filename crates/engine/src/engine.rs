@@ -14,6 +14,9 @@
 //! root, and draw it with a single pipeline call. A size pair that cannot be
 //! fitted skips everything that draws.
 //!
+//! The frame is drawn into the target the host gave the engine: a surface to
+//! present to, or an offscreen target a host with no window reads back.
+//!
 //! Nothing here reads a wall clock. [`Engine::run`] takes the elapsed
 //! time from the caller's clock source, [`Engine::frame`] takes the absolute
 //! time and [`Engine::step`] adds a delta to the clock the engine already
@@ -24,6 +27,7 @@
 //! layer, and [`EngineOverlay`] supplies the render-only debug overlay. This
 //! module never names those layers.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,8 +37,10 @@ use api::geometry::PixelRegion;
 use api::host::{PresentSkip, Presentation, SurfaceEvent};
 use render::{
     BackendKind, FrameStats, FrameTimings, RenderNode, RenderPipeline, RenderScene, RenderState,
-    Surface, Texture, TextureDesc, TextureUpload, create_texture, drop_texture, last_frame_timings,
-    recover_surface, render, resize as resize_render, supports_effect_pipelines, upload_textures,
+    RenderTarget, RenderTargetDesc, Surface, Texture, TextureDesc, TextureUpload,
+    create_render_target, create_texture, destroy_render_target, drop_texture, last_frame_timings,
+    read_render_target, recover_surface, render, render_to_target, resize as resize_render,
+    supports_effect_pipelines, upload_textures,
 };
 
 use crate::clock::{FrameClock, FrameTimeSource, InjectedFrameTime};
@@ -48,18 +54,34 @@ use crate::storage::{StoragePoolConfig, StoragePoolError, StorageReadPool, Stora
 use crate::timer::{TimerState, deliver_due};
 use crate::translate::{PixelTranslation, TranslateError};
 
+/// Where the engine's frames are drawn.
+///
+/// A host with a window presents every frame to a surface; a host with no
+/// window draws the frame into an offscreen target, which the caller reads
+/// back. The two need different resources, so the engine holds one of them
+/// and never both.
+pub enum FrameTarget {
+    /// The frame is presented to a presentation surface.
+    Surface(Surface),
+    /// The frame is drawn into an offscreen target of the engine's surface
+    /// size.
+    Offscreen(RenderTarget),
+}
+
 /// The bottom objects and initial state [`Engine::new`] assembles into an
 /// [`Engine`].
 ///
 /// The caller creates these itself: the render pipeline comes from the
-/// backend selection, the surface and render state from the window handle, and
-/// the overlay from whatever higher layer draws one.
+/// backend selection, the frame target and the render state from the window
+/// handle or from the offscreen entry point, and the overlay from whatever
+/// higher layer draws one.
 pub struct EngineParts {
     /// Stateless render service.
     pub pipeline: RenderPipeline,
-    /// Presented surface for `render_state`.
-    pub surface: Surface,
-    /// GPU/staging/texture bookkeeping for `surface`.
+    /// Where the frames are drawn: a surface to present to, or an offscreen
+    /// target to draw into.
+    pub target: FrameTarget,
+    /// GPU/staging/texture bookkeeping for the target.
     pub render_state: RenderState,
     /// Initial surface size in pixels; clamped to at least `1x1`.
     pub surface_size: (u32, u32),
@@ -236,26 +258,30 @@ impl StallCause {
     fn warn(self) {
         match self {
             Self::Backend(PresentFault::Unreported) => {
-                log::warn!("engine: the backend presented no frame and reported no surface event")
+                log::warn!(
+                    "engine.frame: the backend presented no frame and reported no surface event"
+                )
             }
             // A skipped frame is not a fault: the backend abandoned it before
             // submitting anything and the previous image stays on screen.
             Self::Backend(PresentFault::Skipped(PresentSkip::AcquireTimeout)) => log::warn!(
-                "engine: the display did not release a swapchain image within the \
+                "engine.frame: the display did not release a swapchain image within the \
                  presentation budget; this frame was skipped"
             ),
             Self::Backend(PresentFault::Surface(SurfaceEvent::Lost)) => log::warn!(
-                "engine: the presentation surface was lost; this frame was not presented"
+                "engine.frame: the presentation surface was lost; this frame was not presented"
             ),
             Self::Backend(PresentFault::Surface(SurfaceEvent::OutOfDate)) => log::warn!(
-                "engine: the presentation surface is out of date; rebuilding the swapchain"
+                "engine.frame: the presentation surface is out of date; rebuilding the swapchain"
             ),
             Self::Backend(PresentFault::Surface(SurfaceEvent::Restored)) => {
-                log::warn!("engine: the surface was restored but this frame was not presented")
+                log::warn!(
+                    "engine.frame: the surface was restored but this frame was not presented"
+                )
             }
             Self::Backend(PresentFault::Surface(SurfaceEvent::Resized(width, height))) => {
                 log::warn!(
-                    "engine: this frame was not presented after a resize to {width}x{height}"
+                    "engine.frame: this frame was not presented after a resize to size={width}x{height}"
                 )
             }
             // The unfittable-size warning is emitted where the mapping is
@@ -400,9 +426,11 @@ pub struct FrameReport {
     /// accumulated fractional part; [`Engine::frame`] sets it to the injected
     /// whole millisecond.
     pub elapsed_ms: f64,
-    /// Whether the frame was presented to the surface.
+    /// Whether the frame reached its destination.
     ///
-    /// A frame with `presented == false` updated the scene but the backend
+    /// A frame drawn into an offscreen target has no surface to be presented
+    /// to: it reaches the target, which holds it until the next frame changes
+    /// it. A frame with `presented == false` updated the scene but the backend
     /// kept the previous surface contents; the engine reports and retries it
     /// instead of treating it as an ordinary frame.
     pub presented: bool,
@@ -447,8 +475,9 @@ pub struct Engine {
     /// Layer ids the latest projection emitted, including descendants covered
     /// by a cached ancestor.
     drawn_layers: Vec<u32>,
-    /// Presented surface for `render_state`.
-    surface: Surface,
+    /// Presented surface for `render_state`, or the offscreen target the
+    /// frame is drawn into when the host has no window.
+    target: FrameTarget,
     /// GPU/staging/texture bookkeeping.
     render_state: RenderState,
     /// Bitmap id → uploaded texture handle.
@@ -495,6 +524,12 @@ pub struct Engine {
     headless: bool,
     /// Render-only overlay, or `None` when none is drawn.
     overlay: Option<Box<dyn EngineOverlay>>,
+    /// The layers whose pose the CPU draws, by layer id.
+    ///
+    /// A backend that cannot draw a layer's pose draws it on the CPU, and
+    /// the layer keeps drawing it there: its image holds the pose the CPU
+    /// pass drew, so a pose surface over it would draw the pose twice.
+    cpu_pose_layers: BTreeSet<u32>,
     /// The VM-pixel → device-pixel mapping for the current sizes, or `None` when
     /// the two sizes cannot be fitted.
     translation: Option<PixelTranslation>,
@@ -516,16 +551,18 @@ impl Engine {
     ///
     /// The surface is sized to [`EngineParts::surface_size`] (clamped to at
     /// least `1x1`), which is the one surface action the engine performs
-    /// before its first frame.
+    /// before its first frame. An offscreen target is created at that size by
+    /// the caller, and the engine refuses a target of another size.
     ///
     /// # Errors
     ///
     /// Returns [`EngineError::Render`] when the backend rejects the initial
-    /// surface size.
+    /// surface size, and when the offscreen target does not match the surface
+    /// size.
     pub fn new(parts: EngineParts) -> Result<Self, EngineError> {
         let EngineParts {
             pipeline,
-            surface,
+            target,
             render_state,
             surface_size,
             headless,
@@ -537,6 +574,9 @@ impl Engine {
         // transition's frame from the projection; the headless CPU path blends
         // the layer's display bitmap instead.
         scene.composite_transition_frames = pipeline.backend() != BackendKind::Null;
+        // The engine draws the layers' draw lists on the backend, so the
+        // compatibility layer leaves them to it and the list is drawn once.
+        scene.host_draws_lists = true;
         let mut engine = Self {
             pipeline,
             scene,
@@ -544,7 +584,7 @@ impl Engine {
             render_scene: RenderScene::with_root_node(),
             render_scene_revision: None,
             drawn_layers: Vec::new(),
-            surface,
+            target,
             render_state,
             textures: map(),
             timer: TimerState::new(),
@@ -558,22 +598,47 @@ impl Engine {
             clock: FrameClock::new(),
             headless,
             overlay,
+            cpu_pose_layers: BTreeSet::new(),
             translation: None,
             last_window_client_size: None,
             pending_window_resize: None,
             presentation_skipped_logged: false,
             stall: PresentationStall::default(),
         };
-        let event = resize_render(
-            &engine.pipeline,
-            &engine.surface,
-            &mut engine.render_state,
-            surface_size,
-        )?;
-        // The surface can adopt an extent different from the requested one (a
-        // DPI or compositor clamp), so the presentation fits the extent the
-        // backend actually took rather than the size we asked for.
-        engine.surface_size = reported_surface_size(event, surface_size);
+        // The surface is sized to the requested size; an offscreen target is
+        // created at that size by the caller, so it is only checked.
+        match &engine.target {
+            FrameTarget::Surface(surface) => {
+                let event = resize_render(
+                    &engine.pipeline,
+                    surface,
+                    &mut engine.render_state,
+                    surface_size,
+                )?;
+                // The surface can adopt an extent different from the requested
+                // one (a DPI or compositor clamp), so the presentation fits the
+                // extent the backend actually took rather than the size we
+                // asked for.
+                engine.surface_size = reported_surface_size(event, surface_size);
+            }
+            FrameTarget::Offscreen(target) => {
+                // The target holds the frame, so it must be the size the
+                // frame is fitted into: a target of another size would crop
+                // the picture the presentation maps.
+                if (target.width(), target.height()) != surface_size {
+                    return Err(RenderError::InvalidArgument {
+                        message: format!(
+                            "the offscreen target is {}x{} but the frame is fitted into {}x{}",
+                            target.width(),
+                            target.height(),
+                            surface_size.0,
+                            surface_size.1
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
         engine.sync_presentation();
         engine.install_effect_pipelines();
         // The first frame draws: the surface holds nothing yet.
@@ -845,7 +910,7 @@ impl Engine {
 
         if self.translation.is_none() {
             self.frame_index = self.frame_index.saturating_add(1);
-            self.note_presentation_stall(StallCause::NoMapping, now_ms);
+            Self::note_presentation_stall(&mut self.stall, StallCause::NoMapping, now_ms);
             return Ok(FrameReport {
                 frame_index: self.frame_index,
                 elapsed_ms: self.clock.now_f64(),
@@ -860,6 +925,11 @@ impl Engine {
         }
 
         self.refresh_overlay(now_ms)?;
+
+        // The layers' draw lists are drawn on the backend: the pose the
+        // compatibility layer left is composited there, and the layer's image
+        // carries the result into the upload below.
+        self.draw_layer_draw_lists();
 
         let sync_started = Instant::now();
         let upload_started = Instant::now();
@@ -908,48 +978,74 @@ impl Engine {
         // has something to show.
         let mut presented = false;
         if self.scene.dirty() {
-            let outcome = match render(
-                &self.pipeline,
-                &self.surface,
-                &mut self.render_state,
-                &self.render_scene,
-            ) {
-                Ok(presentation) => present_outcome(presentation),
-                // A swapchain that could not be rebuilt is reported here and
-                // retried by the next frame's render call; the backend logged the
-                // precise cause when it happened.
-                Err(RenderError::SurfaceOutOfDate) => present_outcome(Presentation {
-                    presented: false,
-                    surface_event: Some(SurfaceEvent::OutOfDate),
-                    skip: None,
-                }),
-                Err(error) => return Err(error.into()),
-            };
-            // A lost surface is recoverable: rebuild the surface and swapchain in
-            // the bottom layer and keep the scene, textures and VM in place. The
-            // recovered frame is skipped and the next frame presents normally.
-            if outcome.surface_event == Some(SurfaceEvent::Lost) {
-                recover_surface(&self.pipeline, &mut self.surface, &mut self.render_state)?;
-                log::info!("engine.frame: presentation surface recreated after it was lost");
-                // The recreated surface holds nothing, so the whole frame is
-                // drawn again.
-                self.scene.mark_dirty();
-            }
-            if outcome.presented {
-                self.finish_presentation_stall(now_ms);
-                // The presented frame carries the change, so the next frame
-                // starts clean. A frame the display did not accept keeps it:
-                // the previous frame's content is still on screen.
-                self.scene.clear_dirty();
-                presented = true;
-            } else {
-                // `present_outcome` names a fault for every non-presented frame; a
-                // frame without one is the backend's silence, reported as such.
-                let fault = match outcome.fault {
-                    Some(fault) => fault,
-                    None => PresentFault::Unreported,
-                };
-                self.note_presentation_stall(StallCause::Backend(fault), now_ms);
+            // The frame is drawn into the target the host gave the engine: a
+            // surface to present to, or an offscreen target to draw into.
+            match &mut self.target {
+                FrameTarget::Surface(surface) => {
+                    let outcome = match render(
+                        &self.pipeline,
+                        surface,
+                        &mut self.render_state,
+                        &self.render_scene,
+                    ) {
+                        Ok(presentation) => present_outcome(presentation),
+                        // A swapchain that could not be rebuilt is reported here and
+                        // retried by the next frame's render call; the backend logged the
+                        // precise cause when it happened.
+                        Err(RenderError::SurfaceOutOfDate) => present_outcome(Presentation {
+                            presented: false,
+                            surface_event: Some(SurfaceEvent::OutOfDate),
+                            skip: None,
+                        }),
+                        Err(error) => return Err(error.into()),
+                    };
+                    // A lost surface is recoverable: rebuild the surface and swapchain in
+                    // the bottom layer and keep the scene, textures and VM in place. The
+                    // recovered frame is skipped and the next frame presents normally.
+                    if outcome.surface_event == Some(SurfaceEvent::Lost) {
+                        recover_surface(&self.pipeline, surface, &mut self.render_state)?;
+                        log::info!(
+                            "engine.frame: presentation surface recreated after it was lost"
+                        );
+                        // The recreated surface holds nothing, so the whole frame is
+                        // drawn again.
+                        self.scene.mark_dirty();
+                    }
+                    if outcome.presented {
+                        Self::finish_presentation_stall(&mut self.stall, now_ms);
+                        // The presented frame carries the change, so the next frame
+                        // starts clean. A frame the display did not accept keeps it:
+                        // the previous frame's content is still on screen.
+                        self.scene.clear_dirty();
+                        presented = true;
+                    } else {
+                        // `present_outcome` names a fault for every non-presented frame; a
+                        // frame without one is the backend's silence, reported as such.
+                        let fault = match outcome.fault {
+                            Some(fault) => fault,
+                            None => PresentFault::Unreported,
+                        };
+                        Self::note_presentation_stall(
+                            &mut self.stall,
+                            StallCause::Backend(fault),
+                            now_ms,
+                        );
+                    }
+                }
+                FrameTarget::Offscreen(target) => {
+                    // The target holds the frame: there is no surface to
+                    // present to, so the frame is complete when the draw
+                    // returns, and the target keeps it until the next frame
+                    // changes it.
+                    render_to_target(
+                        &self.pipeline,
+                        &mut self.render_state,
+                        target,
+                        &self.render_scene,
+                    )?;
+                    self.scene.clear_dirty();
+                    presented = true;
+                }
             }
         }
         let render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
@@ -974,24 +1070,24 @@ impl Engine {
     /// A cause is reported the first time it joins the stall, and the stall's
     /// age is reported once it lasts long enough that a game frozen on screen
     /// would otherwise look like a hung process.
-    fn note_presentation_stall(&mut self, cause: StallCause, now_ms: u64) {
-        if let Some(cause) = self.stall.record(cause, now_ms) {
+    fn note_presentation_stall(stall: &mut PresentationStall, cause: StallCause, now_ms: u64) {
+        if let Some(cause) = stall.record(cause, now_ms) {
             cause.warn();
         }
-        if let Some(age) = self.stall.due_report(now_ms) {
+        if let Some(age) = stall.due_report(now_ms) {
             log::warn!(
                 "engine.frame: the display has not accepted a frame elapsed_s={:.1} \
                  frames_skipped={} causes={}",
                 age.elapsed_ms as f64 / 1000.0,
                 age.frames,
-                describe_stall_causes(&self.stall.causes),
+                describe_stall_causes(&stall.causes),
             );
         }
     }
 
     /// Ends a presentation stall and reports how long it lasted and why.
-    fn finish_presentation_stall(&mut self, now_ms: u64) {
-        if let Some(summary) = self.stall.resumed(now_ms) {
+    fn finish_presentation_stall(stall: &mut PresentationStall, now_ms: u64) {
+        if let Some(summary) = stall.resumed(now_ms) {
             log::info!(
                 "engine.frame: presentation resumed frames_skipped={} elapsed_s={:.1} causes={}",
                 summary.frames,
@@ -1009,15 +1105,40 @@ impl Engine {
     /// presentation refits the screen into the new framebuffer, so an OS resize
     /// moves no value a script observes.
     ///
+    /// A host with no window has no surface: its offscreen target is the
+    /// frame's destination, so a new size replaces it with a target of that
+    /// size, and the frame is drawn again into the empty target.
+    ///
     /// # Errors
     ///
-    /// Returns [`EngineError::Render`] when the backend rejects the resize.
+    /// Returns [`EngineError::Render`] when the backend rejects the resize or
+    /// the replacement target cannot be created.
     pub fn resize(&mut self, size: (u32, u32)) -> Result<SurfaceEvent, EngineError> {
         let size = (size.0.max(1), size.1.max(1));
-        let event = if size == self.surface_size {
-            SurfaceEvent::Resized(size.0, size.1)
-        } else {
-            resize_render(&self.pipeline, &self.surface, &mut self.render_state, size)?
+        let event = match &mut self.target {
+            FrameTarget::Surface(surface) => {
+                if size == self.surface_size {
+                    SurfaceEvent::Resized(size.0, size.1)
+                } else {
+                    resize_render(&self.pipeline, surface, &mut self.render_state, size)?
+                }
+            }
+            FrameTarget::Offscreen(target) => {
+                if size != self.surface_size {
+                    // The replacement is created before the old target is
+                    // released, so the frame's destination is never missing.
+                    let replacement = create_render_target(
+                        &self.pipeline,
+                        RenderTargetDesc::new(size.0, size.1),
+                    )?;
+                    let previous = std::mem::replace(target, replacement);
+                    destroy_render_target(&self.pipeline, &mut self.render_state, previous);
+                    // The new target holds nothing, so the frame is drawn
+                    // again.
+                    self.scene.mark_dirty();
+                }
+                SurfaceEvent::Resized(size.0, size.1)
+            }
         };
         self.surface_size = reported_surface_size(event, size);
         self.sync_presentation();
@@ -1334,6 +1455,64 @@ impl Engine {
         last_frame_timings(&self.render_state)
     }
 
+    /// Reads the frame the last frame drew into the offscreen target.
+    ///
+    /// The pixels are RGBA8 in device pixels: the target holds the picture
+    /// the projected tree was drawn into, at the engine's surface size. A
+    /// host that presents to a surface has no target, so it reads nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Render`] when the read-back fails, which is the
+    /// case when no frame has been drawn into the target yet.
+    pub fn read_offscreen_frame(&self) -> Result<Option<Vec<u8>>, EngineError> {
+        let FrameTarget::Offscreen(target) = &self.target else {
+            return Ok(None);
+        };
+        let width = target.width();
+        let height = target.height();
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        read_render_target(
+            &self.pipeline,
+            &self.render_state,
+            target,
+            PixelRegion::new(0, 0, width, height),
+            &mut pixels,
+        )?;
+        Ok(Some(pixels))
+    }
+
+    /// Installs the backend that reads a layer's pose surface back.
+    ///
+    /// The pose the motion player draws lives on the backend, so a script
+    /// that reads the layer's pixels asks the scene for them, and the scene
+    /// calls this. The read-back is a backend operation, and the engine
+    /// owns the pipeline and the render state, so the composition root
+    /// builds the seam.
+    pub fn install_pose_sync(&mut self, sync: crate::scene::PoseSync) {
+        self.scene.set_pose_sync(sync);
+    }
+
+    /// Reads the pose of a layer back into the pixels a script reads.
+    ///
+    /// The pixels are the layer's image with the pose composited over them.
+    /// A layer that shows no pose has nothing to add, and the image's own
+    /// pixels are the answer.
+    ///
+    /// The scene caches the pixels with the pose's revision, so a read that
+    /// finds the cache current does not reach this at all: the seam is
+    /// called only when the pose was redrawn.
+    pub fn sync_pose_pixels(&mut self, bitmap: u32) -> Result<Option<Vec<u8>>, RenderError> {
+        // A layer that shows no pose reads nothing.
+        let Some(pose) =
+            self.scene
+                .read_pose_pixels(&self.pipeline, &mut self.render_state, bitmap)?
+        else {
+            return Ok(None);
+        };
+        self.scene.compose_pose_pixels(bitmap, &pose)
+    }
+
     /// Whether the engine draws a render-only overlay.
     pub fn debug_overlay_enabled(&self) -> bool {
         self.overlay.is_some()
@@ -1350,6 +1529,59 @@ impl Engine {
     /// cannot abort the frame. All dirty bitmaps are uploaded in one batch, so
     /// the frame submits them once and the present path waits for that batch
     /// instead of waiting once per bitmap.
+    /// Draws the layers' draw lists on the backend.
+    ///
+    /// A list the backend cannot draw - it has no surface, or the draw
+    /// failed - falls back to the CPU pass, so the pose is never lost.
+    fn draw_layer_draw_lists(&mut self) {
+        for layer_id in self.scene.layers_with_draws() {
+            // A layer whose pose the backend could not draw keeps drawing it
+            // on the CPU: its image is then the whole picture, and a pose
+            // surface over it would draw the pose twice.
+            if self.cpu_pose_layers.contains(&layer_id) {
+                self.scene.draw_layer_draws(layer_id);
+                continue;
+            }
+            let drawn =
+                self.scene
+                    .draw_layer_draws_gpu(&self.pipeline, &mut self.render_state, layer_id);
+            match drawn {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.draw_pose_on_cpu(layer_id, None);
+                }
+                Err(error) => {
+                    self.draw_pose_on_cpu(layer_id, Some(&error.to_string()));
+                }
+            }
+        }
+    }
+
+    /// Draws the layer's pose on the CPU and records that it does.
+    ///
+    /// The pose surface is dropped, so the layer's image carries the pose
+    /// alone. The layer keeps drawing the pose on the CPU: the image holds
+    /// the pose the CPU pass drew, and a pose surface over it would draw
+    /// the pose twice.
+    fn draw_pose_on_cpu(&mut self, layer_id: u32, error: Option<&str>) {
+        match error {
+            Some(error) => log::warn!(
+                "engine.frame: the pose of layer {layer_id} was not drawn on the backend: \
+                 {error}; the CPU pass draws it"
+            ),
+            None => log::warn!(
+                "engine.frame: the pose of layer {layer_id} was not drawn on the backend; the \
+                 CPU pass draws it"
+            ),
+        }
+        if let Some(bitmap_id) = self.scene.layer(layer_id).and_then(|layer| layer.bitmap) {
+            self.scene
+                .drop_pose_surface(&self.pipeline, &mut self.render_state, bitmap_id);
+        }
+        self.cpu_pose_layers.insert(layer_id);
+        self.scene.draw_layer_draws(layer_id);
+    }
+
     ///
     /// A bitmap that changed in a rectangle uploads that rectangle alone;
     /// one that changed wholly uploads every pixel.
@@ -1404,7 +1636,9 @@ impl Engine {
                         self.render_scene_revision = None;
                     }
                     Err(error) => {
-                        log::warn!("failed to create a texture for bitmap #{id}: {error}");
+                        log::warn!(
+                            "engine.scene: failed to create a texture for bitmap id={id}: {error}"
+                        );
                         continue;
                     }
                 }
@@ -1548,9 +1782,9 @@ fn clear_uploaded_dirty(scene: &mut Scene, uploaded: &[u32], succeeded: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Engine, EngineParts, GameFrame, PresentFault, PresentationStall, Scene, StallAge,
-        StallCause, StallSummary, clear_uploaded_dirty, describe_stall_causes, present_outcome,
-        reported_surface_size,
+        Engine, EngineParts, FrameTarget, GameFrame, PresentFault, PresentationStall, Scene,
+        StallAge, StallCause, StallSummary, clear_uploaded_dirty, describe_stall_causes,
+        present_outcome, reported_surface_size,
     };
     use api::geometry::PixelRegion;
     use api::host::{PresentSkip, Presentation, SurfaceEvent};
@@ -1573,7 +1807,7 @@ mod tests {
         let (surface, render_state) = begin_render_state(&pipeline, &handle).expect("surface");
         Engine::new(EngineParts {
             pipeline,
-            surface,
+            target: FrameTarget::Surface(surface),
             render_state,
             surface_size: size,
             headless: true,

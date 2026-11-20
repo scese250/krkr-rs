@@ -676,6 +676,34 @@ impl VulkanPipeline {
             .read_render_target(&self.memory_properties, target, region, out)
     }
 
+    /// Copies the pixels of an offscreen `target` into a `texture`.
+    ///
+    /// The copy stays on the device: the pixels never reach the host. The
+    /// texture's image is created when it has none, so the copy can land in
+    /// a texture that was never uploaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::InvalidArgument`] when the texture is smaller
+    /// than the target, [`RenderError::Framebuffer`] when the target was
+    /// never rendered into, and [`RenderError::InvalidArgument`] for a
+    /// mismatched state.
+    pub(crate) fn copy_render_target_to_texture(
+        &self,
+        state: &mut RenderState,
+        target: &RenderTarget,
+        texture: &Texture,
+    ) -> Result<(), RenderError> {
+        let StateKind::Vulkan(vstate) = &mut state.kind else {
+            return Err(RenderError::InvalidArgument {
+                message: "the Vulkan backend received a null render state".to_owned(),
+            });
+        };
+        vstate
+            .device_mut()
+            .copy_render_target_to_texture(&self.memory_properties, target, texture)
+    }
+
     /// Acquires, records, submits and presents one frame.
     pub(crate) fn render(
         &self,
@@ -1647,6 +1675,57 @@ impl VulkanDevice {
             fence: self.offscreen_fence,
         };
         target::read(&submit, memory_properties, gpu, &mut readback, region, out)
+    }
+
+    /// Copies the pixels of an offscreen `target` into a `texture`.
+    ///
+    /// The copy stays on the device: the pixels never reach the host, so the
+    /// pose a draw list produces never travels back to the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Framebuffer`] when the target was never
+    /// rendered into, and [`RenderError::InvalidArgument`] when the texture
+    /// is smaller than the target.
+    pub(crate) fn copy_render_target_to_texture(
+        &mut self,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        target: &RenderTarget,
+        texture: &Texture,
+    ) -> Result<(), RenderError> {
+        let key = texture.key();
+        if !self.textures.contains_key(&key) {
+            let gpu = texture::create_texture(
+                &self.device,
+                memory_properties,
+                self.resources.descriptor_set_layout,
+                self.resources.descriptor_pool,
+                self.resources.sampler,
+                *texture.desc(),
+            )?;
+            self.textures.insert(key, gpu);
+        }
+        // The upload ring may still hold work that writes a texture, so the
+        // ring is drained before the copy is recorded.
+        self.upload.wait_all(&self.device)?;
+        let submit = target::OffscreenSubmit {
+            device: &self.device,
+            queue: self.graphics_queue,
+            command_pool: self.offscreen_pool,
+            command_buffer: self.offscreen_command,
+            fence: self.offscreen_fence,
+        };
+        let Some(gpu_target) = self.render_targets.get_mut(&target.key()) else {
+            return Err(RenderError::Framebuffer {
+                message: "render target has not been rendered yet".to_owned(),
+            });
+        };
+        let Some(gpu_texture) = self.textures.get_mut(&key) else {
+            return Err(RenderError::Framebuffer {
+                message: "texture state disappeared during the copy".to_owned(),
+            });
+        };
+        target::copy_to_texture(&submit, gpu_target, gpu_texture)
     }
 }
 

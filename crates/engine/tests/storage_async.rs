@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 
 use api::error::FsError;
+use engine::engine::FrameTarget;
 use engine::storage::{
     FileSystemReader, StorageBytes, StorageJob, StorageOutcome, StoragePoolConfig, StorageReadPool,
     StorageReader,
@@ -615,7 +616,7 @@ fn headless_parts() -> EngineParts {
     let (surface, render_state) = begin_render_state(&pipeline, &handle).expect("surface");
     EngineParts {
         pipeline,
-        surface,
+        target: FrameTarget::Surface(surface),
         render_state,
         surface_size: (64, 64),
         headless: true,

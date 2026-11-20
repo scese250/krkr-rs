@@ -27,7 +27,7 @@ or `FontSystem` — it reaches the platform only through L2.
 
 | Group | Items | What L3 uses them for |
 |---|---|---|
-| the logical scene | `Scene`, `LayerState`, `BitmapState`, `FontState`, `Rect`, `DecodedImageKey`, `DecodedImageMode`, `TransitionFrame`, `HitCandidate` | the layer tree, the bitmap store, the font store, the decoded-image cache, the frame a composited transition draws |
+| the logical scene | `Scene`, `LayerState`, `BitmapState`, `FontState`, `Rect`, `DecodedImageKey`, `DecodedImageMode`, `TransitionFrame`, `HitCandidate` | the layer tree, the bitmap store, the font store, the decoded-image cache, the frame a composited transition draws, and the pixels a layer's pose shows (`Scene::read_pixels`) |
 | the storage namespace | `Storage`, `StorageEntry`, `Location`, `StorageReadError`, `StorageMedia`, `normalize_in_archive_name` | mounting, resolving and reading a script storage name, and serving the names a storage media owns |
 | input | `InputState` | the generic pointer, key, button and touch state |
 | timers | `TimerState`, `TimerId`, `TimerCallback` | the L2 timer registry L3 arms and disarms |

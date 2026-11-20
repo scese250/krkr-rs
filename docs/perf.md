@@ -1769,3 +1769,40 @@ content when the cache is released. The cost of the old condition was large:
 the engine's own work was **18.00 ms** per frame with it and **0.40 ms**
 without, and the worst frame was **about 165 ms** with it and **35.90 ms**
 without.
+
+With the fix, the real game's release numbers over 3,600 frames are:
+
+| | the engine's work per frame | the frame gap's 1% low | the worst frame | the frames over 33 ms |
+|---|---|---|---|---|
+| the CPU path | 0.40 ms | 19.58 ms (51.1 fps) | 50.53 ms | 3 |
+| the GPU path | 3.78 ms | 64.79 ms (15.4 fps) | 177.74 ms | 171 |
+
+The CPU path with the fixed region meets the 30 fps budget in the 1% low and
+holds the worst frame at the 50 ms the target asks for. The GPU path is the
+direction, and it is behind the CPU path until the round trips are gone.
+
+### 12.2 The pose on the device: what landed
+
+The pose now lives on the backend, the way the reference's own motion player
+does: the reference renders each item into a per-item leaf layer and composites
+the leaf on the device
+(`reference/krkr2/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:761-771`),
+and the canvas it keeps is a layer object rather than a bitmap
+(`PlayerRenderTargets.cpp:604`, `:1141`; `PlayerRender.cpp:37-42`).
+
+Ours keeps a persistent per-layer pose surface, sized to the layer's image so
+it never outgrows and the accumulated pose is never lost as the pose's bounding
+box moves. The projection draws the layer's own image and then the pose surface
+over it, with the premultiplied source-over, so the presentation needs no CPU
+pixels. The layer's CPU image is not written per frame; the pixels a script
+reads are the image's pixels with the pose composited over them, read back on
+demand and cached per pose revision - so `getPixel` and `Layer.hitTest` cost
+nothing per read within a frame.
+
+Two approximations come with the shape, and they are recorded rather than
+hidden: a layer with a non-default blend mode has it applied to the content
+and then to the pose, where the CPU path applies it once to content and pose
+together; and the pose's own non-source-over draw modes composite against a
+transparent surface instead of against the content, because the Photoshop modes
+are not associative. The reference's per-item leaf composition is the second
+behaviour, not ours.

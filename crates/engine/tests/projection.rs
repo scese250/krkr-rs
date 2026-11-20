@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use api::blend::{BlendMode, DstBlend};
 use api::geometry::{PixelRegion, RectF};
+use engine::engine::FrameTarget;
 use engine::{
     BitmapState, Engine, EngineOverlay, EngineParts, GameFrame, Map, PixelTranslation, Rect, Scene,
     TransitionFrame, TransitionSource, compose_layer, project_scene, project_window,
@@ -652,7 +653,7 @@ fn headless_engine_with_projection_count(size: (u32, u32)) -> (Engine, Rc<Cell<u
     let projections = Rc::new(Cell::new(0));
     let parts = EngineParts {
         pipeline,
-        surface,
+        target: FrameTarget::Surface(surface),
         render_state,
         surface_size: size,
         headless: true,

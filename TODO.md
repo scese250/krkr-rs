@@ -1858,3 +1858,28 @@ frame, so it stays unused rather than changing `getPixel`/`piledCopy`/
 `saveLayerImage`. A device-resolution capture is a separate additive capability
 on the offscreen `RenderTarget` API; `raster_scale` is deferred until the GPU
 text path is production.
+
+## 20. The pose on the backend: two known gaps
+
+The motion player's pose lives on the backend now: a persistent per-layer pose
+surface, the projection draws it over the layer's own image, and the pixels a
+script reads are the image's pixels with the pose composited over them, read
+back on demand and cached per pose revision. Two gaps are open.
+
+- **The null backend clears its offscreen target to opaque black, the Vulkan
+  backend loads it.** The Vulkan's offscreen render pass uses a load operation,
+  so the attachment keeps its content and the pose accumulates on it. The null
+  backend's `render_scene` clears the buffer on every render, so the pose
+  surface does not accumulate there. The pose surface's first draw now starts
+  it transparent, which makes the two agree for the frame the surface is
+  created, but the null backend still loses the accumulation. The fix is in
+  the null backend: the clear belongs to the presentation path
+  (`composite_presented`, which corresponds to the Vulkan's swapchain pass and
+  does clear) and not to the offscreen target path.
+- **The projection is rebuilt only when the scene's structure revision moves,
+  and the pose surface's creation does not move it.** The node appears because
+  the motion player resizes the target layer's rect on the first draw, which
+  is structural. If a pose surface is ever recreated without a structural
+  change, the projected node would keep the old texture handle. No test covers
+  the engine's frame with a draw list:
+  `crates/engine/tests/motion_draw_list_gpu.rs` drives the scene directly.

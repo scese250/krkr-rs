@@ -65,7 +65,7 @@ These are the crate root's re-exports, complete:
 | group | items at the crate root |
 |---|---|
 | the clock | `FrameClock`, `FrameTimeSource`, `InjectedFrameTime` |
-| the frame | `Engine`, `EngineError`, `EngineOverlay`, `EngineParts`, `FrameReport`, `GameFrame`, `ObjectCounts` |
+| the frame | `Engine`, `EngineError`, `EngineOverlay`, `EngineParts`, `FrameReport`, `FrameTarget`, `GameFrame`, `ObjectCounts` |
 | the decode pool | `DecodePool` |
 | the mapping | `PixelTranslation`, `TranslateError` |
 | the lookup map | `Map` |
@@ -133,10 +133,11 @@ state, the clock and the presentation; it advances them one frame at a time.
 | type | what it is |
 |---|---|
 | `Engine` | the frame-owning object. Every value the middle layer needs is a field of it, so two engines can run in one process. |
-| `EngineParts` | the bottom objects `Engine::new` assembles: the render pipeline, the surface, the render state, the initial surface size, the headless flag and the optional overlay. The caller creates them. |
+| `EngineParts` | the bottom objects `Engine::new` assembles: the render pipeline, the frame target, the render state, the initial surface size, the headless flag and the optional overlay. The caller creates them. |
+| `FrameTarget` | where the frames are drawn: a surface to present to, or an offscreen target to draw into. The engine holds one of them and never both. |
 | `GameFrame` | the **single upward edge** of the frame. The layer above implements it: it runs the script tick and the event dispatch, and returns a failure as a message. |
 | `EngineOverlay` | the render-only debug overlay: a node drawn above every layer, refreshed once per frame. It is not part of the scene and owns no bitmap a script could reach. |
-| `FrameReport` | what one frame did: the frame index, the clock, whether the frame was presented, the backend counters and the per-phase millisecond costs. |
+| `FrameReport` | what one frame did: the frame index, the clock, whether the frame reached its destination, the backend counters and the per-phase millisecond costs. |
 | `FrameTimeSource` | the trait the frame's elapsed time comes through. The engine owns the clock it advances; the caller owns where the elapsed time comes from. |
 | `InjectedFrameTime` | the frame time the caller injects. The windowed loop writes the real time the platform measured into it; the headless runner writes the time it measured between its frames. |
 | `EngineError` | the errors a frame or a surface action surfaces. |
@@ -146,14 +147,14 @@ state, the clock and the presentation; it advances them one frame at a time.
 
 | step | call | what it does |
 |---|---|---|
-| 1 | build the L1 objects, then `Engine::new(parts)` | the engine takes the pipeline, the surface and the render state; it clamps the surface size to at least 1×1, performs the one surface action it does before its first frame, adopts the extent the backend actually took, and fits the presentation. Returns `Result<Engine, EngineError>`. |
+| 1 | build the L1 objects, then `Engine::new(parts)` | the engine takes the pipeline, the frame target and the render state; it clamps the surface size to at least 1×1, sizes the surface before its first frame and adopts the extent the backend actually took, checks an offscreen target against that size, and fits the presentation. Returns `Result<Engine, EngineError>`. |
 | 2 | `Engine::install_decoder(decoder, config)` | installs the image codec and starts the decode pool. Optional: without it the engine has no deferred decodes. |
 | 3 | `Engine::install_storage_reader(reader, config)` | installs the storage reader and starts the storage read pool, and hands the pool back so the storage and the engine share it. |
 | 4 | `Engine::load_shader(desc)` / `Engine::effect_pipeline(shader, blend)` | register a shader program and create the backend pipeline for a (program, blend) pair. The engine registers its own two programs at construction when the backend can run effect pipelines. |
 | 5 | mount the storage, then `Storage::startup_plan()` | the namespace and the startup plan: the four startup script names, resolved. `engine::startup::discover_startup(&storage)` answers the same question with resolved locations. These live outside the `Engine`: the storage is a value the root owns. |
 | 6 | attach the L3 handles | the compatibility layer attaches the scene, the storage, the input state, the timer registry and the clock. The attached values must outlive the binding. |
 | 7 | **one frame**: `Engine::run(clock, hooks)` | the loop-level entry point. The caller chooses where the elapsed time comes from; every timeline the frame derives comes from that one value. |
-| 8 | `Engine::resize(size)` | rebinds the surface to a new framebuffer size. The logical screen is untouched: the presentation refits the screen into the new framebuffer, so an OS resize moves no value a script observes. |
+| 8 | `Engine::resize(size)` | rebinds the surface to a new framebuffer size, or replaces the offscreen target with one of that size. The logical screen is untouched: the presentation refits the screen into the new framebuffer, so an OS resize moves no value a script observes. |
 | 9 | `Engine::take_window_resize()` | hands the root the script-side window size it still has to apply to the OS window, and clears it. |
 
 Two alternative frame entry points exist for callers that drive the frame
@@ -165,6 +166,10 @@ differently:
 | `Engine::frame(now_ms, hooks)` | the caller has an absolute time. The engine **sets** the clock to that value, discarding any fractional remainder, and the delta handed to the hook is the distance from the previous frame's clock (zero on the first frame). A test drives frames this way. |
 
 All three return `Result<FrameReport, EngineError>`.
+
+A host with no window reads the frame back: `Engine::read_offscreen_frame()`
+answers with the RGBA8 device pixels of the last frame drawn into the
+offscreen target, and with `None` for a host that presents to a surface.
 
 ### 2.3 What one frame does, in order
 
@@ -188,7 +193,7 @@ same sequence:
 10. run `GameFrame::after_project(&drawn_layers)`;
 11. fit the presentation again, upload again and project again if the hook
     changed the scene's structure;
-12. **one** render call;
+12. **one** render call — into the surface, or into the offscreen target;
 13. recover a lost surface, record the frame in the presentation stall, bump
     the frame counter and return the report.
 
@@ -204,7 +209,7 @@ projection is rebuilt **in place**: the node list is cleared and refilled.
 |---|---|
 | `frame_index` | the number of frames drawn so far, counting this one |
 | `elapsed_ms` | the frame clock this frame ran at, with the fractional part for a clock advanced by `run`/`step` and without it for a clock set by `frame` |
-| `presented` | whether the frame reached the display. A frame with `presented == false` updated the scene but the backend kept the previous surface contents; the engine reports it and counts it into the current presentation stall |
+| `presented` | whether the frame reached its destination: the display for a surface, the offscreen target otherwise. A frame with `presented == false` updated the scene but the backend kept the previous surface contents; the engine reports it and counts it into the current presentation stall |
 | `stats` | the null backend's per-frame counters, `None` on a GPU backend |
 | `sync_ms` | the milliseconds spent syncing dirty bitmaps to textures |
 | `upload_ms` | the part of `sync_ms` spent uploading |
@@ -368,7 +373,8 @@ Two rules govern what is drawn:
 | `RenderScene` | the draw tree: the root node, the node list and the background |
 | `RenderNode` | one drawable: its content, its destination rectangle, its source rectangle, its transform, its blend mode and its z order |
 | `RenderState` | the GPU and staging bookkeeping for the surface; it is an explicit `&mut` value the caller owns |
-| `Surface` | the presented surface the pipeline renders into |
+| `Surface` | the surface the pipeline presents to |
+| `RenderTarget` | the offscreen target the pipeline draws into when the host has no window |
 | `Texture` | an uploaded bitmap texture |
 
 The projection's output is **not** on the compatibility layer's path: the

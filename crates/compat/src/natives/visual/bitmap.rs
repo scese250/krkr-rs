@@ -1172,7 +1172,16 @@ extern "C" fn bitmap_get_pixel(
     };
     // The image may still be decoding: the pixel is the decoded one.
     scene.resolve_bitmap(id);
-    set_int(out, read_bitmap_pixel(scene, id, x, y) & 0x00ff_ffff);
+    // The pose the layer shows lives on the backend, so the pixel is read
+    // back when a script asks for it: one pixel, borrowed, not copied.
+    let word = match scene.read_pixel(id, x, y) {
+        Ok(Some(pixel)) => rgba_to_pixel_word(pixel),
+        Ok(None) => read_bitmap_pixel(scene, id, x, y),
+        Err(error) => {
+            return report_error(out_error, &format!("Bitmap.getPixel: {error}"));
+        }
+    };
+    set_int(out, word & 0x00ff_ffff);
     0
 }
 
@@ -1248,7 +1257,16 @@ extern "C" fn bitmap_get_mask_pixel(
     };
     // The image may still be decoding: the pixel is the decoded one.
     scene.resolve_bitmap(id);
-    set_int(out, (read_bitmap_pixel(scene, id, x, y) >> 24) & 0xff);
+    // The pose the layer shows lives on the backend, so the pixel is read
+    // back when a script asks for it: one pixel, borrowed, not copied.
+    let word = match scene.read_pixel(id, x, y) {
+        Ok(Some(pixel)) => rgba_to_pixel_word(pixel),
+        Ok(None) => read_bitmap_pixel(scene, id, x, y),
+        Err(error) => {
+            return report_error(out_error, &format!("Bitmap.getMaskPixel: {error}"));
+        }
+    };
+    set_int(out, (word >> 24) & 0xff);
     0
 }
 

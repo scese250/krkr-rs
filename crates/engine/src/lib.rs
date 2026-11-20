@@ -55,7 +55,8 @@ pub use crate::clock::{FrameClock, FrameTimeSource, InjectedFrameTime};
 // The frame owner: the clock, the timer pump, the projection and the single
 // render call, plus the one upward hook the composition root implements.
 pub use crate::engine::{
-    Engine, EngineError, EngineOverlay, EngineParts, FrameReport, GameFrame, ObjectCounts,
+    Engine, EngineError, EngineOverlay, EngineParts, FrameReport, FrameTarget, GameFrame,
+    ObjectCounts,
 };
 // The fixed-seed lookup map the engine keys its per-bitmap tables with.
 pub use crate::hasher::Map;

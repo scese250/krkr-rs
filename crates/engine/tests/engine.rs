@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use api::geometry::{RectF, Transform2D};
 use api::host::SurfaceEvent;
+use engine::engine::FrameTarget;
 use engine::{Engine, EngineError, EngineOverlay, EngineParts, GameFrame, Rect};
 use render::{
     PipelineConfig, RenderContent, RenderNode, RenderPipeline, RenderState, Texture, TextureDesc,
@@ -68,7 +69,7 @@ fn headless_parts(size: (u32, u32)) -> EngineParts {
     let (surface, render_state) = begin_render_state(&pipeline, &handle).expect("surface");
     EngineParts {
         pipeline,
-        surface,
+        target: FrameTarget::Surface(surface),
         render_state,
         surface_size: size,
         headless: true,

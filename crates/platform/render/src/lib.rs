@@ -586,6 +586,34 @@ pub fn read_render_target(
     }
 }
 
+/// Copies a target's pixels into a texture.
+///
+/// The copy stays on the device: the pixels never reach the host. The
+/// texture must hold the target's whole image, and the copy replaces the
+/// texture's pixels.
+///
+/// # Errors
+///
+/// Returns [`RenderError::InvalidArgument`] when the texture is smaller than
+/// the target or the formats differ, [`RenderError::Framebuffer`] when the
+/// target was never rendered into, and [`RenderError::Unsupported`] for an
+/// unimplemented backend.
+pub fn copy_render_target_to_texture(
+    p: &RenderPipeline,
+    state: &mut RenderState,
+    target: &RenderTarget,
+    texture: &Texture,
+) -> Result<(), RenderError> {
+    match &p.kind {
+        PipelineKind::Null(backend) => {
+            backend.copy_render_target_to_texture(state, target, texture)
+        }
+        PipelineKind::Vulkan(backend) => {
+            backend.copy_render_target_to_texture(state, target, texture)
+        }
+    }
+}
+
 /// Renders `scene` into `surface`, mutating `state`.
 ///
 /// This is the only drawing entry point. The pipeline owns traversal,

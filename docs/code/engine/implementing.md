@@ -166,7 +166,7 @@ the engine, the obligation is met by review and by the shape of the type,
 not by a gate check.
 
 **Worked example.** `Engine` holds `scene`, `timer`, `input`, `clock`,
-`textures`, `render_scene`, `surface`, `render_state`, `translation`
+`textures`, `render_scene`, `target`, `render_state`, `translation`
 and the counters as its own fields (`crates/engine/src/engine.rs`).
 `Scene` holds the windows, layers, bitmaps and fonts
 (`crates/engine/src/scene.rs`); `TimerState` holds the registry
@@ -202,7 +202,7 @@ pub trait GameFrame {
   upload and projection, so the change is in the frame being drawn.
 
 **The frame returns** a report: the frame index, the elapsed time, whether
-the frame reached the display, the backend's counters, and the measured
+the frame reached its destination, the backend's counters, and the measured
 costs of the upload, prune, projection and draw phases.
 
 **How to tell.** Search the engine for a place where a delta is accumulated,
@@ -483,16 +483,17 @@ the clock is already set when it starts.
 | 8 | fit the presentation again — the hook may have resized a window's primary layer | `Engine::sync_presentation` |
 | 9 | if the sizes cannot be fitted: report the frame as not presented and draw nothing | the `translation.is_none()` branch of `Engine::run_frame` |
 | 10 | refresh the render-only overlay | `Engine::refresh_overlay` → `EngineOverlay::refresh` |
-| 11 | upload the dirty bitmap regions, prune the textures whose bitmap is gone | `Engine::sync_dirty_bitmaps`, `Engine::prune_stale_textures` |
-| 12 | project the scene when its structure revision changed | `Engine::reproject_render_scene` → `projection::project_scene_report` |
-| 13 | put the Fit presentation on the render-scene root | `PixelTranslation::root_transform` |
-| 14 | **run the upward hook again**, with the projected layer ids | `GameFrame::after_project(&self.drawn_layers)` |
-| 15 | fit the presentation again | `Engine::sync_presentation` |
-| 16 | upload and prune again — the hook may have rewritten a bitmap without changing the tree | `Engine::sync_dirty_bitmaps`, `Engine::prune_stale_textures` |
-| 17 | project again if the hook changed the scene's structure | `Engine::reproject_render_scene` |
-| 18 | draw the scene in one call | `render::render` |
-| 19 | recover a lost surface; record whether the display accepted the frame | `render::recover_surface`, the presentation-stall bookkeeping |
-| 20 | bump the frame counter and return the report | `FrameReport` |
+| 11 | draw the layers' draw lists on the backend — a layer's pose is drawn into the layer's own pose surface | `Engine::draw_layer_draw_lists` → `Scene::draw_layer_draws_gpu` |
+| 12 | upload the dirty bitmap regions, prune the textures whose bitmap is gone | `Engine::sync_dirty_bitmaps`, `Engine::prune_stale_textures` |
+| 13 | project the scene when its structure revision changed | `Engine::reproject_render_scene` → `projection::project_scene_report` |
+| 14 | put the Fit presentation on the render-scene root | `PixelTranslation::root_transform` |
+| 15 | **run the upward hook again**, with the projected layer ids | `GameFrame::after_project(&self.drawn_layers)` |
+| 16 | fit the presentation again | `Engine::sync_presentation` |
+| 17 | upload and prune again — the hook may have rewritten a bitmap without changing the tree | `Engine::sync_dirty_bitmaps`, `Engine::prune_stale_textures` |
+| 18 | project again if the hook changed the scene's structure | `Engine::reproject_render_scene` |
+| 19 | draw the scene in one call — into the surface, or into the offscreen target | `render::render`, `render::render_to_target` |
+| 20 | recover a lost surface; record whether the display accepted the frame | `render::recover_surface`, the presentation-stall bookkeeping |
+| 21 | bump the frame counter and return the report | `FrameReport` |
 
 Four properties of this order matter to a replacement:
 
@@ -523,7 +524,7 @@ Four properties of this order matter to a replacement:
 
 | extension point | how a replacement reaches it | what it may change |
 |---|---|---|
-| **the render backend** | `EngineParts::pipeline` | the whole draw path: the pipeline, the surface, the render state, the shaders, the effect pipelines. A backend that cannot run effect pipelines gets none, and the transitions that need one fall back to the CPU blend |
+| **the render backend** | `EngineParts::pipeline` | the whole draw path: the pipeline, the frame target, the render state, the shaders, the effect pipelines. A backend that cannot run effect pipelines gets none, and the transitions that need one fall back to the CPU blend |
 | **the image decoder** | `Engine::install_decoder` takes an `Arc<dyn ImageDecoder>` | the codec, the worker pool's configuration and its byte limit. A job the pool refuses is decoded on the calling thread instead |
 | **the storage reader** | `Engine::install_storage_reader` takes an `Arc<dyn StorageReader>` | the backing of the reads: a live file, an in-memory image, another source. The resolution order and the namespace stay the engine's |
 | **the storage namespace** | `Storage` | the mounts, the precedence, the auto paths, the resolution cache — all inside the engine, and all free to change as long as the observable order holds |

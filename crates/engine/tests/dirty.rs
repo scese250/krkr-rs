@@ -7,6 +7,7 @@
 //! screen, and the change must be drawn again.
 
 use api::geometry::PixelRegion;
+use engine::engine::FrameTarget;
 use engine::{Engine, EngineParts, GameFrame, Rect};
 use render::{PipelineConfig, begin_render_state, create_render_pipeline};
 use testkit::headless_window;
@@ -27,7 +28,7 @@ fn headless_parts(size: (u32, u32)) -> EngineParts {
     let (surface, render_state) = begin_render_state(&pipeline, &handle).expect("surface");
     EngineParts {
         pipeline,
-        surface,
+        target: FrameTarget::Surface(surface),
         render_state,
         surface_size: size,
         headless: true,

@@ -125,6 +125,16 @@ pub struct RenderNode {
     pub content: RenderContent,
     /// Node-local transform (translate/scale/rotate/pivot).
     pub transform: Transform2D,
+    /// The node's own placement, as a general 2×3 affine.
+    ///
+    /// A node that carries an affine places its content with it, and the
+    /// decomposed [`Self::transform`] is not read. The affine is the form a
+    /// placement needs when the decomposed transform cannot express it: a
+    /// shear, a skew or a rotation about an arbitrary axis.
+    ///
+    /// The affine maps the node's local space, so the content's rectangle
+    /// ([`Self::dst`]) is placed in the space the affine produces.
+    pub affine: Option<Affine2>,
     /// Destination rectangle in the parent's coordinate space.
     pub dst: RectF,
     /// Source sub-rectangle for textures (sprite-sheet frames, clipping).
@@ -156,6 +166,7 @@ impl Default for RenderNode {
             children: Vec::new(),
             content: RenderContent::None,
             transform: Transform2D::IDENTITY,
+            affine: None,
             dst: RectF::ZERO,
             src: PixelRegion::ZERO,
             opacity: 1.0,
@@ -267,7 +278,10 @@ pub(crate) fn children_are_sorted(scene: &RenderScene, children: &[RenderNodeId]
 /// the target, so a scale in `parent` scales the rectangle's origin and extent
 /// together.
 pub(crate) fn node_spaces(node: &RenderNode, parent: &Affine2) -> (Affine2, Affine2) {
-    let node_space = node.transform.to_affine().then(parent);
+    // The node's own placement is the general affine when it has one, and
+    // the decomposed transform otherwise.
+    let local = node.affine.unwrap_or_else(|| node.transform.to_affine());
+    let node_space = local.then(parent);
     let content_space = place_rect(&node.dst).then(&node_space);
     (node_space, content_space)
 }
@@ -336,5 +350,42 @@ mod tests {
         let (_node_space, content) = node_spaces(&node, &Affine2::IDENTITY);
         assert_close(content.transform_point((0.0, 0.0)), (7.0, 11.0));
         assert_close(content.transform_point((1.0, 1.0)), (20.0, 28.0));
+    }
+
+    /// A node's own affine places its content, and the decomposed transform is
+    /// not read: a shear is a placement the decomposed transform cannot
+    /// express.
+    #[test]
+    fn a_node_affine_places_the_content_with_its_shear() {
+        let node = RenderNode {
+            dst: RectF::new(0.0, 0.0, 1.0, 1.0),
+            affine: Some(Affine2 {
+                m11: 1.0,
+                m12: 0.5,
+                m21: 0.0,
+                m22: 1.0,
+                tx: 10.0,
+                ty: 20.0,
+            }),
+            ..RenderNode::default()
+        };
+        let (_node_space, content) = node_spaces(&node, &Affine2::IDENTITY);
+        assert_close(content.transform_point((0.0, 0.0)), (10.0, 20.0));
+        assert_close(content.transform_point((1.0, 0.0)), (11.0, 20.0));
+        assert_close(content.transform_point((0.0, 1.0)), (10.5, 21.0));
+    }
+
+    /// The affine composes with the parent transform: the parent's placement
+    /// is applied after the node's own.
+    #[test]
+    fn a_node_affine_composes_with_the_parent_transform() {
+        let node = RenderNode {
+            dst: RectF::new(0.0, 0.0, 1.0, 1.0),
+            affine: Some(Affine2::translation(3.0, 4.0)),
+            ..RenderNode::default()
+        };
+        let parent = Affine2::scale(2.0, 2.0);
+        let (_node_space, content) = node_spaces(&node, &parent);
+        assert_close(content.transform_point((0.0, 0.0)), (6.0, 8.0));
     }
 }

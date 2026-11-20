@@ -1003,6 +1003,143 @@ fn allocate_sampled_set(
     Ok(descriptor_set)
 }
 
+/// Copies the target's image into a texture's image.
+///
+/// The copy stays on the device: the pixels never reach the host. The
+/// target's image leaves the colour-attachment layout for the copy and
+/// comes back afterwards, and the texture's image leaves the sampled layout
+/// for the copy and comes back to it, so the presentation samples it as it
+/// did before.
+///
+/// # Errors
+///
+/// Returns [`RenderError::InvalidArgument`] when the texture is smaller
+/// than the target or the two formats differ.
+pub(crate) fn copy_to_texture(
+    submit: &OffscreenSubmit<'_>,
+    target: &mut VulkanRenderTarget,
+    texture: &mut VulkanTexture,
+) -> Result<(), RenderError> {
+    let OffscreenSubmit { device, .. } = *submit;
+    if texture.desc.width < target.desc.width || texture.desc.height < target.desc.height {
+        return Err(RenderError::InvalidArgument {
+            message: format!(
+                "the {}x{} texture is smaller than the {}x{} render target",
+                texture.desc.width, texture.desc.height, target.desc.width, target.desc.height
+            ),
+        });
+    }
+    if image_format(texture.desc.format) != image_format(target.desc.format) {
+        return Err(RenderError::InvalidArgument {
+            message: "the texture and the render target have different formats".to_owned(),
+        });
+    }
+    let extent = vk::Extent3D {
+        width: target.desc.width,
+        height: target.desc.height,
+        depth: 1,
+    };
+    // The texture's image holds pixels once it was uploaded, and is
+    // undefined before that.
+    let (old_layout, src_access, src_stage) = if texture.uploaded {
+        (
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        )
+    } else {
+        (
+            vk::ImageLayout::UNDEFINED,
+            vk::AccessFlags::empty(),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+        )
+    };
+    record_and_submit(submit, |command_buffer| {
+        // The target's image becomes a transfer source.
+        barrier_color(
+            device,
+            command_buffer,
+            target.image,
+            &Barrier {
+                old_layout: target.layout,
+                new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                dst_access: vk::AccessFlags::TRANSFER_READ,
+                src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                dst_stage: vk::PipelineStageFlags::TRANSFER,
+            },
+        );
+        // The texture's image becomes a transfer destination.
+        barrier_color(
+            device,
+            command_buffer,
+            texture.image,
+            &Barrier {
+                old_layout,
+                new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                src_access,
+                dst_access: vk::AccessFlags::TRANSFER_WRITE,
+                src_stage,
+                dst_stage: vk::PipelineStageFlags::TRANSFER,
+            },
+        );
+        let subresource = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0)
+            .base_array_layer(0)
+            .layer_count(1);
+        let copy = vk::ImageCopy::default()
+            .src_subresource(subresource)
+            .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .dst_subresource(subresource)
+            .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .extent(extent);
+        // SAFETY: the command buffer is recording and both handles are live.
+        unsafe {
+            device.cmd_copy_image(
+                command_buffer,
+                target.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                texture.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+        }
+        // The texture's image becomes a sampled image again.
+        barrier_color(
+            device,
+            command_buffer,
+            texture.image,
+            &Barrier {
+                old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                src_access: vk::AccessFlags::TRANSFER_WRITE,
+                dst_access: vk::AccessFlags::SHADER_READ,
+                src_stage: vk::PipelineStageFlags::TRANSFER,
+                dst_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+            },
+        );
+        // The target's image becomes a colour attachment again.
+        barrier_color(
+            device,
+            command_buffer,
+            target.image,
+            &Barrier {
+                old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                src_access: vk::AccessFlags::TRANSFER_READ,
+                dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                src_stage: vk::PipelineStageFlags::TRANSFER,
+                dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            },
+        );
+        Ok(())
+    })?;
+    target.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+    texture.uploaded = true;
+    Ok(())
+}
+
 /// One image-memory barrier's layout, access and stage span.
 struct Barrier {
     /// Layout the image is in before the barrier.
