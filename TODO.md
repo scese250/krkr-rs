@@ -1491,6 +1491,47 @@ run on a machine that has one; anything not compiled is documented as unverified
   UI is hardcoded English: `strings.xml` holds only `app_name`, with no
   `values-zh` (`docs.old/audits/android-ui-review.md` F5).
 
+* **The package's size, and what is left in it.** The measured package was
+  37,607,087 bytes: 24,001,412 of dex, 12,569,456 of native library, and the
+  rest. The dex is the launcher - 65% of its method bytecode is Jetpack
+  Compose, and 569,498 bytes of that is Material 3 the launcher never calls.
+  Three things landed: R8 with a keep-rule file the release job verifies
+  against the built package, the dex compressed in the package (the same bytes
+  deflate to 8,285,512), and the resources shrunk. **The size of the result is
+  not yet measured** - it needs the `apk` CI job, and the release job holds
+  the package to 30 MiB so a build that lost the shrinker fails. The native
+  library is 12,569,456 bytes: 8,673,996 of code, 1,473,828 of literals, 912,652
+  of unwind tables and 458,088 of dynamic relocations, of which about 3.6 MB is
+  the C and C++ the engine carries (the TJS2 virtual machine, the Opus decoder,
+  oniguruma).
+
+  **Open: the packed relocations.** The library's 19,070 relative relocations
+  cost 458,088 bytes as `Elf64_Rela` and about 5 KB in the packed `DT_RELR`
+  form, so the packing is worth 453 KB - 1.2% of the package. It is **not**
+  enabled: the device loader's ability to read the packed form cannot be
+  verified on this host, and the failure mode is an app that does not start.
+  One device launch settles it; `KRKR_ANDROID_PACK_RELOCS=1` would turn it on
+  (`crates/android/build-android.sh`).
+
+* **The launcher keeps Compose, and the direction is a native UI.** The
+  launcher is 4,056 lines of Kotlin, of which 1,506 are logic that no UI
+  change touches and 1,771 are Compose. Replacing the toolkit with plain
+  Android views would remove the dex's 65%, but the launcher is unverified on
+  any device, so a rewrite nobody can see run is not a trade worth making. The
+  direction is a launcher drawn by the engine's own renderer - the Vulkan
+  pipeline, the text rasteriser and the font registry are already there - which
+  would remove the toolkit and the dex with it. **Open: that is a project, not
+  a patch.**
+
+* **The gameplay harness's scene routes do not reach their scenes.** The
+  title page's button column sits at coordinates the harness recorded before
+  the logical screen became 1920x1080; the settings click at `(165, 1095)` is
+  15 pixels below the bottom edge, so `--scene settings` loads `custom.ks` and
+  never `option.ks`. **The title-to-settings measurement in `docs/perf.md`
+  §11.8 is therefore not a scene-change measurement** - it is the same path
+  the text route takes. The positions have to be read off the title page and
+  made relative to the logical screen before the number means anything.
+
 ## 15. Comments-gate debt
 
 `house-style` (`scripts/krkr_gates/checks/house_style.py`) enforces the D31
