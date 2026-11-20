@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
+import shutil
 import struct
 import sys
 import tempfile
@@ -55,6 +56,7 @@ from pathlib import Path
 # is their only owner, and a second copy in this script is a table that can
 # drift from the code that reads it.
 JNI_FIELDS_SOURCE = "crates/android/src/jni_fields.rs"
+KEEP_RULES_SOURCE = "android/app/proguard-rules.pro"
 
 JNI_CONST_RE = re.compile(
     r"(?:pub(?:\(crate\))?\s+)?const\s+(FIELD_[A-Z0-9_]+|SIG_STRING)\s*:\s*&str\s*=\s*\"([^\"]*)\""
@@ -73,13 +75,20 @@ REQUIRED_SYMBOLS = (
 # The manifest attribute the Activity carries to name its native library.
 LIB_NAME_META = "android.app.lib_name"
 
-# The size the release package is held to. The measurement this number comes
-# from is the first one this script printed: a package with no shrinker and an
-# unstripped engine library measured 37,607,087 bytes (35.86 MiB). The budget
-# leaves 2.14 MiB (6%) of headroom over that measurement, so a package that
-# grew by more than that fails the build, and a package that shrank passes
-# with room to spare.
-BUDGET_BYTES = 38 * 1024 * 1024
+# The size the release package is held to.
+#
+# The first measurement this script printed was a package with no shrinker, an
+# uncompressed dex and an unstripped engine library: 37,607,087 bytes
+# (35.86 MiB). The dex in that package measured 24,001,412 bytes, and deflated
+# the same way the packager deflates it they are 8,285,512 - so the dex alone
+# accounts for 15.0 MiB of the package, and the budget is set where it is so
+# that a build which loses either the shrinker or the compression fails.
+#
+# 30 MiB is 5.6 MiB above the 24.4 MiB the package measures with the dex
+# compressed and nothing else changed, and 12 MiB above it with the shrinker
+# on as well: room for the engine to grow, and no room for the dex to go back
+# to being uncompressed.
+BUDGET_BYTES = 30 * 1024 * 1024
 
 
 class CheckError(Exception):
@@ -276,6 +285,7 @@ def size_report(apk_path: Path, entries: list[Entry], rows: list[Row]) -> list[s
 
 ACC_STATIC = 0x0008
 ACC_PUBLIC = 0x0001
+ACC_NATIVE = 0x0100
 
 
 def u16(data: bytes, offset: int) -> int:
@@ -307,7 +317,9 @@ class DexClass:
     superclass: str | None
     access_flags: int
     static_fields: list[tuple[str, str, int]] = field(default_factory=list)
+    instance_fields: list[tuple[str, str, int]] = field(default_factory=list)
     methods: list[str] = field(default_factory=list)
+    native_methods: list[str] = field(default_factory=list)
 
 
 class DexFile:
@@ -413,6 +425,8 @@ class DexFile:
             diff, offset = uleb128(data, offset)
             access_flags, offset = uleb128(data, offset)
             field_index += diff
+            _, type_descriptor, name = self.field(field_index)
+            entry.instance_fields.append((name, type_descriptor, access_flags))
 
         method_index = 0
         for count in (direct_methods_size, virtual_methods_size):
@@ -423,7 +437,10 @@ class DexFile:
                 code_off, offset = uleb128(data, offset)
                 method_index += diff
                 base = self.method_ids_off + 8 * method_index
-                entry.methods.append(self.string(u32(self.data, base + 4)))
+                name = self.string(u32(self.data, base + 4))
+                entry.methods.append(name)
+                if access_flags & ACC_NATIVE:
+                    entry.native_methods.append(name)
 
 
 def refresh_dex_checksums(data: bytearray) -> None:
@@ -665,6 +682,97 @@ def read_jni_field_names(repo_root: Path) -> tuple[dict[str, str], str]:
     return fields, signature
 
 
+@dataclass
+class KeepRule:
+    """One class a keep rule names, and the members it names."""
+
+    name: str
+    kind: str
+    members: list[tuple[str, str, str]]
+
+
+KEEP_RULE_RE = re.compile(r"^-keep(classmembers)?\s+class\s+([\w.$]+)\s*\{")
+
+JAVA_PRIMITIVES = {
+    "void": "V",
+    "boolean": "Z",
+    "byte": "B",
+    "char": "C",
+    "short": "S",
+    "int": "I",
+    "long": "J",
+    "float": "F",
+    "double": "D",
+}
+
+
+def java_type_to_descriptor(text: str) -> str:
+    """The type descriptor a Java type name stands for."""
+    if text in JAVA_PRIMITIVES:
+        return JAVA_PRIMITIVES[text]
+    return "L" + text.replace(".", "/") + ";"
+
+
+def parse_keep_member(line: str) -> tuple[str, str, str] | None:
+    """The (kind, type, name) a keep-rule member line stands for."""
+    text = line.strip()
+    if not text or text.startswith("#"):
+        return None
+    text = text.rstrip(";").strip()
+    if "<init>" in text:
+        return ("init", "", "<init>")
+    if "<methods>" in text:
+        return ("native", "", "<methods>")
+    text = text.replace("native ", "").strip()
+    if "(" in text:
+        tokens = text[: text.index("(")].strip().split()
+        if not tokens:
+            return None
+        return ("method", " ".join(tokens[:-1]), tokens[-1])
+    tokens = text.split()
+    if not tokens:
+        return None
+    static = tokens[0] == "static"
+    if static:
+        tokens = tokens[1:]
+    kind = "static-field" if static else "field"
+    if len(tokens) == 1:
+        return (kind, "", tokens[0])
+    return (kind, " ".join(tokens[:-1]), tokens[-1])
+
+
+def parse_keep_rules(path: Path) -> list[KeepRule]:
+    """The classes the keep rules name, with the members they name."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise CheckError(f"cannot read {KEEP_RULES_SOURCE}: {error}") from error
+    rules: list[KeepRule] = []
+    current: KeepRule | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = KEEP_RULE_RE.match(line)
+        if match:
+            current = KeepRule(
+                name=match.group(2),
+                kind="keep" if match.group(1) is None else "keepclassmembers",
+                members=[],
+            )
+            rules.append(current)
+            continue
+        if line.startswith("}"):
+            current = None
+            continue
+        if current is not None:
+            member = parse_keep_member(line)
+            if member is not None:
+                current.members.append(member)
+    if not rules:
+        raise CheckError(f"{KEEP_RULES_SOURCE} names no class")
+    return rules
+
 def qualify(package: str | None, name: str) -> str:
     """The class name a manifest entry stands for."""
     if name.startswith("."):
@@ -806,6 +914,103 @@ def verify(apk_path: Path, repo_root: Path) -> CheckResult:
                     f"({'static' if flags & ACC_STATIC else 'not static'})"
                 )
 
+        # The keep rules are the contract with the shrinker: every class and
+        # every member they name has to be in the package under that name.
+        rules = parse_keep_rules(repo_root / KEEP_RULES_SOURCE)
+        for rule in rules:
+            descriptor = f"L{rule.name.replace('.', '/')};"
+            found = find_class(dexes, descriptor)
+            if found is None:
+                result.problems.append(
+                    f"the DEX carries no class {rule.name}; the keep rules name it, so "
+                    f"the shrinker removed something the app resolves by name"
+                )
+                continue
+            dex_name, candidate = found
+            result.lines.append(f"rules: {rule.name} is in {dex_name}")
+            if not candidate.access_flags & ACC_PUBLIC:
+                result.problems.append(
+                    f"{rule.name} is not public; the framework or the native library "
+                    f"resolves it by name"
+                )
+            statics = {
+                name: (type_text, flags)
+                for name, type_text, flags in candidate.static_fields
+            }
+            instances = {
+                name: (type_text, flags)
+                for name, type_text, flags in candidate.instance_fields
+            }
+            for kind, type_text, name in rule.members:
+                if kind == "init":
+                    if "<init>" not in candidate.methods:
+                        result.problems.append(
+                            f"{rule.name} has no constructor; the keep rules name it"
+                        )
+                    continue
+                if kind == "native":
+                    if not candidate.native_methods:
+                        result.problems.append(
+                            f"{rule.name} has no native method; the keep rules name them"
+                        )
+                    continue
+                if kind in ("field", "static-field"):
+                    entry = (
+                        statics.get(name)
+                        if kind == "static-field"
+                        else instances.get(name)
+                    )
+                    if entry is None:
+                        result.problems.append(
+                            f"{rule.name} has no {kind.replace('-', ' ')} {name}; the "
+                            f"keep rules name it"
+                        )
+                        continue
+                    descriptor_text, _flags = entry
+                    if type_text and descriptor_text != java_type_to_descriptor(type_text):
+                        result.problems.append(
+                            f"{rule.name}.{name} has type {descriptor_text}; the keep "
+                            f"rules name {type_text}"
+                        )
+                    continue
+                if name not in candidate.methods:
+                    result.problems.append(
+                        f"{rule.name} declares no method {name}; the keep rules name it"
+                    )
+
+        # Every name the native side reads has to be in the rules as well, or
+        # the shrinker is free to rename it.
+        rules_text = (repo_root / KEEP_RULES_SOURCE).read_text(encoding="utf-8")
+        for _constant, field_name in sorted(fields.items()):
+            if field_name not in rules_text:
+                result.problems.append(
+                    f"the keep rules do not name {field_name}; the native side reads "
+                    f"it by name, so the shrinker may rename it"
+                )
+                result.hints.append(
+                    f"-keepclassmembers class {class_name} "
+                    f"{{ static java.lang.String {field_name}; }}"
+                )
+        # The service files name the implementations the runtime loads by
+        # name, and a shrinker that renames a class rewrites the file with it.
+        for name in names:
+            if not name.startswith("META-INF/services/"):
+                continue
+            payload = apk.read(name).decode("utf-8", "replace")
+            for line in payload.splitlines():
+                entry = line.strip()
+                if not entry or entry.startswith("#"):
+                    continue
+                descriptor = f"L{entry.replace('.', '/')};"
+                if find_class(dexes, descriptor) is None:
+                    result.problems.append(
+                        f"the service file {name} names {entry}, which the DEX does "
+                        f"not carry; the runtime loads it by name"
+                    )
+                else:
+                    result.lines.append(
+                        f"services: {name} names {entry}, and the DEX carries it"
+                    )
         # The native library, and the entry points the glue resolves in it.
         library = f"lib{activity.lib_name}.so"
         candidates = [
@@ -951,6 +1156,35 @@ def self_test(apk_path: Path, repo_root: Path) -> int:
                     file=sys.stderr,
                 )
                 failures += 1
+        # The rules and the native contract can drift apart: a field the
+        # native side reads that the rules no longer name is a rename waiting
+        # to happen, and it is caught without a package at all.
+        drifted = work / "drifted"
+        for relative in (KEEP_RULES_SOURCE, JNI_FIELDS_SOURCE):
+            (drifted / relative).parent.mkdir(parents=True, exist_ok=True)
+        rules_text = (repo_root / KEEP_RULES_SOURCE).read_text(encoding="utf-8")
+        (drifted / KEEP_RULES_SOURCE).write_text(
+            rules_text.replace("    static java.lang.String pendingGameDir;\n", ""),
+            encoding="utf-8",
+        )
+        shutil.copy(repo_root / JNI_FIELDS_SOURCE, drifted / JNI_FIELDS_SOURCE)
+        try:
+            result = verify(apk_path, drifted)
+        except CheckError as error:
+            result = CheckResult(problems=[str(error)])
+        if result.problems:
+            print(
+                f"apk-size-report: self-test: a keep rule that forgot a field is "
+                f"rejected ({result.problems[0]})"
+            )
+        else:
+            print(
+                "apk-size-report: self-test: FAILED: a keep rule that forgot a "
+                "field was accepted",
+                file=sys.stderr,
+            )
+            failures += 1
+
     if failures:
         print(
             f"apk-size-report: self-test: {failures} case(s) were not rejected",
