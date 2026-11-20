@@ -30,7 +30,11 @@ task seems to need.**
 * **`cargo` writes to the disk** — the target directory, the registry, the
   incremental caches — so: no `cargo build`, `cargo check`, `cargo clippy`,
   `cargo test`, `cargo run` or `rustc`. The main agent runs the builds and
-  the test suites, one at a time, under a shared lock.
+  the test suites, one at a time, in the project's own `target/`, under the
+  shared lock `flock /tmp/cargo.lock`. **If the lock is held, another cargo
+  is running: do not start a second one.** Look at the holder — if it is a
+  stale or obsolete process, kill it and start again; otherwise wait for the
+  lock. Two cargos at once make both slow and the machine worse.
 * **`/mnt/e_drive` is the user's drive. Nothing may be written to it.** A
   worker that needs a baseline build, a copy of the tree, or more space than
   `/tmp` has **stops and reports it**; the main agent does it, or frees the
@@ -55,7 +59,10 @@ change is made the way it is; these say *what* you owe the next person.
 3. **Do not run cargo.** Not `cargo build`, `cargo check`, `cargo clippy`,
    `cargo test`, `cargo run` or `rustc`: concurrent builds in one target
    directory have livelocked this machine, and the main agent runs the builds
-   and the suites, one at a time. You may run `cargo fmt` / `rustfmt`
+   and the suites, one at a time, in the project's own `target/`, under the
+   shared lock `flock /tmp/cargo.lock`. If the lock is held, another cargo is
+   running — look at the holder, kill it if it is stale, and otherwise wait
+   rather than starting a second one. You may run `cargo fmt` / `rustfmt`
    (formatting is not a build), the compiler-free gate checks (§0.4), and
    already-built binaries.
    **A measurement needs a build, so you ask for one.** Write the
@@ -198,7 +205,7 @@ uv run --project scripts krkr-gate gate
 ```
 
 It runs the ordered **static** gate: `cargo fmt --all -- --check`; the
-`stateless`, `error-handling`, `house-style`, `layering`,
+`stateless`, `error-handling`, `house-style`, `log-format`, `layering`,
 `storage-boundary`, `native-construction`, `lifecycle-order`,
 `storage-media`, `callback-objthis`, `native-arity`, `void-getter` and
 `native-instance-lookup` checks;

@@ -28,24 +28,25 @@ It runs the steps below in this order and stops at the first failure:
 | 2 | `stateless` | check | no process-global state in the bottom-core crates (D9) |
 | 3 | `error-handling` | check | no silent fallbacks or dropped errors (AGENTS §4) |
 | 4 | `house-style` | check | bean accessors, parameter shapes, comment rules (AGENTS §5/§6) |
-| 5 | `layering` | check | layer vocabulary, unsafe placement, the L3↔L2 protocol |
-| 6 | `storage-boundary` | check | script storage names do not reach L2 or the host unstripped |
-| 7 | `native-construction` | check | native instances are constructed when they are created |
-| 8 | `lifecycle-order` | check | a native teardown must not take another script object's Scene record |
-| 9 | `storage-media` | check | reference storage-media domains are served or documented |
-| 10 | `callback-objthis` | check | callback-invoking native members carry objthis |
-| 11 | `native-arity` | check | reference zero-argument natives are not rejected |
-| 12 | `void-getter` | check | a native getter does not return a raw void where the reference returns an object |
-| 13 | `native-instance-lookup` | check | invalidated instances resolve by class; dispatch keeps the invalidation guard |
-| 14 | `cargo clippy --workspace --all-targets -- -D warnings` | cargo | the host build |
-| 15 | `cargo clippy -p platform --features platform-android --all-targets -- -D warnings` | cargo | the Android feature on the host |
-| 16 | `android-target` | check | no desktop-only backend leaks into the Android graph, or vice versa |
-| 17 | `surface-lock --update` | check | regenerate the live VM dispatch dump |
-| 18 | `surface-lock` | check | the dump matches the reviewed baseline (D29) |
-| 19 | `native-parity` | check | native class surface vs the reference |
-| 20 | `plugin-parity --no-doc` | check | plugin surface vs the reference |
-| 21 | `host-facts` | check | every host seam has a production installer |
-| 22 | `ci` | check | the release workflow contract (v* → Linux + Android in parallel → one release) |
+| 5 | `log-format` | check | every log record names its subsystem (`docs/rules/logging.md`) |
+| 6 | `layering` | check | layer vocabulary, unsafe placement, the L3↔L2 protocol |
+| 7 | `storage-boundary` | check | script storage names do not reach L2 or the host unstripped |
+| 8 | `native-construction` | check | native instances are constructed when they are created |
+| 9 | `lifecycle-order` | check | a native teardown must not take another script object's Scene record |
+| 10 | `storage-media` | check | reference storage-media domains are served or documented |
+| 11 | `callback-objthis` | check | callback-invoking native members carry objthis |
+| 12 | `native-arity` | check | reference zero-argument natives are not rejected |
+| 13 | `void-getter` | check | a native getter does not return a raw void where the reference returns an object |
+| 14 | `native-instance-lookup` | check | invalidated instances resolve by class; dispatch keeps the invalidation guard |
+| 15 | `cargo clippy --workspace --all-targets -- -D warnings` | cargo | the host build |
+| 16 | `cargo clippy -p platform --features platform-android --all-targets -- -D warnings` | cargo | the Android feature on the host |
+| 17 | `android-target` | check | no desktop-only backend leaks into the Android graph, or vice versa |
+| 18 | `surface-lock --update` | check | regenerate the live VM dispatch dump |
+| 19 | `surface-lock` | check | the dump matches the reviewed baseline (D29) |
+| 20 | `native-parity` | check | native class surface vs the reference |
+| 21 | `plugin-parity --no-doc` | check | plugin surface vs the reference |
+| 22 | `host-facts` | check | every host seam has a production installer |
+| 23 | `ci` | check | the release workflow contract (v* → Linux + Android in parallel → one release) |
 
 The `cargo` steps are the main agent's; they are the reason a worker may run a
 compiler-free check but may not run the build gate. `gate --no-cargo` runs the

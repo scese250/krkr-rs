@@ -31,6 +31,7 @@ from .checks import (
     host_facts,
     house_style,
     layering,
+    log_format,
     lifecycle_order,
     native_arity,
     native_construction,
@@ -51,6 +52,7 @@ CHECKS: dict[str, Callable[[list[str]], int]] = {
     "stateless": stateless.main,
     "error-handling": error_handling.main,
     "house-style": house_style.main,
+    "log-format": log_format.main,
     "layering": layering.main,
     "storage-boundary": storage_boundary.main,
     "native-construction": native_construction.main,
@@ -75,6 +77,7 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
     ("stateless", "check", "stateless", []),
     ("error-handling", "check", "error-handling", []),
     ("house-style", "check", "house-style", []),
+    ("log-format", "check", "log-format", []),
     ("layering", "check", "layering", []),
     ("storage-boundary", "check", "storage-boundary", []),
     ("native-construction", "check", "native-construction", []),
@@ -137,6 +140,7 @@ Checks:
   stateless        process-global state in the bottom-core crates
   error-handling   silent fallbacks and dropped errors (AGENTS §4)
   house-style      bean accessors, parameter shapes, comments (AGENTS §5/§6)
+  log-format       every log record names its subsystem (docs/rules/logging.md)
   layering         layer vocabulary and unsafe placement (AGENTS §2/§5)
   storage-boundary script storage names that reach L2 or the host unstripped
   native-construction native instances left unconstructed at create time
