@@ -57,9 +57,14 @@ change is made the way it is; these say *what* you owe the next person.
    directory have livelocked this machine, and the main agent runs the builds
    and the suites, one at a time. You may run `cargo fmt` / `rustfmt`
    (formatting is not a build), the compiler-free gate checks (§0.4), and
-   already-built binaries. A measurement needs a build: take the shared lock
-   (`flock /tmp/cargo.lock -c 'cargo ...'`), and report the load average with
-   your numbers — a load above about four invalidates a timing.
+   already-built binaries.
+   **A measurement needs a build, so you ask for one.** Write the
+   instrumentation, then end your turn with the exact build command and the
+   exact run command; the main agent builds it in the project's own `target/`
+   — where the cache already is, so the build is fast — and hands you the
+   binary to measure. You never take the lock yourself, and you never create
+   a build directory. Report the load average with your numbers: a load above
+   about four invalidates a timing.
 4. **Scratch goes under `/tmp`, never on the hard disk**, and you delete it
    when the task ends. `/tmp` is a 16 GB tmpfs: keep the build directories
    out of `/tmp/pi-patches/`, and remove them when they are done.
