@@ -1,6 +1,6 @@
 # Plugin surface parity
 
-> **Generated** by `krkr-gate plugin-parity` on 2026-11-01 — do not edit by hand.
+> **Generated** by `krkr-gate plugin-parity` on 2026-11-20 — do not edit by hand.
 
 Machine-diff of the reference KiriKiri plugin surface (`reference/cpp/plugins/**`) against the plugin classes the Rust engine registers (`crates/compat/src/natives/plugins/**`). A *missing* member exists in the reference but is not registered by Rust. An *extra* is a genuine plugin-surface addition: a member registered by a plugin file that the reference class does not have. Core natives (`natives/*.rs`) and members inherited from a shared registration table are counted separately.
 
@@ -62,7 +62,7 @@ Class and global members the reference installs after construction with ``PropSe
 | `GdiPlus` | 157 | 157 | 157 | 0 | 0 | 100.0% |
 | `GdiPlus.Appearance` | 3 | 4 | 3 | 0 | 0 | 100.0% |
 | `GdiPlus.Font` | 9 | 10 | 9 | 0 | 0 | 100.0% |
-| `GdiPlus.Image` | 0 | 34 | 0 | 0 | 0 | n/a |
+| `GdiPlus.Image` | 0 | 13 | 0 | 0 | 0 | n/a |
 | `GdiPlus.Matrix` | 0 | 16 | 0 | 0 | 0 | n/a |
 | `GdiPlus.Path` | 17 | 18 | 17 | 0 | 0 | 100.0% |
 | `GdiPlus.PointF` | 3 | 4 | 3 | 0 | 0 | 100.0% |
@@ -164,7 +164,7 @@ Plugin classes Rust registers that have no reference counterpart reachable throu
 | `Clipboard` | 2 | `crates/compat/src/natives/clipboard.rs` |
 | `Controller` | 1 | `crates/compat/src/natives/debug.rs` |
 | `Debug` | 12 | `crates/compat/src/natives/debug.rs` |
-| `GdiPlus.Image` | 34 |  |
+| `GdiPlus.Image` | 13 |  |
 | `GdiPlus.Matrix` | 16 |  |
 | `ImageFunction` | 12 | `crates/compat/src/natives/image_function.rs` |
 | `Key` | 4 | `crates/compat/src/natives/input.rs` |
