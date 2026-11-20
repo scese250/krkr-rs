@@ -1703,11 +1703,19 @@ impl Scene {
                 // chain holds nothing of it.
                 break;
             };
-            if keeps_region && let Some(layer) = self.layer_mut_untracked(cid) {
-                layer.content_region = Some(match layer.content_region {
-                    Some(current) => current.union(&clipped),
-                    None => clipped,
-                });
+            if let Some(layer) = self.layer_mut_untracked(cid) {
+                if keeps_region {
+                    layer.content_region = Some(match layer.content_region {
+                        Some(current) => current.union(&clipped),
+                        None => clipped,
+                    });
+                } else {
+                    // A layer that does not cache keeps no region at all, so a
+                    // region left from when it did cache is stale: the
+                    // composite would reconstruct that part alone and leave
+                    // the rest of the content as it was.
+                    layer.content_region = None;
+                }
             }
             area = clipped;
         }
@@ -3768,7 +3776,15 @@ impl Scene {
         };
         if count == 0 {
             let (display, content) = match self.layer_mut_untracked(id) {
-                Some(layer) => (layer.cache_bitmap.take(), layer.cache_content.take()),
+                Some(layer) => {
+                    // A layer keeps a recalculation region only while its
+                    // caching is enabled, so the region goes with the cache:
+                    // a region left behind would have the composite
+                    // reconstruct that part alone and leave the rest of the
+                    // content as it was.
+                    layer.content_region = None;
+                    (layer.cache_bitmap.take(), layer.cache_content.take())
+                }
                 None => (None, None),
             };
             if display != content

@@ -153,13 +153,23 @@ fn advancing_an_effect_keeps_the_layer_content_reusable() {
     let pixels = 4 * 4 * 4;
     let source = scene.add_bitmap(4, 4, vec![0u8; pixels]);
     let other = scene.add_bitmap(4, 4, vec![0u8; pixels]);
-    {
-        let state = scene.layer_mut(layer).expect("layer");
-        state.rect = Rect::new(0, 0, 4, 4);
-        state.visible = true;
-        state.bitmap = Some(source);
-    }
+    // The transition holds a cache consumer on the layer for as long as it
+    // runs (`IncCacheEnabledCount`, LayerIntf.cpp:7869-7876), so the layer
+    // caches and keeps a recalculation region while it does.
+    scene.inc_cache_enabled_count(layer);
+    scene
+        .update_layer(layer, |state| {
+            state.rect = Rect::new(0, 0, 4, 4);
+            state.visible = true;
+            state.bitmap = Some(source);
+            true
+        })
+        .expect("the layer is updated");
     let region = scene.layer_content_region(layer);
+    assert!(
+        region.is_some(),
+        "a caching layer keeps the region its change marked: {region:?}"
+    );
 
     let first = cross_fade(25.0)
         .effect_draw(source, other, (4, 4), true)
@@ -182,9 +192,14 @@ fn advancing_an_effect_keeps_the_layer_content_reusable() {
     );
 
     scene.set_effect(layer, None);
+    // The teardown releases the cache consumer (`DecCacheEnabledCount`,
+    // LayerIntf.cpp:7961-7964), and a layer keeps a recalculation region only
+    // while its caching is enabled (`:6318-6331`), so the region goes with
+    // the cache and the next composite is a fresh one.
+    scene.dec_cache_enabled_count(layer);
     assert!(
         scene.layer_content_region(layer) != region,
-        "clearing the draw resumes from a fresh composite"
+        "releasing the cache resumes from a fresh composite"
     );
 }
 
