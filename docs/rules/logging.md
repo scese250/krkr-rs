@@ -33,24 +33,39 @@ from. It is the crate, and the module inside it:
 
 | subsystem | what it covers |
 |---|---|
-| `app.frame` | the frame body, its phases and the slow-frame report |
 | `app.audio` | the audio device, its underruns and its playback cap |
+| `app.frame` | the frame body, its phases and the slow-frame report |
+| `app.runner` | the run: the mount, the window and the report it prints |
 | `app.startup` | the open sequence and its phases |
+| `android.host` | the Android composition root |
+| `android.input` | the Android input queue and the touch mapping |
+| `compat.audio` | the sound natives and the mixer |
+| `compat.event` | the event adapter |
+| `compat.font` | the font natives |
+| `compat.image` | the image natives and the pixel operations |
+| `compat.kag` | the KAG parser and the scenario |
+| `compat.layer` | the Layer natives, their focus and their transitions |
+| `compat.menu` | the menu natives |
+| `compat.plugin` | the plugin link and the plugin classes |
+| `compat.psb` | the PSB plugin |
+| `compat.scripts` | the script natives and the storage scripts |
+| `compat.sound` | the sound buffer natives |
+| `compat.storage` | the storage natives |
+| `compat.system` | the system natives |
+| `compat.timer` | the timer natives |
+| `engine.audio` | the engine mixer |
+| `engine.frame` | the frame clock and the engine frame |
+| `engine.jobpool` | the decode pool |
+| `engine.projection` | the projection of the scene onto the screen |
 | `engine.scene` | the layer tree, the layers and their properties |
 | `engine.storage` | the archives, the entries and the reads |
 | `engine.text` | the fonts and the text measurement |
-| `engine.frame` | the frame clock and the projection |
-| `compat.layer` | the `Layer` natives |
-| `compat.sound` | the sound natives |
-| `compat.scripts` | the script natives and the storage scripts |
-| `compat.kag` | the KAG parser and the scenario |
-| `compat.plugin` | the plugin link and the plugin classes |
-| `compat.event` | the event adapter |
-| `platform.render` | the renderer and the backends |
-| `platform.media` | the decoders |
+| `engine.timer` | the engine timers |
+| `platform.fs` | the file system |
 | `platform.linux` | the desktop window, the audio device and the clock |
+| `platform.media` | the decoders |
+| `platform.render` | the renderer and the backends |
 | `vm.tjs` | the script VM host |
-| `android.host` | the Android composition root |
 
 A subsystem that is not in this list is added to it, with the module it
 covers. The list is the whole vocabulary.
