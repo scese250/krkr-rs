@@ -79,6 +79,18 @@ change is made the way it is; these say *what* you owe the next person.
    a measurement, so a number taken under load is not a result.
 7. **Review the patch, not only the report** (§0.3), and **commit in stages**:
    a reviewed stage is a commit of its own, never one large commit at the end.
+8. **Freeing disk space is a surgical act, never a blanket delete.** When
+   the target directory has to shrink, remove what the build does not need
+   — the stale artifacts of sources that were deleted, the abandoned
+   incremental directories, the build directories of a dependency that is
+   gone — and keep what the next build would have to rebuild: the compiled
+   dependencies and the incremental cache of every crate that is still in
+   the tree. **Do not delete `target/debug` or `target/release` wholesale.**
+   The debug cache is what makes a cold rebuild cheap: `compat` alone is
+   over 100 000 lines, and rebuilding it and its dependency tree from
+   nothing costs the better part of an hour of wall clock that buys
+   nothing. Delete a cache only when the user asks for it, and then say
+   what the next build will cost.
 
 ---
 
