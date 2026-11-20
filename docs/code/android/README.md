@@ -34,7 +34,7 @@ The launcher's own interface — the Kotlin side of the app, under
 | `config` | `src/config.rs` | the launcher's settings → the validated `RuntimeConfig` | [config.md](config.md) |
 | `jni_fields` | `src/jni_fields.rs` | the static-field JNI reads | [config.md](config.md) §4 |
 | — | `build-android.sh` | the cross-compile, the staging and the verification | [build.md](build.md) |
-| — | `check-jni-libs.sh` | the packaging check: the dependencies and the page alignment of the staged libraries | [build.md](build.md) §6 |
+| — | `check-jni-libs.sh` | the packaging check: the dependencies and the page alignment of the staged libraries | [build.md](build.md) §7 |
 
 ---
 
@@ -160,7 +160,8 @@ is no NDK and none may be installed, so:
 
 Everything Android-only is therefore documented as **unverified**, never as
 working. The pieces that a device must still show are listed in
-[build.md](build.md) §7 and in [`android.md`](../../../docs.old/android.md) §8.
+[build.md](build.md) §9, for the engine, and in [ui.md](ui.md) §8, for the
+launcher.
 
 What *is* host-tested: the state-file writer, the log-file sink, the settings
 resolver, the JNI field names, and the whole touch → mouse state machine.

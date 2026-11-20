@@ -22,7 +22,7 @@ picks the folder at runtime.
 
 The package is checked by `crates/android/check-jni-libs.sh`, which runs on
 the staged directory before Gradle sees it and on the finished APK in CI —
-see §6.
+see §7.
 
 ---
 
@@ -82,7 +82,7 @@ per-API directory **first** and the root **last** in the link search path. With
 the root first, `-lc` resolves `libc.a` and the engine links a private bionic:
 the library then has no `libc.so` in `DT_NEEDED`, the dynamic linker never
 initialises that copy, and it crashes before `android_main`. The ordering is
-pinned in `build-android.sh`; §6 rejects a package that carries bionic.
+pinned in `build-android.sh`; §7 rejects a package that carries bionic.
 
 The static runtime is also the right choice for the page size: the shared
 runtime of the NDK is only 16 KB aligned from NDK r28 on, and the package is
@@ -139,7 +139,7 @@ for `RUSTFLAGS` and dropping it would silently discard the caller's flags.
 The verification reads the `PT_LOAD` alignments with `readelf` and refuses to
 package a library whose alignment is not a non-zero multiple of `0x4000`. A
 missing `readelf` is an error too: the script refuses to package an
-*unverifiable* library. The rule lives in `check-jni-libs.sh` (§6), which
+*unverifiable* library. The rule lives in `check-jni-libs.sh` (§7), which
 checks every library of the package, not only the engine's.
 
 ---
@@ -227,7 +227,75 @@ first.
 
 ---
 
-## 6. The packaging check
+## 6. The package's size
+
+The release package is one file, and what is in it decides how long it takes
+to download. The measured v2.1.2 package was 37,607,087 bytes:
+
+```
+classes.dex                        13,672,636   36.4%
+lib/arm64-v8a/libkrkr_android.so  12,569,456   33.5%
+classes2.dex                      10,328,776   27.5%
+resources.arsc                        668,496    1.8%
+the res/, assets/, META-INF/ and kotlin/ trees   about 367,000    1.0%
+```
+
+**The dex is the package's bulk, and the dex is the launcher.** The engine is
+the native library; the dex holds the Kotlin launcher and the libraries it
+pulls in. Reading the dex's own tables gives the method bytecode by library:
+
+```
+androidx.compose   10,301 classes  64,695 methods  3,880,870 bytes  65.4%
+kotlin/ (stdlib)      976 classes  10,388 methods    550,406 bytes   9.3%
+androidx.collection   162 classes   3,332 methods    265,216 bytes   4.5%
+androidx.core       1,069 classes   6,990 methods    254,338 bytes   4.3%
+kotlinx.coroutines    858 classes   4,582 methods    205,696 bytes   3.5%
+androidx.appcompat    444 classes   4,236 methods    191,070 bytes   3.2%
+dev.krkr.rs           253 classes                 93,872 bytes   1.6%
+the game activity      13 classes                   6,324 bytes   0.1%
+```
+
+The launcher is 4,056 lines of Kotlin; the toolkit it uses is 65% of the dex.
+
+### The three levers, and what each is worth
+
+| lever | what it does | size |
+|---|---|---|
+| **the dex is compressed** | the packager deflates the dex instead of storing it | 24,001,412 -> 8,285,512 bytes; **-15.0 MiB** |
+| **R8 shrinks the launcher** | the code with no caller is removed, with its strings, annotations and classes | an estimate; see below |
+| **the resources are shrunk** | the resources nothing refers to are dropped | about 0.1-0.2 MB |
+
+The compression figure is exact: it is the shipped dex bytes put through the
+same deflate the packager uses. The R8 figure is an estimate, because R8
+needs the compiled Kotlin classes and an SDK, and neither is on this host.
+
+**R8's rules are in `android/app/proguard-rules.pro`, and they are checked.**
+The engine reads seven static fields off its Activity with `GetStaticFieldID`,
+and the game-activity glue finds its class and its methods with `FindClass`,
+`RegisterNatives` and `GetMethodID` - all by name. A shrinker that renamed
+one of them would leave a package that installs, launches and dies on the
+device, with nothing in the build log to show for it. The release job
+therefore reads the rules out of the built package and checks every class and
+member they name, and separately checks that the rules name every field the
+native side reads (`scripts/apk_size_report.py`).
+
+### What is not possible here
+
+The dex cannot be made smaller by being fetched at run time. Android has no
+shared library for application code; loading code from writable storage is
+forbidden since Android 14 (the app targets 35); and the one sanctioned
+mechanism, Play's feature modules, needs Play distribution, which this
+project does not use - the package is published as one file.
+
+The toolkit itself could be replaced - the launcher is a folder list, a
+settings page and a log viewer, and plain Android views would cost nothing
+in dex - but the launcher is unverified on any device (§9), so a rewrite
+that nobody can see run is not a trade worth making. The direction is a
+launcher drawn by the engine's own renderer, which would remove the toolkit
+and the dex with it.
+---
+
+## 7. The packaging check
 
 `crates/android/check-jni-libs.sh` verifies that the native libraries of the
 package can be loaded on a device. It takes either a directory of `.so` files
@@ -254,7 +322,7 @@ the rules fire — a check that cannot fail is not a check.
 
 ---
 
-## 7. CI
+## 8. CI
 
 `.github/workflows/release.yml` triggers on **`v*` tags** and on
 `workflow_dispatch`. A branch push triggers nothing. One tag builds the Linux
@@ -271,7 +339,7 @@ Android `apk` job installs the NDK, the SDK platform and the build tools, JDK
 21, Rust with the `aarch64-linux-android` target, Zig (the C++ dependency fetch
 needs it) and `bison` (the TJS2 parser generator), runs the same
 `build-android.sh`, runs `gradle :app:assembleRelease`, checks the packaged
-native libraries (§6), and uploads the APK as an artifact. The Linux job builds the desktop binary
+native libraries (§7), and uploads the APK as an artifact. The Linux job builds the desktop binary
 with the runner's `clang++ -stdlib=libc++` (Zig 0.17 still fetches the C++
 dependencies; its newer libc++ headers would not match Ubuntu's runtime) and
 uploads its archive. A single final `release` job needs
@@ -288,7 +356,7 @@ The complete gate, test and release contract is
 
 ---
 
-## 8. What is not verified here
+## 9. What is not verified here
 
 **The Android target is never built or tested on the development host.** There
 is no NDK and none may be installed. The host-side equivalents are:
@@ -319,7 +387,7 @@ staging-copy transport is the current default.
 
 ---
 
-## 9. Related documents
+## 10. Related documents
 
 | topic | document |
 |---|---|

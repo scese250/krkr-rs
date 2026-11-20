@@ -156,7 +156,7 @@ None. `psd` is pure Rust and compiles identically on every target.
 aarch64 Android build and run are **unverified** — the same limitation the
 whole Android target carries (see
 [`../../platform/README.md`](../../platform/README.md) §7 and
-[`../../android/build.md`](../../android/build.md) §6).
+[`../../android/build.md`](../../android/build.md) §7).
 
 ---
 
