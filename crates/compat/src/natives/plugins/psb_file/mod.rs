@@ -70,8 +70,9 @@
 //!
 //! # Architecture
 //!
-//! The class owns its parsed [`container::PsbDocument`] in the native
-//! instance payload; nothing lives in a process global. Encoding values for
+//! The class owns the container it loaded in the native instance payload;
+//! the container holds the parsed [`container::PsbDocument`] and the index
+//! of its chunks, and nothing lives in a process global. Encoding values for
 //! TJS builds real TJS `Dictionary`/`Array` objects through the engine, so a
 //! game script sees the same shapes as the reference `toTJSVal` conversions.
 #![allow(unsafe_code)]
@@ -91,7 +92,7 @@ use tjs::{
     Tjs2Engine, TjsValue, VAL_STRING, Value,
 };
 
-use psd::container::{PsbDocument, PsbValue};
+use psd::container::PsbValue;
 
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
 use crate::natives::plugins::var_file;
@@ -107,7 +108,8 @@ use crate::{CompatCtx, CompatError, CompatServices};
 /// The parsed document and the path it was loaded from.
 #[derive(Default)]
 struct PsbFileInst {
-    document: Option<Rc<PsbDocument>>,
+    /// The container the document is held in, with the index of its chunks.
+    container: Option<Rc<media::PsbContainer>>,
     path: Option<String>,
 }
 
@@ -207,7 +209,7 @@ fn set_built(
 /// Convert a parsed value into a TJS value/object tree.
 fn build_value(
     host: &Tjs2Engine,
-    document: &PsbDocument,
+    container: &media::PsbContainer,
     value: &PsbValue,
 ) -> Result<Built, String> {
     match value {
@@ -220,7 +222,7 @@ fn build_value(
         PsbValue::Double(value) => Ok(Built::Scalar(TjsValue::Real(*value))),
         PsbValue::String(value) => Ok(Built::Scalar(TjsValue::String(value.clone()))),
         PsbValue::Resource(reference) => {
-            let Some(bytes) = document.resource_bytes(*reference) else {
+            let Some(bytes) = container.bytes(*reference) else {
                 let table = if reference.extra { "extra" } else { "normal" };
                 return Err(format!(
                     "the container carries no bytes for the resource {} of the {table} chunk table",
@@ -242,7 +244,7 @@ fn build_value(
         PsbValue::List(items) => {
             let array = array_new(host)?;
             for item in items {
-                let built = build_value(host, document, item)?;
+                let built = build_value(host, container, item)?;
                 add_built(host, array.raw_id(), built)?;
             }
             Ok(Built::Object(array))
@@ -250,7 +252,7 @@ fn build_value(
         PsbValue::Dictionary(entries) => {
             let dictionary = dictionary_new(host)?;
             for (key, item) in entries {
-                let built = build_value(host, document, item)?;
+                let built = build_value(host, container, item)?;
                 set_built(host, dictionary.raw_id(), key, built)?;
             }
             Ok(Built::Object(dictionary))
@@ -264,13 +266,13 @@ fn build_value(
 /// The reference only enumerates `getObjects()`, which null-casts for every
 /// non-dictionary root and yields an empty custom object; a dictionary root
 /// produces a **fresh** object per read.
-fn build_root(host: &Tjs2Engine, document: &PsbDocument) -> Result<DetachedValue, String> {
-    let PsbValue::Dictionary(entries) = &document.root else {
+fn build_root(host: &Tjs2Engine, container: &media::PsbContainer) -> Result<DetachedValue, String> {
+    let PsbValue::Dictionary(entries) = container.root() else {
         return dictionary_new(host);
     };
     let dictionary = dictionary_new(host)?;
     for (key, item) in entries {
-        let built = build_value(host, document, item)?;
+        let built = build_value(host, container, item)?;
         set_built(host, dictionary.raw_id(), key, built)?;
     }
     Ok(dictionary)
@@ -404,7 +406,7 @@ extern "C" fn psb_invalidate(_engine: *mut c_void, instance: *mut c_void) {
         return;
     }
     let inst = instance_mut(instance);
-    inst.document = None;
+    inst.container = None;
     inst.path = None;
 }
 
@@ -441,14 +443,16 @@ fn load_document(ctx: &CompatCtx, inst: &mut PsbFileInst, path: &str) -> Result<
     match parsed {
         Ok(document) => {
             let document = Rc::new(document);
-            inst.document = Some(Rc::clone(&document));
-            inst.path = Some(path.to_string());
             // A `load` registers the resources that sit directly under the
             // root: the `psb://` media serves them under the container's
             // normalized name, and the `var://` media serves them under the
-            // name the script reads them through.
+            // name the script reads them through. The container the media
+            // holds is the one the instance converts, so the document and
+            // the index of its chunks have one owner.
             let container = media::media(services)
                 .register_root_resources(&normalize_psb_domain(path), Rc::clone(&document));
+            inst.container = Some(Rc::clone(&container));
+            inst.path = Some(path.to_string());
             publish_to_var_media(services, path, container);
             Ok(true)
         }
@@ -604,8 +608,8 @@ extern "C" fn psb_root_get(
     let inst = instance_ref(instance);
     let path = inst.path.as_deref().unwrap_or("<no container>");
     let started = Instant::now();
-    let built = match inst.document.as_deref() {
-        Some(document) => build_root(host, document),
+    let built = match inst.container.as_deref() {
+        Some(container) => build_root(host, container),
         None => dictionary_new(host),
     };
     report_slow_root(services, path, started.elapsed());

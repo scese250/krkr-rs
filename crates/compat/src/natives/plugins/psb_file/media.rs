@@ -43,11 +43,51 @@ pub(crate) enum PsbScope {
 pub(crate) struct PsbContainer {
     /// The parsed document the resources are read from.
     document: Rc<PsbDocument>,
+    /// The place of every chunk in the document's chunk table, by the
+    /// chunk's handle.
+    ///
+    /// The document holds its chunks in a vector and finds one by walking
+    /// it. A chunk is asked for by its handle, and the conversion asks for
+    /// one per resource node, so the walk made the conversion quadratic in
+    /// the number of chunks. The index is built once, when the container
+    /// is, and the lookup is a hash hit.
+    chunks: Map<ResourceRef, usize>,
     /// Which of its resources the media serves.
     scope: PsbScope,
 }
 
 impl PsbContainer {
+    /// The container of `document`, serving the resources of `scope`.
+    fn new(document: Rc<PsbDocument>, scope: PsbScope) -> Self {
+        let chunks = document
+            .resources
+            .iter()
+            .enumerate()
+            .map(|(position, (reference, _))| (*reference, position))
+            .collect();
+        Self {
+            document,
+            chunks,
+            scope,
+        }
+    }
+
+    /// The bytes of the chunk the handle names.
+    ///
+    /// `None` when the container carries no such chunk.
+    pub(crate) fn bytes(&self, reference: ResourceRef) -> Option<&[u8]> {
+        let position = *self.chunks.get(&reference)?;
+        self.document
+            .resources
+            .get(position)
+            .map(|(_, data)| data.as_slice())
+    }
+
+    /// The container's root value.
+    pub(crate) fn root(&self) -> &PsbValue {
+        &self.document.root
+    }
+
     /// The resource the member path names, in this container's scope.
     fn resource(&self, member: &str) -> Option<ResourceRef> {
         match self.scope {
@@ -116,10 +156,7 @@ impl PsbMedia {
         container: &str,
         document: Rc<PsbDocument>,
     ) -> Rc<PsbContainer> {
-        let entry = Rc::new(PsbContainer {
-            document,
-            scope: PsbScope::RootResources,
-        });
+        let entry = Rc::new(PsbContainer::new(document, PsbScope::RootResources));
         self.containers
             .borrow_mut()
             .insert(container.to_string(), Rc::clone(&entry));
@@ -135,7 +172,7 @@ impl PsbMedia {
     fn register(&self, container: &str, document: Rc<PsbDocument>, scope: PsbScope) {
         self.containers.borrow_mut().insert(
             container.to_string(),
-            Rc::new(PsbContainer { document, scope }),
+            Rc::new(PsbContainer::new(document, scope)),
         );
     }
 
@@ -144,12 +181,12 @@ impl PsbMedia {
     /// `path` is the storage name with its scheme removed:
     /// `<container>/<member path>`. `None` when the media holds no container
     /// under that name, or the container holds no member under that path.
-    fn lookup(&self, path: &str) -> Option<(Rc<PsbDocument>, ResourceRef)> {
+    fn lookup(&self, path: &str) -> Option<(Rc<PsbContainer>, ResourceRef)> {
         let (container, member) = path.split_once('/')?;
         let containers = self.containers.borrow();
         let entry = containers.get(&normalize_psb_domain(container))?;
         let reference = entry.resource(member)?;
-        Some((Rc::clone(&entry.document), reference))
+        Some((Rc::clone(entry), reference))
     }
 
     /// Reports a read that took longer than the threshold.
@@ -178,7 +215,7 @@ impl VarContainer for PsbContainer {
         let Some(reference) = self.resource(name) else {
             return Ok(None);
         };
-        match self.document.resource_bytes(reference) {
+        match self.bytes(reference) {
             Some(bytes) => Ok(Some(bytes.to_vec())),
             None => Err(format!(
                 "the container carries no bytes for the member {name}"
@@ -209,15 +246,15 @@ impl StorageMedia for PsbProvider {
 
     fn read(&self, path: &str) -> Result<Vec<u8>, StorageReadError> {
         let started = Instant::now();
-        let Some((document, reference)) = self.media.lookup(path) else {
+        let Some((container, reference)) = self.media.lookup(path) else {
             // A member the container does not hold is a missing storage, not
             // a failure: the caller decides what a missing member means.
             return Err(StorageReadError::NotFound(path.to_string()));
         };
         let lookup_ms = started.elapsed().as_secs_f64() * 1000.0;
         let copy_started = Instant::now();
-        let bytes = document
-            .resource_bytes(reference)
+        let bytes = container
+            .bytes(reference)
             .map(<[u8]>::to_vec)
             .ok_or_else(|| StorageReadError::Media {
                 media: "psb".to_string(),
@@ -314,5 +351,41 @@ pub(crate) mod fixture {
         media.register_whole_tree(container, document);
         storage.register_media(Box::new(provider(media)));
         storage
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use super::fixture::{chunk, container};
+    use super::{PsbContainer, PsbScope, PsbValue};
+
+    /// Every chunk of a container is reachable by its reference.
+    ///
+    /// The container indexes its chunks once, when it is built, and the
+    /// conversion asks for a chunk by its reference — once per resource
+    /// node. A chunk the index dropped, or one it placed at another
+    /// chunk's position, would hand the script another chunk's bytes.
+    #[test]
+    fn every_chunk_is_reachable_by_its_reference() {
+        let chunks = vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()];
+        let document = container(
+            PsbValue::Dictionary(vec![("res".to_string(), PsbValue::Resource(chunk(1)))]),
+            chunks.clone(),
+        );
+        let held = PsbContainer::new(Rc::new(document), PsbScope::RootResources);
+        for (index, bytes) in chunks.iter().enumerate() {
+            assert_eq!(
+                held.bytes(chunk(index as u32)),
+                Some(bytes.as_slice()),
+                "the chunk {index} must be reachable by its reference"
+            );
+        }
+        assert_eq!(
+            held.bytes(chunk(3)),
+            None,
+            "a chunk the container does not carry answers nothing"
+        );
     }
 }

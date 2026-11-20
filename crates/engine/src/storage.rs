@@ -1184,17 +1184,23 @@ fn read_archive_entry(
     })
 }
 
-/// The bytes a read outcome holds, before the extraction filter runs.
+/// The bytes a read outcome holds, taken out of it without copying them
+/// when the outcome holds the only owner of them.
+///
+/// The pool hands its ownership over when the caller takes a read out of
+/// it, so the bytes move to the caller instead of being copied on the
+/// thread that asked for them. An outcome the pool still holds is copied,
+/// because the pool's copy and the caller's are the same bytes.
 ///
 /// A failed or cancelled read is the storage's own typed error; there is no
 /// substitute value and no empty result. A file that vanished between the
 /// resolution and the read is the same not-found the resolution reports.
-fn outcome_to_payload(
-    outcome: StorageOutcome,
-    name: &str,
-) -> Result<StorageBytes, StorageReadError> {
+fn take_payload(outcome: StorageOutcome, name: &str) -> Result<StorageBytes, StorageReadError> {
     match outcome {
-        StorageOutcome::Ready(payload) => Ok((*payload).clone()),
+        StorageOutcome::Ready(payload) => Ok(match Arc::try_unwrap(payload) {
+            Ok(bytes) => bytes,
+            Err(shared) => (*shared).clone(),
+        }),
         StorageOutcome::Failed(StorageReadError::Fs(FsError::NotFound { .. })) => {
             Err(StorageReadError::NotFound(name.to_string()))
         }
@@ -2326,7 +2332,7 @@ impl Storage {
         let key = StorageKey::new(name, None, self.generation);
         // A read the frame already published is answered with its result.
         if let Some(outcome) = pool.peek_completed(&key) {
-            let payload = outcome_to_payload(outcome, name)?;
+            let payload = take_payload(outcome, name)?;
             return Ok(Some(StorageEntry::File {
                 name: name.to_string(),
                 pending: PendingStorage::ready(payload, plan.size),
@@ -2377,21 +2383,13 @@ impl Storage {
     /// cancelled before it produced a result.
     pub fn read_entry(&self, entry: &StorageEntry) -> Result<Vec<u8>, StorageReadError> {
         let bytes = match entry {
-            StorageEntry::File { name, pending } => match pending.await_outcome() {
-                StorageOutcome::Ready(payload) => finalize_bytes(
-                    payload.as_ref().clone(),
+            StorageEntry::File { name, pending } => {
+                let outcome = pending.await_outcome();
+                finalize_bytes(
+                    take_payload(outcome, name)?,
                     self.xp3_extraction_filter.as_deref(),
-                ),
-                StorageOutcome::Failed(StorageReadError::Fs(FsError::NotFound { .. })) => {
-                    return Err(StorageReadError::NotFound(name.clone()));
-                }
-                StorageOutcome::Failed(error) => return Err(error),
-                StorageOutcome::Cancelled => {
-                    return Err(StorageReadError::NoResult {
-                        message: "the read was cancelled before it produced a result".to_string(),
-                    });
-                }
-            },
+                )
+            }
             StorageEntry::Media { provider, path } => provider.read(path)?,
         };
         self.count_read_bytes(bytes.len());
@@ -2457,7 +2455,7 @@ impl Storage {
         let key = StorageKey::new(name, limit, self.generation);
         // A read the frame already published is served without another wait.
         if let Some(outcome) = pool.take_completed(&key) {
-            let payload = outcome_to_payload(outcome, name)?;
+            let payload = take_payload(outcome, name)?;
             return Ok(Some(finalize_bytes(
                 payload,
                 self.xp3_extraction_filter.as_deref(),
@@ -2483,7 +2481,7 @@ impl Storage {
             }
         };
         let outcome = pending.await_outcome();
-        let payload = outcome_to_payload(outcome, name)?;
+        let payload = take_payload(outcome, name)?;
         Ok(Some(finalize_bytes(
             payload,
             self.xp3_extraction_filter.as_deref(),
