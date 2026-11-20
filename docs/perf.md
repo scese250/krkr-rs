@@ -1629,13 +1629,10 @@ The plane the composite redraws is now 2.25x the area it was, which is what
 makes the region worth landing: a whole-plane redraw at 1920x1080 is exactly
 what the region removes.
 
-### 11.8 The scene change: the route, the cost, and the shape behind it
+### 11.8 The scene change: the route, the cost, and what is not measured
 
-**The measurements so far never crossed a scene boundary**, and the scene
-change is the case the game is worst at. The harness now drives the route:
-the title page is a KAG scene with a column of buttons on the left of the
-window, and the game answered to the clicks at x = 165 with the rows 65
-pixels apart:
+**The title page is a KAG scene with a column of buttons on the left of the
+window**, and the game answers to the clicks at x = 165:
 
 | the click | the scenario the game loaded |
 |---|---|
@@ -1644,57 +1641,64 @@ pixels apart:
 | `(165, 732)` | `load.ks` - the save-data screen |
 
 The harness's `--scene` option names those three and the text-advancing one
-(`scenario`, the middle of the screen), so a run crosses the boundary the
-text-advancing run never reaches.
+(`scenario`, the middle of the screen), so a run is meant to cross a scene
+boundary - the case the game is worst at, and the one a text-advancing run
+never reaches.
 
-**The measurement (the Vulkan backend, the 60 fps pacing, the delta clock,
-the real game, 3 600 frames, the click at 12 000 ms and then every 1 000 ms).**
-The load during the run was **max 0.32, mean 0.27** - a quiet machine, so
-the numbers are trustworthy. The scenarios the game loaded:
-`autoskipmark.asd -> first.ks -> custom.ks -> title.ks -> custom.ks ->
-title.ks -> option.ks`.
+**What the measurement shows is that the route does not arrive.** The logical
+screen is 1920x1080 now, and the click at `(165, 1095)` is 15 pixels below its
+bottom edge, so it cannot reach a button. The runs confirm it: the
+`--scene settings` run loads `autoskipmark.asd -> first.ks -> custom.ks` and
+never `option.ks`. **Every "title to settings" number measured so far is the
+text route's number under another name**, and this section's earlier figures
+were debug-build figures of that same path. The positions have to be read off
+the title page and made relative to the logical screen before the case is
+measured at all.
+
+**The text route is measured, and it is a release measurement.** The Vulkan
+backend, the 60 fps pacing, the delta clock, the real game, 3 600 frames, the
+click at 12 000 ms and then every 1 000 ms; the load during the run was max
+0.87 and mean 1.68, so the machine was quiet.
 
 | the measure | p50 | p90 | p99 | the 1% low | the worst |
 |---|---:|---:|---:|---:|---:|
-| the frame gap | 16.70 ms | 16.79 ms | 17.58 ms | **316.27 ms (3.2 fps)** | 4 016.11 ms |
-| the engine's own work | 2.45 ms | 2.56 ms | 6.46 ms | **312.07 ms (3.2 fps)** | 4 004.14 ms |
+| the frame gap | 16.68 ms | 16.74 ms | 17.18 ms | **31.57 ms (31.7 fps)** | 152.54 ms |
+| the engine's own work | 0.26 ms | 0.35 ms | 3.60 ms | **21.57 ms (46.4 fps)** | 152.53 ms |
 
-26 frames took over 33 ms and 10 took over 100 ms; those frames carry
-11 951 ms and 10 996 ms in total. **This is a debug build, so it is the
-shape's cost and not a shipping number**; the release run is the one that
-counts against the target. What it settles is the route: the text-advancing
-run of the same harness has a p99 of 38.69 ms and a worst of 2 008.71 ms,
-so **the scene boundary is the worst case, and the tail is the engine's own
-work** (the engine's 1% low tracks the frame gap's).
+8 frames took over 33 ms and 2 took over 100 ms; the platform's wait never
+exceeded 16.86 ms, so the pacing is the platform's and the tail is the
+engine's. The frames over 33 ms carry 653 ms in total.
 
-**The cost is the transition step.** The slow-frame report's `frame_tail`
-is the frame body's own phase, and it names the transition:
+**Against the same route before the audio and the draw-list work**, the
+release numbers moved like this:
 
-| the frame | the gap | the async poll | the frame tail |
-|---|---:|---:|---:|
-| 724 | 1 624.7 ms | 110.9 ms | **1 510.7 ms** |
-| 725 | 1 140.0 ms | 1 082.2 ms | 0.0 ms |
-| 740 | - | 3 427.1 ms | **512.1 ms** |
+| | before | after |
+|---|---:|---:|
+| the engine's 1% low | 33.00 ms (30.3 fps) | **21.57 ms (46.4 fps)** |
+| the engine's worst | 253.03 ms (4.0 fps) | **152.53 ms (6.6 fps)** |
+| the engine's mean | 0.95 ms | **0.54 ms** |
+| the engine's p90 | 1.36 ms | **0.35 ms** |
+| the frame gap's 1% low | 38.28 ms (26.1 fps) | **31.57 ms (31.7 fps)** |
 
-**The shape behind it.** The transition resolves its two endpoints on the
-CPU before the backend is consulted: `transition_sources_subtree`
+**The shape behind the tail.** The transition resolves its two endpoints on
+the CPU before the backend is consulted:
+`transition_sources_subtree`
 (`crates/compat/src/natives/visual/layer/transitions.rs:1535`) calls
 `render_layer_subtree` for the destination and for the source - the whole
-subtree of each, composited into a content bitmap - and only then asks for
-the effect draw. So a transition of two ticks runs **four endpoint
-composites**, and the composite is about **74 times** the cost of the blend
-(868.48 ms against 11.75 ms, in the debug build).
-
-The reference does not do this. The destination is drawn live into the
-transition's drawable (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7148-7149`),
+subtree of each, composited into a content bitmap - and only then asks for the
+effect draw. The reference does not do this. The destination is drawn live into
+the transition's drawable (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7148-7149`),
 and the source is the source layer's **cache**, read through
-`Complete(destrect)` (`:8186-8199`) - the incrementally maintained cache,
-which reconstructs only the changed region (`:7673-7748`). The reference's
-per-tick transition cost is therefore the blend alone, and the GPU path
-moves the *drawing*, not the blend
+`Complete(destrect)` (`:8186-8199`) - the incrementally maintained cache, which
+reconstructs only the changed region (`:7673-7748`). The reference's
+per-tick transition cost is therefore the blend alone, and the GPU path moves
+the *drawing*, not the blend
 (`reference/krkr2/cpp/core/visual/TransIntf.cpp:584-612`).
 
-Our engine's endpoint composite is the work the reference avoids. The
-region's shape is what makes it a cache hit instead of a full composite,
-and the transition's source is the next step after it: the source's cache
-read, the way the reference reads it.
+The region's shape is what makes our endpoint composite a region
+reconstruction rather than a whole-plane one, and the transition's source is
+the step after it: the source's cache read, the way the reference reads it.
+
+**Open:** the route has to reach the settings page before the scene change
+can be measured, and the measurement has to be repeated on the real scene
+before it means anything against the target.
