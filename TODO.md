@@ -1958,3 +1958,20 @@ not run the class's initializer, or that runs it in a different order, or
 that lets a script observe a half-built object. The performance win does not
 justify that risk, so the work stays inside L2 and L3.
 
+
+## 23. A third-party plugin the engine has not built in
+
+The reference loads no plugin from the game's directory:
+`ncbAutoRegister::LoadModule` (`reference/krkr2/cpp/core/plugin/ncbind.cpp:12-28`)
+consults only the registry of the modules linked into the binary, and the
+`.tpm` path rewrites the extension and ends in the same registry
+(`reference/krkr2/cpp/core/plugin/PluginImpl.cpp:129-143`). A plugin that is
+not in it is logged as an error and the engine continues
+(`reference/krkr2/cpp/core/plugin/PluginImpl.cpp:48-56`).
+
+That is the model this engine has (the static plugin table), so a game that
+needs a plugin we have not built in - `shrinkCopy` is one - sees the member
+absent here, and sees it absent in a reference build that does not link the
+plugin either. The fix is to build the plugin in, and its behaviour needs the
+plugin's own build as the evidence: the shipped DLL, cited by its hash, or
+the upstream source. The behaviour is not derivable from the name.
