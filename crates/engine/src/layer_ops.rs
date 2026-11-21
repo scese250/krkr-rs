@@ -26,10 +26,15 @@
 use std::sync::Arc;
 
 use api::blend::{BlendMode, DstBlend};
+use api::error::RenderError;
 use api::geometry::{Affine2, PixelRegion, RectF};
 use render::Texture;
 use render::blend::PhotoshopBlend;
 use render::scene::{RenderContent, RenderNode, RenderScene};
+use render::{
+    RenderPipeline, RenderState, RenderTarget, read_render_target, render_to_target,
+    unpremultiply_rgba8,
+};
 
 use crate::hasher::Map;
 use crate::raster::blend_pixel_at;
@@ -5839,6 +5844,13 @@ struct SubtreeDraw {
     /// the alpha face stores a straight alpha, the additive-alpha face a
     /// premultiplied one, and the opaque face none.
     dst_alpha: DestAlpha,
+    /// The layer's own blend, as the generic mode a renderer draws with.
+    ///
+    /// The `mode` above is the numeric operation mode the byte tables use;
+    /// this is the mode the layer carries, and it is the mode the live
+    /// projection draws the layer with. The device path draws with it, so
+    /// the device composite paints the picture the layer would draw live.
+    blend: BlendMode,
     /// Whether the source is read as an opaque image.
     ///
     /// The copy method reads the source as an opaque image on every face but
@@ -6195,6 +6207,7 @@ fn collect_subtree_draws(
             kind,
             dst_alpha,
             treat_as_opaque,
+            blend: layer.blend,
         });
     }
     draws
@@ -6329,6 +6342,75 @@ fn composite_subtree_draw(
     }
 }
 
+/// The shape of a subtree's composite: the layer's own image, the size of the
+/// content, whether the subtree needs no composite at all, whether the
+/// layer's face is opaque and the window the tree belongs to.
+///
+/// The trivial subtree is the one that needs no composite: no visible child,
+/// the image at the origin, and the image as large as the layer's rectangle.
+/// Its content is the layer's own image, which is read as a source and never
+/// written.
+struct SubtreeShape {
+    /// The layer's own image.
+    bitmap: Option<u32>,
+    /// The content's width in pixels.
+    width: u32,
+    /// The content's height in pixels.
+    height: u32,
+    /// Whether the subtree needs no composite.
+    trivial: bool,
+    /// Whether the layer's face is opaque.
+    opaque: bool,
+    /// The window the tree belongs to.
+    window: u32,
+}
+
+/// The shape of `root`'s subtree's composite.
+fn subtree_shape(scene: &Scene, root: u32) -> Option<SubtreeShape> {
+    let layer = scene.layer(root)?;
+    let clip = scene.clipping_rect(root).unwrap_or(layer.rect);
+    let width = clip.w.max(1);
+    let height = clip.h.max(1);
+    let main_image_matches_rect = layer
+        .bitmap
+        .and_then(|id| scene.bitmap(id))
+        .is_some_and(|bitmap| bitmap.width == layer.rect.w && bitmap.height == layer.rect.h);
+    let trivial = !has_visible_child(scene, layer)
+        && layer.image_left == 0
+        && layer.image_top == 0
+        && main_image_matches_rect;
+    Some(SubtreeShape {
+        bitmap: layer.bitmap,
+        width,
+        height,
+        trivial,
+        opaque: layer.blend == BlendMode::Replace,
+        window: layer.window,
+    })
+}
+
+/// The bitmap a layer's subtree composites into.
+///
+/// The trivial subtree's content is the layer's own image: nothing is
+/// composited, and the image is the content. Every other subtree composites
+/// into the layer's content bitmap, which is allocated when it is not there
+/// yet.
+///
+/// The content's identity is settled without touching a pixel: the device
+/// path needs the bitmap the composite writes into, and it draws the tree on
+/// the device rather than on the CPU.
+pub fn subtree_content_id(scene: &mut Scene, root: u32) -> Option<u32> {
+    let shape = subtree_shape(scene, root)?;
+    if shape.trivial {
+        // The trivial path hands the main image over, so any content
+        // composited for an earlier, non-trivial frame is stale.
+        release_subtree_caches(scene, root);
+        return shape.bitmap;
+    }
+    let (content, _) = ensure_layer_content(scene, root, shape.width, shape.height)?;
+    Some(content)
+}
+
 /// Render `root`'s own image and the visible layers of its subtree into the
 /// layer's composited content. Returns the bitmap to use as the layer's
 /// rendered content:
@@ -6363,28 +6445,15 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
 /// The depth bounds the completion of the descendants' caches: a malformed
 /// parent cycle must not make the walk recurse for ever.
 fn render_layer_subtree_at(scene: &mut Scene, root: u32, depth: usize) -> Option<u32> {
-    let (bitmap, w, h, trivial, opaque, window) = {
-        let layer = scene.layer(root)?;
-        let clip = scene.clipping_rect(root).unwrap_or(layer.rect);
-        let w = clip.w.max(1);
-        let h = clip.h.max(1);
-        let main_image_matches_rect = layer
-            .bitmap
-            .and_then(|id| scene.bitmap(id))
-            .is_some_and(|b| b.width == layer.rect.w && b.height == layer.rect.h);
-        let trivial = !has_visible_child(scene, layer)
-            && layer.image_left == 0
-            && layer.image_top == 0
-            && main_image_matches_rect;
-        (
-            layer.bitmap,
-            w,
-            h,
-            trivial,
-            layer.blend == BlendMode::Replace,
-            layer.window,
-        )
-    };
+    let shape = subtree_shape(scene, root)?;
+    let (bitmap, w, h, trivial, opaque, window) = (
+        shape.bitmap,
+        shape.width,
+        shape.height,
+        shape.trivial,
+        shape.opaque,
+        shape.window,
+    );
     if trivial {
         // The trivial path returns the main image, so any content composited
         // for an earlier, non-trivial frame is stale.
@@ -6451,6 +6520,316 @@ fn render_layer_subtree_at(scene: &mut Scene, root: u32, depth: usize) -> Option
     // regions are settled by the descendants' own composites.
     let _ = scene.take_layer_content_region(root);
     Some(content)
+}
+
+/// The size of a layer's subtree's content, and whether the subtree needs no
+/// composite at all.
+///
+/// The trivial subtree's content is the layer's own image: nothing is
+/// composited, and the image is the content. The device composite asks this
+/// before it draws anything, so a trivial subtree costs no surface and no
+/// content bitmap.
+pub fn subtree_composite_size(scene: &Scene, root: u32) -> Option<(u32, u32, bool)> {
+    let shape = subtree_shape(scene, root)?;
+    Some((shape.width, shape.height, shape.trivial))
+}
+
+/// The device composite of a layer's subtree: the subtree's picture drawn on
+/// the device.
+///
+/// The CPU composite ([`render_layer_subtree`]) blends every draw of the
+/// tree pixel by pixel on the CPU, and that per-pixel work is what the frame
+/// tail pays when a transition asks for its two endpoints. This path draws
+/// the same tree on the device and reads the result back into the layer's
+/// content bitmap, so the per-pixel work happens in the backend's shaders.
+///
+/// The content bitmap keeps holding the picture — the read-back is brought
+/// into the straight-alpha form the bitmap holds — so every reader of the
+/// CPU content sees what the device drew, and the frame uploads the content
+/// as it uploads any other bitmap.
+///
+/// The CPU composite stays the exact path: it is the fallback for every tree
+/// this path refuses to draw, and the two pictures differ by the backend's
+/// blend arithmetic, the same tolerance the pose's device path has.
+///
+/// `target` is the surface the tree is drawn into, and it must be the size
+/// of the content. `texture` resolves a bitmap id to the texture the device
+/// samples it from; a bitmap without a texture is a tree this path cannot
+/// draw.
+///
+/// # Errors
+///
+/// Returns [`RenderError::Unsupported`] when the tree holds a draw this path
+/// cannot reproduce on the device — a coverage plane, an opaque or
+/// additive-alpha face, a scaled image, a copy that takes the source's
+/// alpha — and the backend's own errors otherwise. A refused tree is not a
+/// failure: the caller falls back to the CPU composite.
+pub fn composite_subtree_on_device<F>(
+    scene: &mut Scene,
+    root: u32,
+    pipeline: &RenderPipeline,
+    state: &mut RenderState,
+    target: &RenderTarget,
+    texture: &mut F,
+) -> Result<Option<u32>, RenderError>
+where
+    F: FnMut(u32) -> Option<Texture>,
+{
+    let shape = match subtree_shape(scene, root) {
+        Some(shape) => shape,
+        None => return Ok(None),
+    };
+    let (bitmap, w, h, trivial, opaque, window) = (
+        shape.bitmap,
+        shape.width,
+        shape.height,
+        shape.trivial,
+        shape.opaque,
+        shape.window,
+    );
+    if trivial {
+        // The trivial path hands the main image over, so any content
+        // composited for an earlier frame is stale.
+        release_subtree_caches(scene, root);
+        return Ok(bitmap);
+    }
+    let Some((content, fresh)) = ensure_layer_content(scene, root, w, h) else {
+        return Ok(None);
+    };
+    let Some(content_bitmap) = scene.bitmap(content) else {
+        return Ok(None);
+    };
+    if !pixels_usable(content_bitmap, "compositeSubtreeOnDevice") {
+        return Ok(None);
+    }
+    let region = if fresh {
+        Some(Rect::new(0, 0, w, h))
+    } else {
+        subtree_content_region(scene, root, w, h)
+    };
+    let Some(region) = region else {
+        // The content is current: the region is empty and the content is
+        // left untouched, exactly as the CPU composite leaves it.
+        let _ = scene.take_layer_content_region(root);
+        return Ok(Some(content));
+    };
+    if target.width() != w || target.height() != h {
+        return Err(RenderError::InvalidArgument {
+            message: format!(
+                "the device composite's surface is {}x{} and the content is {w}x{h}",
+                target.width(),
+                target.height()
+            ),
+        });
+    }
+    // The window's paint order, read once: the composite and the region walk
+    // share it instead of rebuilding it for every layer.
+    let order = scene.window_layer_order(window);
+    // The descendants whose caches are stale are completed first, exactly as
+    // the CPU composite does it: a stale cache is never drawn live.
+    complete_stale_caches(scene, &order, root, 0);
+    let draws = collect_subtree_draws(scene, &order, root, w, h);
+    let mut tree = subtree_render_tree(scene, &draws, opaque, texture)?;
+    // The device draws the region alone: the surface keeps the content it
+    // holds outside it, and the tree is confined to the region. The region
+    // is the unit of reconstruction, so a change that names a rectangle
+    // costs that rectangle and not the plane.
+    let region_pixels = PixelRegion::new(
+        region.x.max(0) as u32,
+        region.y.max(0) as u32,
+        region.w,
+        region.h,
+    );
+    tree.coverage = Some(region_pixels);
+    render_to_target(pipeline, state, target, &tree)?;
+    // The read-back: the surface holds the pixels the device drew in the
+    // premultiplied space the pipeline composites in, and the content holds
+    // straight-alpha pixels. The read-back covers the region alone: the
+    // surface's other pixels are the content the previous composite wrote.
+    let Some(bytes) = (region_pixels.width as usize)
+        .checked_mul(region_pixels.height as usize)
+        .and_then(|area| area.checked_mul(4))
+    else {
+        return Err(RenderError::InvalidArgument {
+            message: "the region's size overflows the address space".to_owned(),
+        });
+    };
+    let mut pixels = vec![0u8; bytes];
+    read_render_target(pipeline, state, target, region_pixels, &mut pixels)?;
+    unpremultiply_rgba8(&mut pixels);
+    {
+        let Some(content_bitmap) = scene.bitmap_mut_untracked(content) else {
+            return Ok(None);
+        };
+        if !write_region(content_bitmap, region_pixels, &pixels) {
+            return Err(RenderError::InvalidArgument {
+                message: "the region does not fit the content".to_owned(),
+            });
+        }
+        // The region is what changed, so the upload sends the region alone.
+        content_bitmap.mark_dirty_rect(region_pixels);
+    }
+    // The region is the record of what the content was missing, and the
+    // content holds it now.
+    let _ = scene.take_layer_content_region(root);
+    Ok(Some(content))
+}
+
+/// Writes a region's tightly packed pixels into a bitmap at the region's
+/// origin.
+///
+/// The bitmap keeps the pixels outside the region: the region is what the
+/// composite reconstructed, and the rest of the content is current.
+///
+/// `false` when the region does not fit the bitmap or the pixels are not
+/// the region's own.
+fn write_region(bitmap: &mut BitmapState, region: PixelRegion, pixels: &[u8]) -> bool {
+    let width = bitmap.width as usize;
+    let height = bitmap.height as usize;
+    let x = region.x as usize;
+    let y = region.y as usize;
+    let row_bytes = (region.width as usize).saturating_mul(4);
+    let rows = region.height as usize;
+    if x.saturating_add(region.width as usize) > width
+        || y.saturating_add(rows) > height
+        || pixels.len() != row_bytes.saturating_mul(rows)
+    {
+        return false;
+    }
+    for row in 0..rows {
+        let source = row * row_bytes;
+        let target = (y + row) * width * 4 + x * 4;
+        bitmap.rgba[target..target + row_bytes]
+            .copy_from_slice(&pixels[source..source + row_bytes]);
+    }
+    true
+}
+
+/// The render tree of a subtree's draws.
+///
+/// Every draw of the CPU composite becomes one node: the source is the
+/// texture of the bitmap the draw reads, the destination and the source
+/// region are the ones the composite resolved, and the node carries the
+/// layer's own blend and opacity. The tree is therefore the picture the
+/// layer would draw live.
+///
+/// The draws the device cannot reproduce are refused rather than
+/// approximated: a coverage plane has no bitmap to sample, a scaled image
+/// would be sampled with the backend's own sampler where the CPU composite
+/// resamples it, and the opaque and additive-alpha faces store their alpha
+/// differently than the device's straight-alpha surface.
+fn subtree_render_tree<F>(
+    scene: &Scene,
+    draws: &[SubtreeDraw],
+    opaque: bool,
+    texture: &mut F,
+) -> Result<RenderScene, RenderError>
+where
+    F: FnMut(u32) -> Option<Texture>,
+{
+    let mut out = RenderScene::with_root_node();
+    // The content starts from the layer's backdrop: an opaque layer's
+    // content is opaque, every other type's is transparent.
+    out.background = Some(if opaque {
+        [0.0, 0.0, 0.0, 1.0]
+    } else {
+        [0.0, 0.0, 0.0, 0.0]
+    });
+    let mut z: i32 = 0;
+    for draw in draws.iter() {
+        if draw.dst_alpha != DestAlpha::Straight {
+            return Err(device_unsupported(
+                "a layer whose face stores its alpha differently",
+            ));
+        }
+        if draw.treat_as_opaque {
+            return Err(device_unsupported("a copy that takes the source's alpha"));
+        }
+        let id = match &draw.source {
+            SubtreeSource::Cache(id) | SubtreeSource::Bitmap(id) => *id,
+            SubtreeSource::Derived(_) => {
+                return Err(device_unsupported("a coverage plane"));
+            }
+        };
+        let Some((source_width, source_height)) = draw.source.dims(scene) else {
+            return Err(device_unsupported("a source without pixels"));
+        };
+        if source_width == 0 || source_height == 0 {
+            continue;
+        }
+        let source = (
+            draw.src.0,
+            draw.src.1,
+            draw.src.2.saturating_sub(draw.src.0),
+            draw.src.3.saturating_sub(draw.src.1),
+        );
+        // The device samples the source with the backend's own sampler, so a
+        // draw whose source region is not the size of its destination is a
+        // draw the device would place differently than the CPU composite
+        // rescales it.
+        if source.2 != draw.dw || source.3 != draw.dh {
+            return Err(device_unsupported("a scaled image"));
+        }
+        let Some(sampled) = texture(id) else {
+            return Err(device_unsupported("a source without a texture"));
+        };
+        let opacity = f32::from(draw.opa) / 255.0;
+        // The content's base and the coverage planes are drawn over the
+        // destination as they are; every other image is composited with the
+        // layer's blend. The device draws the base the same way.
+        let blend = match draw.kind {
+            SubtreeKind::Plain => BlendMode::SourceOver,
+            SubtreeKind::Image => draw.blend,
+        };
+        // The placement clamps the source rectangle to the bitmap, so its
+        // origin and its extent are inside it.
+        let Ok(source_x) = u32::try_from(source.0) else {
+            return Err(device_unsupported("a source rectangle outside the bitmap"));
+        };
+        let Ok(source_y) = u32::try_from(source.1) else {
+            return Err(device_unsupported("a source rectangle outside the bitmap"));
+        };
+        let Ok(source_width) = u32::try_from(source.2) else {
+            return Err(device_unsupported("a source rectangle outside the bitmap"));
+        };
+        let Ok(source_height) = u32::try_from(source.3) else {
+            return Err(device_unsupported("a source rectangle outside the bitmap"));
+        };
+        let node = RenderNode {
+            parent: Some(out.root),
+            content: RenderContent::Texture(sampled),
+            dst: RectF::new(
+                draw.dx as f32,
+                draw.dy as f32,
+                draw.dw as f32,
+                draw.dh as f32,
+            ),
+            src: PixelRegion::new(source_x, source_y, source_width, source_height),
+            opacity,
+            visible: true,
+            z,
+            blend: crate::projection::resolve_blend(blend, opacity),
+            hold_alpha: draw.hold_alpha,
+            ..RenderNode::default()
+        };
+        let node = out.push(node);
+        if let Some(root) = out.node_mut(out.root) {
+            root.children.push(node);
+        }
+        z = z.saturating_add(1);
+    }
+    Ok(out)
+}
+
+/// The error a tree the device path cannot draw reports.
+///
+/// The tree is not broken: the CPU composite draws it, and the caller falls
+/// back to it. The error names the draw the device cannot reproduce, so the
+/// fallback is a decision the caller makes and not a silent degradation.
+fn device_unsupported(what: &str) -> RenderError {
+    RenderError::Unsupported {
+        message: format!("the device composite cannot draw {what}"),
+    }
 }
 
 /// The area a composite writes: the layer's region, widened over the draws

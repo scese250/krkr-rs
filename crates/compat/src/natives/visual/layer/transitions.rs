@@ -1121,6 +1121,11 @@ fn end_transition(ctx: &crate::CompatCtx, dest: u32, source: u32, event: bool) {
         scene.set_transition_self_image(dest, None);
         scene.set_effect(dest, None);
         exchange_layers(scene, dest, source, !entry.with_children);
+        // The endpoints' device surfaces go with the transition: the
+        // surfaces their composites were drawn into are released when it
+        // ends. The engine owns the surfaces, so it releases them.
+        scene.request_device_surface_release(dest);
+        scene.request_device_surface_release(source);
     }
     if event {
         dispatch_transition_completed(ctx, dest, source);
@@ -1455,8 +1460,23 @@ fn composite_transition(
     let effect: Option<EffectDraw> =
         scene.transition_effect_draw(trans, src1, src2, (w, h), with_children);
     if let Some(effect) = effect {
+        // The device draws the frame, so the endpoints' content is composited
+        // on the device: the engine runs the request before the frame is
+        // drawn, and the shader samples the content the composite wrote.
+        if with_children {
+            scene.request_device_composite(id);
+            if source != id {
+                scene.request_device_composite(source);
+            }
+        }
         scene.set_effect(id, Some(effect));
         return Ok(());
+    }
+    // The CPU blend: the endpoints' content is composited on the CPU, which
+    // is the exact path. The blend reads the two composites while it writes
+    // the frame, so the composite cannot wait for the device.
+    if with_children {
+        transition_sources_composite(scene, id, source)?;
     }
     // The blend needs a frame of its own, distinct from the content it reads,
     // whatever the destination's content happens to be.
@@ -1508,10 +1528,11 @@ fn composite_transition(
 /// The two sources of a whole-subtree transition and their shared size: the
 /// destination's composited subtree content and the source layer's.
 ///
-/// `render_layer_subtree` returns the composited subtree content, reusing it
-/// while the subtree's content signature still matches the one the content
-/// was composited with; a trivial layer's content is its MainImage, which is
-/// read as a source and never written.
+/// The content's identity is settled here, without touching a pixel: the
+/// device path draws the tree on the device — the engine runs the request
+/// before the frame is drawn — and the CPU path composites it on the CPU,
+/// which is the exact path. A trivial layer's content is its MainImage,
+/// which is read as a source and never written.
 ///
 /// A transition's tick changes the transition's own frame, not the pixels of
 /// the two endpoints, so the endpoints' composites stay valid and the step
@@ -1522,14 +1543,12 @@ fn transition_sources_subtree(
     dest: u32,
     source: u32,
 ) -> Result<(u32, u32, u32, u32), String> {
-    let dst_content =
-        crate::engine_api::layer_ops::render_layer_subtree(scene, dest).ok_or_else(|| {
-            "Layer.beginTransition: cannot render the destination subtree".to_string()
-        })?;
-    let src_content = crate::engine_api::layer_ops::render_layer_subtree(scene, source)
-        .ok_or_else(|| {
-            "Layer.beginTransition: cannot render the transition source subtree".to_string()
-        })?;
+    let dst_content = scene.subtree_content_id(dest).ok_or_else(|| {
+        "Layer.beginTransition: cannot render the destination subtree".to_string()
+    })?;
+    let src_content = scene.subtree_content_id(source).ok_or_else(|| {
+        "Layer.beginTransition: cannot render the transition source subtree".to_string()
+    })?;
     // The source layer draws its rendered content. A layer that is its own
     // transition source keeps the destination's slots instead.
     if source != dest {
@@ -1539,6 +1558,20 @@ fn transition_sources_subtree(
         "Layer.beginTransition: the transition destination content is missing".to_string()
     })?;
     Ok((dst_content, src_content, w, h))
+}
+
+/// The endpoints' subtrees composited on the CPU: the exact path.
+///
+/// The blend reads the two composites while it writes the frame, so the
+/// composites cannot wait for the device.
+fn transition_sources_composite(scene: &mut Scene, dest: u32, source: u32) -> Result<(), String> {
+    crate::engine_api::layer_ops::render_layer_subtree(scene, dest).ok_or_else(|| {
+        "Layer.beginTransition: cannot render the destination subtree".to_string()
+    })?;
+    crate::engine_api::layer_ops::render_layer_subtree(scene, source).ok_or_else(|| {
+        "Layer.beginTransition: cannot render the transition source subtree".to_string()
+    })?;
+    Ok(())
 }
 
 /// The two sources of a transition without children and their shared size: the

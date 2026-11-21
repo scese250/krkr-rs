@@ -50,6 +50,7 @@ mod cpu;
 mod effect;
 pub mod glyph;
 mod null;
+mod pixels;
 mod presented;
 pub mod render_target;
 pub mod scene;
@@ -71,6 +72,7 @@ pub use crate::glyph::{
     has_glyph, load_font, rasterize_glyph,
 };
 pub use crate::null::{FrameStats, NULL_MAX_TEXTURE_DIMENSION, NullRenderPipeline};
+pub use crate::pixels::unpremultiply_rgba8;
 pub use crate::presented::{PresentedFrame, PresentedFrameSlot};
 pub use crate::render_target::{RenderTarget, RenderTargetDesc};
 pub use crate::scene::{

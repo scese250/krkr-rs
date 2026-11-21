@@ -15,6 +15,34 @@ use super::super::common::{VisualState, resolve_object_id, scene_ref};
 use crate::CompatCtx;
 use crate::natives::system::{value_as_bool, value_as_i64};
 
+/// The subtree's content: the device composite when the device can draw it.
+///
+/// The device path is the fast one and the CPU composite is the exact one:
+/// the device refuses a tree it cannot reproduce — a coverage plane, a
+/// scaled image, a face whose alpha it stores differently — and the engine
+/// draws that tree on the CPU instead. The refusal is a typed error, so the
+/// fallback is a decision and not a silent approximation.
+///
+/// The composite itself is the engine's work: the engine owns the device and
+/// runs the request before the frame is drawn, so the content the caller
+/// names is filled when the frame reaches the screen.
+///
+/// `None` when the scene belongs to no engine: the caller composites the
+/// tree on the CPU.
+pub(super) fn device_subtree_content(scene: &mut Scene, root: u32) -> Option<u32> {
+    if !scene.device_present {
+        // A scene that belongs to no engine has no device: the CPU path
+        // draws the tree.
+        return None;
+    }
+    // The content's identity: the bitmap the composite writes into. The
+    // engine draws the tree on the device, so the pixels are in the frame the
+    // engine draws.
+    let content = scene.subtree_content_id(root)?;
+    scene.request_device_composite(root);
+    Some(content)
+}
+
 /// TJS `AsInteger` coercion with the reference's `tvtVoid` default.
 pub(super) fn opt_i64(a: &[Value], index: usize, default: i64) -> i64 {
     match a.get(index) {

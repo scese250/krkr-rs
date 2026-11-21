@@ -980,6 +980,19 @@ pub struct Scene {
     /// A source is not a layer image, so the frame does not upload it: the
     /// backend that draws a list uploads the sources it draws from.
     draw_textures: Map<u32, Texture>,
+    /// The device work the compatibility layer asked for.
+    ///
+    /// The requests are the compatibility layer's device work: the composite
+    /// of a layer's subtree and the release of the surface a composite was
+    /// drawn into. The scene holds the requests, never the device: the engine
+    /// owns the device and runs the requests, so the scene stays `Send`.
+    device_requests: Vec<DeviceRequest>,
+    /// Whether the engine that owns this scene draws through a device.
+    ///
+    /// The engine owns the device and runs the scene's device requests. A
+    /// scene that belongs to no engine has no device, and the compatibility
+    /// layer composites on the CPU instead.
+    pub device_present: bool,
     /// Whether the host draws the layers' draw lists itself.
     ///
     /// The compatibility layer sets a layer's draw list and asks the scene
@@ -1035,6 +1048,23 @@ impl std::fmt::Debug for PoseSync {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PoseSync")
     }
+}
+
+/// The device work the compatibility layer asked for.
+///
+/// The requests are the compatibility layer's device work: the composite of a
+/// layer's subtree and the release of the surface a composite was drawn into.
+///
+/// The scene holds the requests, never the device. The device belongs to the
+/// engine, which owns the frame thread's backend state, and the engine runs
+/// the requests with it — so the scene stays `Send`, and the device's
+/// lifetime is the frame thread's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceRequest {
+    /// Composite the layer's subtree on the device.
+    Composite(u32),
+    /// Release the surface the layer's composite was drawn into.
+    ReleaseSurface(u32),
 }
 
 /// The offscreen surface a layer's draw list is drawn into.
@@ -1109,6 +1139,8 @@ impl Default for Scene {
             pose_revisions: crate::hasher::map(),
             pose_pixels: crate::hasher::map(),
             draw_textures: crate::hasher::map(),
+            device_requests: Vec::new(),
+            device_present: false,
             host_draws_lists: false,
         }
     }
@@ -4743,6 +4775,57 @@ impl Scene {
     /// Installs the backend that reads a pose surface back.
     pub fn set_pose_sync(&mut self, sync: PoseSync) {
         self.pose_sync = Some(sync);
+    }
+
+    /// Asks the engine to composite `root`'s subtree on the device.
+    ///
+    /// The request is served by the engine, which owns the device: the scene
+    /// never holds it, so the scene stays `Send`. The engine runs the
+    /// request on the frame thread, after the upward hook and before the
+    /// frame is drawn, so the composite reaches the picture the frame
+    /// presents.
+    pub fn request_device_composite(&mut self, root: u32) {
+        let request = DeviceRequest::Composite(root);
+        if self.device_requests.contains(&request) {
+            // The request is already pending: the engine runs it once.
+            return;
+        }
+        self.device_requests.push(request);
+    }
+
+    /// Asks the engine to release the surface `layer`'s composite was drawn
+    /// into.
+    ///
+    /// The transition's teardown asks for it for its two endpoints, so the
+    /// surfaces a transition needed do not outlive it.
+    pub fn request_device_surface_release(&mut self, layer: u32) {
+        let request = DeviceRequest::ReleaseSurface(layer);
+        if self.device_requests.contains(&request) {
+            // The request is already pending: the engine runs it once.
+            return;
+        }
+        self.device_requests.push(request);
+    }
+
+    /// The device work the compatibility layer asked for.
+    ///
+    /// The engine takes the requests and runs them with its device.
+    pub fn take_device_requests(&mut self) -> Vec<DeviceRequest> {
+        std::mem::take(&mut self.device_requests)
+    }
+
+    /// The bitmap a layer's subtree composites into.
+    ///
+    /// The trivial subtree's content is the layer's own image: nothing is
+    /// composited, and the image is the content. Every other subtree
+    /// composites into the layer's content bitmap, which is allocated when it
+    /// is not there yet.
+    ///
+    /// The content's identity is settled without touching a pixel: the
+    /// device path needs the bitmap the composite writes into, and it draws
+    /// the tree on the device rather than on the CPU.
+    pub fn subtree_content_id(&mut self, root: u32) -> Option<u32> {
+        crate::layer_ops::subtree_content_id(self, root)
     }
 
     /// The pixels a script reads for a bitmap: the layer's image with the

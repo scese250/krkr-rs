@@ -168,8 +168,16 @@ pub fn refresh_cached_layers(ctx: &crate::CompatCtx) -> Result<(), String> {
             scene.set_cache_bitmap(id, None);
             continue;
         }
-        let content = crate::engine_api::layer_ops::render_layer_subtree(scene, id)
-            .ok_or_else(|| format!("Layer.cached: cannot composite the subtree of layer {id}"))?;
+        // The cached layer's subtree is composited on the device when it can
+        // draw it; a tree the device refuses is composited on the CPU, which
+        // is the exact path.
+        let content =
+            match util::device_subtree_content(scene, id) {
+                Some(content) => content,
+                None => crate::engine_api::layer_ops::render_layer_subtree(scene, id).ok_or_else(
+                    || format!("Layer.cached: cannot composite the subtree of layer {id}"),
+                )?,
+            };
         if scene.layer(id).and_then(|layer| layer.bitmap) != Some(content) {
             scene.set_cache_bitmap(id, Some(content));
         }

@@ -465,8 +465,18 @@ pub struct FrameReport {
 /// layer system through [`Engine::scene`] / [`Engine::scene_mut`] and drive
 /// frames through [`Engine::run`] / [`Engine::step`] / [`Engine::frame`].
 pub struct Engine {
-    /// Stateless render service.
-    pipeline: RenderPipeline,
+    /// The device the frame draws through.
+    ///
+    /// The device owns the backend's bookkeeping for this caller: the render
+    /// state every render action takes, the pipeline that draws with it, the
+    /// uploaded textures, and the surfaces the device composites are drawn
+    /// into.
+    ///
+    /// The device belongs to the engine and to the frame thread: the render
+    /// state holds a backend handle, so the device never leaves the thread
+    /// that owns the frame. The compatibility layer reaches it through the
+    /// scene's device requests, which the engine runs with it.
+    device: Device,
     /// Layer tree owned by the engine.
     scene: Scene,
     /// The registered shader programs and the pipelines built from them.
@@ -487,10 +497,6 @@ pub struct Engine {
     /// Presented surface for `render_state`, or the offscreen target the
     /// frame is drawn into when the host has no window.
     target: FrameTarget,
-    /// GPU/staging/texture bookkeeping.
-    render_state: RenderState,
-    /// Bitmap id → uploaded texture handle.
-    textures: Map<u32, Texture>,
     /// Timer registry advanced by the frame clock.
     timer: TimerState,
     /// The image decode pool, or `None` when no decoder is installed.
@@ -555,6 +561,160 @@ pub struct Engine {
     stall: PresentationStall,
 }
 
+/// The device the engine draws through.
+///
+/// The device owns the backend's bookkeeping for this caller: the render
+/// state every render action takes, the pipeline that draws with it, the
+/// uploaded textures, and the surfaces the device composites are drawn into.
+///
+/// The device belongs to the engine, and the engine's frame thread is the
+/// only thread that touches it: the render state holds a backend handle, so
+/// the device never leaves the thread that owns the frame. The compatibility
+/// layer reaches the device through the scene's device requests, which the
+/// engine runs with it.
+pub struct Device {
+    /// The backend's bookkeeping for this caller.
+    pub state: RenderState,
+    /// The pipeline that draws with the state.
+    pub pipeline: RenderPipeline,
+    /// The uploaded bitmap textures, by bitmap id.
+    ///
+    /// The frame uploads the dirty bitmaps into these textures, and the
+    /// device composite samples the sources from them.
+    pub textures: Map<u32, Texture>,
+    /// The surfaces the device composites are drawn into, by layer id.
+    ///
+    /// A surface is the size of the layer's content, and it is kept between
+    /// the frames: the content's size rarely changes, and a surface that
+    /// followed it would be created and destroyed every frame.
+    pub surfaces: Map<u32, DeviceSurface>,
+}
+
+impl std::fmt::Debug for Device {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Device")
+            .field("textures", &self.textures.len())
+            .field("surfaces", &self.surfaces.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The surface a layer's device composite is drawn into.
+///
+/// The surface holds the composite's picture in the premultiplied form the
+/// backend's composite works in; the read-back brings it into the
+/// straight-alpha form the content bitmap holds.
+pub struct DeviceSurface {
+    /// The surface the composite is drawn into.
+    pub target: RenderTarget,
+    /// The width of the surface in pixels.
+    pub width: u32,
+    /// The height of the surface in pixels.
+    pub height: u32,
+}
+
+impl std::fmt::Debug for DeviceSurface {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceSurface")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The device composite of a layer's subtree: the subtree's picture drawn on
+/// the device.
+///
+/// The CPU composite ([`crate::layer_ops::render_layer_subtree`]) blends
+/// every draw of the tree pixel by pixel on the CPU, and that per-pixel work
+/// is what the frame tail pays when a transition asks for its two endpoints.
+/// This path draws the same tree on the device and reads the result back into
+/// the layer's content bitmap, so the per-pixel work happens in the
+/// backend's shaders.
+///
+/// The CPU composite stays the exact path: it is the fallback for every tree
+/// this path refuses to draw, and the two pictures differ by the backend's
+/// blend arithmetic, the same tolerance the pose's device path has.
+///
+/// # Errors
+///
+/// Returns [`RenderError::Unsupported`] when the tree holds a draw this path
+/// cannot reproduce on the device — a coverage plane, an opaque or
+/// additive-alpha face, a scaled image, a copy that takes the source's
+/// alpha — and the backend's own errors otherwise. A refused tree is not a
+/// failure: the caller falls back to the CPU composite.
+pub fn composite_subtree_on_device(
+    device: &mut Device,
+    scene: &mut Scene,
+    root: u32,
+) -> Result<Option<u32>, RenderError> {
+    let Some((width, height, trivial)) = crate::layer_ops::subtree_composite_size(scene, root)
+    else {
+        return Ok(None);
+    };
+    if trivial {
+        // The trivial subtree's content is the layer's own image: there is
+        // nothing to composite, and the surface would be an empty picture.
+        return Ok(None);
+    }
+    let target = device_surface(device, root, width, height)?;
+    let textures = &mut device.textures;
+    crate::layer_ops::composite_subtree_on_device(
+        scene,
+        root,
+        &device.pipeline,
+        &mut device.state,
+        &target,
+        &mut |id| textures.get(&id).cloned(),
+    )
+}
+
+/// Releases the surface a layer's device composite drew into.
+///
+/// The surface is gone: the layer has no composite to draw, and the device
+/// holds no surface for it.
+pub fn release_device_surface(device: &mut Device, layer: u32) -> bool {
+    let Some(surface) = device.surfaces.remove(&layer) else {
+        return false;
+    };
+    destroy_render_target(&device.pipeline, &mut device.state, surface.target);
+    true
+}
+
+/// The surface a layer's device composite is drawn into.
+///
+/// The surface is the size of the layer's content, and it is kept between the
+/// frames: the content's size rarely changes, and a surface of another size
+/// is replaced, so the surface always holds the content's whole picture.
+fn device_surface(
+    device: &mut Device,
+    layer: u32,
+    width: u32,
+    height: u32,
+) -> Result<RenderTarget, RenderError> {
+    if let Some(surface) = device.surfaces.get(&layer)
+        && surface.width == width
+        && surface.height == height
+    {
+        return Ok(surface.target.clone());
+    }
+    if let Some(surface) = device.surfaces.remove(&layer) {
+        destroy_render_target(&device.pipeline, &mut device.state, surface.target);
+    }
+    let target = create_render_target(&device.pipeline, RenderTargetDesc::new(width, height))?;
+    device.surfaces.insert(
+        layer,
+        DeviceSurface {
+            target: target.clone(),
+            width,
+            height,
+        },
+    );
+    Ok(target)
+}
+
 impl Engine {
     /// Creates an engine from ready-made bottom objects.
     ///
@@ -582,16 +742,22 @@ impl Engine {
         // The engine draws the layers' draw lists on the backend, so the
         // compatibility layer leaves them to it and the list is drawn once.
         scene.host_draws_lists = true;
+        // The scene belongs to an engine that draws through a device: the
+        // engine owns the device and runs the scene's device requests.
+        scene.device_present = true;
         let mut engine = Self {
-            pipeline,
+            device: Device {
+                state: render_state,
+                pipeline,
+                textures: map(),
+                surfaces: map(),
+            },
             scene,
             shader: ShaderLibrary::new(),
             render_scene: RenderScene::with_root_node(),
             render_scene_revision: None,
             drawn_layers: Vec::new(),
             target,
-            render_state,
-            textures: map(),
             timer: TimerState::new(),
             decode_pool: None,
             storage_pool: None,
@@ -615,9 +781,9 @@ impl Engine {
         match &engine.target {
             FrameTarget::Surface(surface) => {
                 let event = resize_render(
-                    &engine.pipeline,
+                    &engine.device.pipeline,
                     surface,
-                    &mut engine.render_state,
+                    &mut engine.device.state,
                     surface_size,
                 )?;
                 // The surface can adopt an extent different from the requested
@@ -660,7 +826,7 @@ impl Engine {
     /// back to the CPU as well; nothing is drawn with a program the driver
     /// rejected.
     fn install_effect_pipelines(&mut self) {
-        if !supports_effect_pipelines(&self.pipeline) {
+        if !supports_effect_pipelines(&self.device.pipeline) {
             log::info!(
                 "engine.scene: this backend cannot run effect pipelines; the display bitmap is \
                  blended on the CPU"
@@ -679,8 +845,8 @@ impl Engine {
                 }
             };
             let pipeline = match self.shader.pipeline(
-                &self.pipeline,
-                &mut self.render_state,
+                &self.device.pipeline,
+                &mut self.device.state,
                 shader,
                 BlendMode::SourceOver,
             ) {
@@ -803,7 +969,7 @@ impl Engine {
         blend: BlendMode,
     ) -> Result<PipelineId, ShaderError> {
         self.shader
-            .pipeline(&self.pipeline, &mut self.render_state, shader, blend)
+            .pipeline(&self.device.pipeline, &mut self.device.state, shader, blend)
     }
 
     /// Advances the frame clock by the elapsed time `clock` reports and
@@ -903,6 +1069,10 @@ impl Engine {
         if let Some(pool) = &self.storage_pool {
             pool.drain();
         }
+        // The upward hook is where the compatibility layer asks for the
+        // device work it needs: the device composite of a layer's subtree.
+        // The engine owns the device and runs the requests, so the scene
+        // never holds it.
         hooks
             .before_render(now_ms, dt_ms)
             .map_err(EngineError::Frame)?;
@@ -946,6 +1116,12 @@ impl Engine {
         let mut prune_ms = prune_started.elapsed().as_secs_f64() * 1000.0;
         let mut sync_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
 
+        // The device work the compatibility layer asked for: the composite of
+        // a layer's subtree on the device. It runs after the upload, so the
+        // sources it samples are the pixels the frame draws, and before the
+        // projection, so the picture it produces is in this frame.
+        self.service_device_requests();
+
         let project_started = Instant::now();
         self.reproject_render_scene();
         let mut project_ms = project_started.elapsed().as_secs_f64() * 1000.0;
@@ -958,6 +1134,12 @@ impl Engine {
             .after_project(&self.drawn_layers)
             .map_err(EngineError::Frame)?;
         self.sync_presentation();
+
+        // The hook may have asked for more device work: a self-updating
+        // transition steps here and asks for its endpoints' composite. The
+        // requests run before the upload below, so the composite reaches the
+        // frame this hook draws.
+        self.service_device_requests();
 
         // The hook may have rewritten a transition frame bitmap without
         // changing the scene graph; upload those dirty bitmaps either way.
@@ -989,9 +1171,9 @@ impl Engine {
             match &mut self.target {
                 FrameTarget::Surface(surface) => {
                     let outcome = match render(
-                        &self.pipeline,
+                        &self.device.pipeline,
                         surface,
-                        &mut self.render_state,
+                        &mut self.device.state,
                         &self.render_scene,
                     ) {
                         Ok(presentation) => present_outcome(presentation),
@@ -1009,7 +1191,7 @@ impl Engine {
                     // the bottom layer and keep the scene, textures and VM in place. The
                     // recovered frame is skipped and the next frame presents normally.
                     if outcome.surface_event == Some(SurfaceEvent::Lost) {
-                        recover_surface(&self.pipeline, surface, &mut self.render_state)?;
+                        recover_surface(&self.device.pipeline, surface, &mut self.device.state)?;
                         log::info!(
                             "engine.frame: presentation surface recreated after it was lost"
                         );
@@ -1044,8 +1226,8 @@ impl Engine {
                     // returns, and the target keeps it until the next frame
                     // changes it.
                     render_to_target(
-                        &self.pipeline,
-                        &mut self.render_state,
+                        &self.device.pipeline,
+                        &mut self.device.state,
                         target,
                         &self.render_scene,
                     )?;
@@ -1127,7 +1309,7 @@ impl Engine {
                 if size == self.surface_size {
                     SurfaceEvent::Resized(size.0, size.1)
                 } else {
-                    resize_render(&self.pipeline, surface, &mut self.render_state, size)?
+                    resize_render(&self.device.pipeline, surface, &mut self.device.state, size)?
                 }
             }
             FrameTarget::Offscreen(target) => {
@@ -1135,11 +1317,11 @@ impl Engine {
                     // The replacement is created before the old target is
                     // released, so the frame's destination is never missing.
                     let replacement = create_render_target(
-                        &self.pipeline,
+                        &self.device.pipeline,
                         RenderTargetDesc::new(size.0, size.1),
                     )?;
                     let previous = std::mem::replace(target, replacement);
-                    destroy_render_target(&self.pipeline, &mut self.render_state, previous);
+                    destroy_render_target(&self.device.pipeline, &mut self.device.state, previous);
                     // The new target holds nothing, so the frame is drawn
                     // again.
                     self.scene.mark_dirty();
@@ -1178,7 +1360,7 @@ impl Engine {
             return;
         };
 
-        let textures = &self.textures;
+        let textures = &self.device.textures;
         let ProjectionReport {
             scene: projected,
             drawn_layers,
@@ -1294,18 +1476,23 @@ impl Engine {
         // an overlay draws the whole surface.
         self.scene.mark_dirty();
         overlay
-            .refresh(&self.pipeline, &mut self.render_state, now_ms, objects)
+            .refresh(
+                &self.device.pipeline,
+                &mut self.device.state,
+                now_ms,
+                objects,
+            )
             .map_err(EngineError::Overlay)
     }
 
     /// Returns the stateless render pipeline.
     pub fn pipeline(&self) -> &RenderPipeline {
-        &self.pipeline
+        &self.device.pipeline
     }
 
     /// Returns the backend the pipeline was created with.
     pub fn backend(&self) -> BackendKind {
-        self.pipeline.backend()
+        self.device.pipeline.backend()
     }
 
     /// Returns the layer tree.
@@ -1348,7 +1535,7 @@ impl Engine {
 
     /// Returns the bitmap-id → texture table.
     pub fn textures(&self) -> &Map<u32, Texture> {
-        &self.textures
+        &self.device.textures
     }
 
     /// Returns the script-visible input state.
@@ -1414,7 +1601,7 @@ impl Engine {
             layers: self.scene.layers.len(),
             bitmaps: self.scene.bitmaps.len(),
             fonts: self.scene.fonts.len(),
-            textures: self.textures.len(),
+            textures: self.device.textures.len(),
         }
     }
 
@@ -1450,7 +1637,7 @@ impl Engine {
 
     /// Returns the null backend's counters for the last frame, if available.
     pub fn last_frame(&self) -> Option<FrameStats> {
-        render::NullRenderPipeline::last_frame(&self.render_state)
+        render::NullRenderPipeline::last_frame(&self.device.state)
     }
 
     /// Returns the presentation calls' costs for the last presented frame.
@@ -1459,7 +1646,7 @@ impl Engine {
     /// measured; the null backend reports zeros. `None` means no frame has
     /// been presented through this state yet.
     pub fn last_frame_timings(&self) -> Option<FrameTimings> {
-        last_frame_timings(&self.render_state)
+        last_frame_timings(&self.device.state)
     }
 
     /// Reads the frame the last frame drew into the offscreen target.
@@ -1480,8 +1667,8 @@ impl Engine {
         let height = target.height();
         let mut pixels = vec![0u8; width as usize * height as usize * 4];
         read_render_target(
-            &self.pipeline,
-            &self.render_state,
+            &self.device.pipeline,
+            &self.device.state,
             target,
             PixelRegion::new(0, 0, width, height),
             &mut pixels,
@@ -1513,7 +1700,7 @@ impl Engine {
         // A layer that shows no pose reads nothing.
         let Some(pose) =
             self.scene
-                .read_pose_pixels(&self.pipeline, &mut self.render_state, bitmap)?
+                .read_pose_pixels(&self.device.pipeline, &mut self.device.state, bitmap)?
         else {
             return Ok(None);
         };
@@ -1536,6 +1723,63 @@ impl Engine {
     /// cannot abort the frame. All dirty bitmaps are uploaded in one batch, so
     /// the frame submits them once and the present path waits for that batch
     /// instead of waiting once per bitmap.
+    /// Runs the device work the compatibility layer asked for.
+    ///
+    /// The requests are the compatibility layer's device work: the composite
+    /// of a layer's subtree and the release of the surface a composite was
+    /// drawn into. The engine owns the device, so the work runs here, on the
+    /// frame thread, and the picture it produces is in the frame the engine
+    /// draws.
+    fn service_device_requests(&mut self) {
+        for request in self.scene.take_device_requests() {
+            match request {
+                crate::scene::DeviceRequest::Composite(root) => {
+                    self.composite_subtree_on_device(root);
+                }
+                crate::scene::DeviceRequest::ReleaseSurface(layer) => {
+                    release_device_surface(&mut self.device, layer);
+                }
+            }
+        }
+    }
+
+    /// The device composite of a layer's subtree: the subtree's picture drawn
+    /// on the device.
+    ///
+    /// A tree the device cannot draw is composited on the CPU, which is the
+    /// exact path: the refusal is a typed error, and the tree is drawn by the
+    /// path that always draws it.
+    fn composite_subtree_on_device(&mut self, root: u32) {
+        let result = composite_subtree_on_device(&mut self.device, &mut self.scene, root);
+        match result {
+            Ok(_) => {}
+            Err(error @ RenderError::Unsupported { .. }) => {
+                log::debug!(
+                    "engine.scene: the device cannot draw the subtree of layer {root}: {error}; \
+                     the CPU composite draws it"
+                );
+                self.composite_subtree_on_cpu(root);
+            }
+            Err(error) => {
+                log::warn!(
+                    "engine.scene: the device composite of layer {root} failed: {error}; the CPU \
+                     composite draws it"
+                );
+                self.composite_subtree_on_cpu(root);
+            }
+        }
+    }
+
+    /// The CPU composite of a layer's subtree: the exact path.
+    ///
+    /// The CPU composite is the fallback for every tree the device refuses to
+    /// draw, so the tree is drawn by the path that always draws it.
+    fn composite_subtree_on_cpu(&mut self, root: u32) {
+        if crate::layer_ops::render_layer_subtree(&mut self.scene, root).is_none() {
+            log::warn!("engine.scene: the CPU composite of layer {root} failed");
+        }
+    }
+
     /// Draws the layers' draw lists on the backend.
     ///
     /// A list the backend cannot draw - it has no surface, or the draw
@@ -1549,9 +1793,11 @@ impl Engine {
                 self.scene.draw_layer_draws(layer_id);
                 continue;
             }
-            let drawn =
-                self.scene
-                    .draw_layer_draws_gpu(&self.pipeline, &mut self.render_state, layer_id);
+            let drawn = self.scene.draw_layer_draws_gpu(
+                &self.device.pipeline,
+                &mut self.device.state,
+                layer_id,
+            );
             match drawn {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1583,7 +1829,7 @@ impl Engine {
         }
         if let Some(bitmap_id) = self.scene.layer(layer_id).and_then(|layer| layer.bitmap) {
             self.scene
-                .drop_pose_surface(&self.pipeline, &mut self.render_state, bitmap_id);
+                .drop_pose_surface(&self.device.pipeline, &mut self.device.state, bitmap_id);
         }
         self.cpu_pose_layers.insert(layer_id);
         self.scene.draw_layer_draws(layer_id);
@@ -1596,10 +1842,14 @@ impl Engine {
     /// The costs of the upload are returned when the backend measured them,
     /// so the frame's report can name where the upload's time went.
     fn sync_dirty_bitmaps(&mut self) -> Option<UploadTimings> {
+    fn sync_dirty_bitmaps(&mut self) {
+    ///
+    /// are the ones the picture needs, and the descriptor set each of them
+    ///
+    /// so the frame's report can name where the upload's time went.
         let dirty: Vec<u32> = self.scene.dirty_bitmaps_for_upload();
-
-        let mut ready: Vec<u32> = Vec::with_capacity(dirty.len());
         for id in dirty {
+        for id in candidates {
             let Some((width, height, len)) = self
                 .scene
                 .bitmap(id)
@@ -1623,16 +1873,18 @@ impl Engine {
             }
 
             let recreate = self
+                .device
                 .textures
                 .get(&id)
                 .is_none_or(|texture| texture.width() != width || texture.height() != height);
             if recreate {
-                if let Some(old) = self.textures.remove(&id) {
-                    drop_texture(&self.pipeline, &mut self.render_state, old);
+                let old = self.device.textures.remove(&id);
+                if let Some(old) = old {
+                    drop_texture(&self.device.pipeline, &mut self.device.state, old);
                 }
-                match create_texture(&self.pipeline, TextureDesc::new(width, height)) {
+                match create_texture(&self.device.pipeline, TextureDesc::new(width, height)) {
                     Ok(texture) => {
-                        self.textures.insert(id, texture);
+                        self.device.textures.insert(id, texture);
                         // A new texture holds no pixels: the copy has to
                         // cover the whole bitmap, or the rest of the texture
                         // stays undefined. Marking the bitmap wholly keeps a
@@ -1656,47 +1908,15 @@ impl Engine {
             ready.push(id);
         }
 
-        if !ready.is_empty() {
-            // The region every dirty bitmap uploads, with the packed pixels
-            // of the partial ones.
-            let mut planned: Vec<(u32, PixelRegion, Vec<u8>)> = Vec::with_capacity(ready.len());
-            for id in &ready {
-                let Some(bitmap) = self.scene.bitmap(*id) else {
-                    continue;
-                };
-                let (region, pixels) = dirty_upload(bitmap);
-                planned.push((*id, region, pixels));
-            }
-            let uploads: Vec<TextureUpload<'_>> = planned
-                .iter()
-                .filter_map(|(id, region, pixels)| {
-                    let bitmap = self.scene.bitmap(*id)?;
-                    let texture = self.textures.get(id)?;
-                    let whole = PixelRegion::new(0, 0, bitmap.width, bitmap.height);
-                    // The whole bitmap uploads its own buffer; a region
-                    // uploads the packed copy of its rows.
-                    let source = if *region == whole {
-                        &bitmap.rgba[..]
-                    } else {
-                        pixels.as_slice()
-                    };
-                    Some(TextureUpload {
-                        texture,
-                        region: *region,
-                        pixels: source,
-                    })
-                })
-                .collect();
-            let uploaded = match upload_textures(&self.pipeline, &mut self.render_state, &uploads) {
-                Ok(()) => true,
-                Err(error) => {
-                    log::warn!(
-                        "engine.scene: failed to upload bitmaps count={}: {error}; the bitmaps stay \
-                         dirty and the next frame retries them",
-                        uploads.len()
-                    );
-                    false
-                }
+        if ready.is_empty() {
+            return None;
+        }
+        // The region every dirty bitmap uploads, with the packed pixels
+        // of the partial ones.
+        let mut planned: Vec<(u32, PixelRegion, Vec<u8>)> = Vec::with_capacity(ready.len());
+        for id in &ready {
+            let Some(bitmap) = self.scene.bitmap(*id) else {
+                continue;
             };
             // The costs of the batch that was just submitted, read right after
             // the call: the value describes this batch and not an earlier one.
@@ -1715,18 +1935,107 @@ impl Engine {
             Some(timings)
         } else {
             None
+            let (region, pixels) = dirty_upload(bitmap);
+            planned.push((*id, region, pixels));
         }
+        let uploads: Vec<TextureUpload<'_>> = planned
+            .iter()
+            .filter_map(|(id, region, pixels)| {
+                let bitmap = self.scene.bitmap(*id)?;
+                let texture = self.device.textures.get(id)?;
+                let whole = PixelRegion::new(0, 0, bitmap.width, bitmap.height);
+                // The whole bitmap uploads its own buffer; a region
+                // uploads the packed copy of its rows.
+                let source = if *region == whole {
+                    &bitmap.rgba[..]
+                } else {
+                    pixels.as_slice()
+                };
+                Some(TextureUpload {
+                    texture,
+                    region: *region,
+                    pixels: source,
+                })
+            })
+            .collect();
+        let uploaded = match upload_textures(
+            &self.device.pipeline,
+            &mut self.device.state,
+            &uploads,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!(
+                    "engine.scene: failed to upload bitmaps count={}: {error}; the bitmaps stay \
+                     dirty and the next frame retries them",
+                    uploads.len()
+                );
+                false
+            }
+        };
+        // The costs of the batch that was just submitted, read right after
+        // the call: the value describes this batch and not an earlier one.
+        // A batch with no uploads submits nothing, so there is nothing to
+        // measure.
+        let timings = if uploads.is_empty() {
+            None
+        } else {
+        };
+        drop(uploads);
+        // The uploaded pixels are the ones the layers drawing the bitmap
+        // show, so the picture changed.
+        self.scene.mark_dirty();
+        clear_uploaded_dirty(&mut self.scene, &ready, uploaded);
+        timings
     }
 
     /// Drops textures whose bitmap no longer exists in the scene.
     ///
     /// The scene records the bitmaps it removed, so the prune drops the
     /// textures of those bitmaps instead of walking the texture table.
+    ///
+    /// The device surfaces go with the layers they belong to: a layer that
+    /// no longer exists has no composite to draw, so its surface is released.
     fn prune_stale_textures(&mut self) {
-        for id in self.scene.take_removed_bitmaps() {
-            if let Some(texture) = self.textures.remove(&id) {
-                drop_texture(&self.pipeline, &mut self.render_state, texture);
+        let removed = self.scene.take_removed_bitmaps();
+        for id in removed {
+            if let Some(texture) = self.device.textures.remove(&id) {
+                drop_texture(&self.device.pipeline, &mut self.device.state, texture);
             }
+        }
+        // The copies of the bitmaps no layer holds any more: a bitmap nobody
+        // shows needs no copy on the device, and the descriptor set each
+        // that is shown again is made again, and the whole bitmap is
+        // uploaded into it.
+        let stale: Vec<u32> = self
+            .device
+            .textures
+            .keys()
+            .copied()
+            .filter(|id| !held.contains(id))
+            .collect();
+        for id in stale {
+            if let Some(texture) = self.device.textures.remove(&id) {
+                drop_texture(&self.device.pipeline, &mut self.device.state, texture);
+            }
+        }
+        // The copies of the draw sources that were released: a source is
+        // per-frame content, and its copy goes with it.
+        for texture in self.scene.take_released_draw_textures() {
+            drop_texture(&self.device.pipeline, &mut self.device.state, texture);
+        }
+        // The device surfaces go with the layers they belong to: a layer that
+        // no longer exists has no composite to draw, so its surface is
+        // released.
+        let stale: Vec<u32> = self
+            .device
+            .surfaces
+            .keys()
+            .copied()
+            .filter(|layer| self.scene.layer(*layer).is_none())
+            .collect();
+        for layer in stale {
+            release_device_surface(&mut self.device, layer);
         }
     }
 }
@@ -1884,7 +2193,7 @@ mod tests {
             .expect("bitmap")
             .mark_dirty_rect(PixelRegion::new(2, 2, 3, 3));
         engine.frame(16, &mut hooks).expect("second frame");
-        let uploaded = NullRenderPipeline::texture_uploaded_bytes(&engine.render_state, &texture)
+        let uploaded = NullRenderPipeline::texture_uploaded_bytes(&engine.device.state, &texture)
             .expect("uploaded bytes");
         assert_eq!(
             uploaded,
@@ -1965,6 +2274,160 @@ mod tests {
         assert!(add_upload_timings(None, None).is_none(), "no measurement");
         let only = add_upload_timings(None, Some(second)).expect("one measured");
         assert_eq!(only.stage_ms, 20.0);
+    /// The device composite of a layer's subtree: the tree is drawn on the
+    /// device into a surface of the content's size, and the release drops
+    /// that surface.
+    ///
+    /// The compatibility layer asks for the composite and for the release;
+    /// the engine owns the device and runs the requests with it, so the scene
+    /// never holds the device.
+    #[test]
+    fn the_device_composite_draws_into_a_surface_the_release_drops() {
+        let mut engine = headless_engine((32, 32));
+        let window = engine.scene_mut().add_window("device", (32, 32));
+        let root = engine.scene_mut().add_layer(window, None);
+        let child = engine.scene_mut().add_layer(window, Some(root));
+        let root_image = engine
+            .scene_mut()
+            .add_bitmap(32, 32, vec![40u8; 32 * 32 * 4]);
+        let child_image = engine.scene_mut().add_bitmap(8, 8, vec![80u8; 8 * 8 * 4]);
+        engine
+            .scene_mut()
+            .update_layer(root, |state| {
+                state.rect = crate::Rect::new(0, 0, 32, 32);
+                state.visible = true;
+                state.bitmap = Some(root_image);
+                true
+            })
+            .expect("the root layer is updated");
+        engine
+            .scene_mut()
+            .update_layer(child, |state| {
+                state.rect = crate::Rect::new(4, 4, 8, 8);
+                state.visible = true;
+                state.bitmap = Some(child_image);
+                true
+            })
+            .expect("the child layer is updated");
+
+        // The frame uploads the images, so the composite has textures to
+        // sample.
+        let mut hooks = NoFrame;
+        engine.frame(0, &mut hooks).expect("the frame");
+
+        // The compatibility layer's request: the engine runs it with the
+        // device, on the frame thread.
+        engine.scene_mut().request_device_composite(root);
+        engine
+            .frame(16, &mut hooks)
+            .expect("the frame with the composite");
+        assert_eq!(
+            engine.device.surfaces.len(),
+            1,
+            "the composite drew the subtree into a surface"
+        );
+        let content = engine
+            .scene_mut()
+            .subtree_content_id(root)
+            .expect("the subtree's content");
+        let pixels = engine
+            .scene()
+            .bitmap(content)
+            .expect("the content bitmap")
+            .rgba
+            .clone();
+        assert!(
+            pixels.chunks(4).any(|pixel| *pixel != [0, 0, 0, 0]),
+            "the composite wrote the subtree's picture into the content"
+        );
+
+        // The transition's teardown releases the endpoints' surfaces.
+        engine.scene_mut().request_device_surface_release(root);
+        engine.scene_mut().request_device_surface_release(child);
+        engine
+            .frame(32, &mut hooks)
+            .expect("the frame with the release");
+        assert_eq!(
+            engine.device.surfaces.len(),
+            0,
+            "the surfaces the transition needed are released"
+        );
+    }
+
+    /// A release for a layer the device never drew into finds no surface, so
+    /// the device holds none for it.
+    #[test]
+    fn releasing_a_surface_that_was_never_drawn_reports_nothing() {
+        let mut engine = headless_engine((32, 32));
+        let window = engine.scene_mut().add_window("device", (32, 32));
+        let root = engine.scene_mut().add_layer(window, None);
+        let mut hooks = NoFrame;
+        engine.scene_mut().request_device_surface_release(root);
+        engine
+            .frame(0, &mut hooks)
+            .expect("the frame with the release");
+        assert_eq!(
+            engine.device.surfaces.len(),
+            0,
+            "the device holds no surface"
+        );
+    }
+
+    /// A tree the device refuses is composited on the CPU: the device has no
+    /// bitmap to sample a mask plane from, and the CPU path draws the tree.
+    #[test]
+    fn a_tree_the_device_refuses_is_composited_on_the_cpu() {
+        let mut engine = headless_engine((32, 32));
+        let window = engine.scene_mut().add_window("device", (32, 32));
+        let root = engine.scene_mut().add_layer(window, None);
+        let child = engine.scene_mut().add_layer(window, Some(root));
+        let root_image = engine
+            .scene_mut()
+            .add_bitmap(32, 32, vec![40u8; 32 * 32 * 4]);
+        let child_image = engine.scene_mut().add_bitmap(8, 8, vec![80u8; 8 * 8 * 4]);
+        engine
+            .scene_mut()
+            .update_layer(root, |state| {
+                state.rect = crate::Rect::new(0, 0, 32, 32);
+                state.visible = true;
+                state.bitmap = Some(root_image);
+                // The mask face: the device cannot sample the plane the
+                // coverage is derived from.
+                state.face = 2;
+                true
+            })
+            .expect("the root layer is updated");
+        engine
+            .scene_mut()
+            .update_layer(child, |state| {
+                state.rect = crate::Rect::new(4, 4, 8, 8);
+                state.visible = true;
+                state.bitmap = Some(child_image);
+                true
+            })
+            .expect("the child layer is updated");
+
+        let mut hooks = NoFrame;
+        engine.frame(0, &mut hooks).expect("the frame");
+        engine.scene_mut().request_device_composite(root);
+        engine
+            .frame(16, &mut hooks)
+            .expect("the frame with the composite");
+
+        let content = engine
+            .scene_mut()
+            .subtree_content_id(root)
+            .expect("the subtree's content");
+        let pixels = engine
+            .scene()
+            .bitmap(content)
+            .expect("the content bitmap")
+            .rgba
+            .clone();
+        assert!(
+            pixels.chunks(4).any(|pixel| *pixel != [0, 0, 0, 0]),
+            "the CPU composite drew the tree the device refused"
+        );
     }
 
     #[test]
