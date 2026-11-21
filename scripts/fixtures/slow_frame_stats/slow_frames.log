@@ -1,0 +1,67 @@
+[2025-05-13T19:51:00.000Z INFO  app.startup] app.startup: archives mounted count=2 entries=1372 bytes=2458104 mount_ms=41.2
+[2025-05-13T19:51:01.000Z INFO  app.startup] app.startup: entry scripts count=3 scripts_ms=812.4 startup_ms=845.1
+[2025-05-13T19:51:02.100Z WARN  app.frame] app.frame: slow frame=7 presented=false gap_ms=520.0 dominant=phases.frame_tail dominant_ms=480.0
+  cost phases.frame_tail=480.0
+  cost pool.elapsed=12.0
+  cost vm.input_events=2.0
+  cost host.render=10.0
+  cost gpu.present=2.5
+  cost wait.unaccounted=3.5
+  residual tick_residual_ms=4.0 host_residual_ms=0.3 unaccounted_ms=3.5 pool_jobs=2
+  total body_ms=480.0 tick_ms=487.5 host_sync_ms=0.5 host_total_ms=11.0 total_ms=501.5 platform_wait_ms=15.0
+[2025-05-13T19:51:02.200Z INFO  app.audio] app.audio: the device opened
+[2025-05-13T19:51:03.100Z WARN  app.frame] app.frame: slow frame=8 presented=true gap_ms=120.0 dominant=host.render dominant_ms=95.0
+  cost host.render=95.0
+  cost pool.elapsed=8.0
+  cost gpu.acquire=4.0
+  cost wait.unaccounted=2.0
+  residual tick_residual_ms=1.0 host_residual_ms=0.5 unaccounted_ms=2.0 pool_jobs=1
+  total body_ms=10.0 tick_ms=15.0 host_sync_ms=1.0 host_total_ms=100.0 total_ms=115.0 platform_wait_ms=3.0
+[2025-05-13T19:51:04.100Z WARN  app.frame] app.frame: slow frame=9 presented=true gap_ms=35.0 dominant=vm.input_events dominant_ms=20.0
+  cost vm.input_events=20.0
+  cost pool.elapsed=4.0
+  cost wait.unaccounted=1.0
+  residual tick_residual_ms=2.0 host_residual_ms=0.2 unaccounted_ms=1.0 pool_jobs=0
+  total body_ms=5.0 tick_ms=27.0 host_sync_ms=0.2 host_total_ms=2.0 total_ms=30.0 platform_wait_ms=2.0
+[2025-05-13T19:51:05.100Z WARN  app.frame] app.frame: slow frame=12 presented=false gap_ms=880.0 dominant=gpu.fence_wait dominant_ms=700.0
+  cost gpu.fence_wait=700.0
+  cost pool.elapsed=30.0
+  cost host.render=60.0
+  cost wait.unaccounted=20.0
+  residual tick_residual_ms=1.0 host_residual_ms=2.0 unaccounted_ms=20.0 pool_jobs=5
+  total body_ms=5.0 tick_ms=8.0 host_sync_ms=1.0 host_total_ms=70.0 total_ms=850.0 platform_wait_ms=25.0
+  front_end lexer_ms=0.5 parser_ms=1.0 generator_ms=0.3 image_ms=0.2 residual_ms=0.0 total_ms=2.0
+[2025-05-13T19:51:06.100Z WARN  app.frame] app.frame: slow frame=13 presented=true gap_ms=18.0 dominant=vm.input_begin dominant_ms=12.0
+  cost vm.input_begin=12.0
+  cost wait.unaccounted=1.0
+  residual tick_residual_ms=1.0 host_residual_ms=0.1 unaccounted_ms=1.0 pool_jobs=0
+  total body_ms=1.0 tick_ms=14.0 host_sync_ms=0.1 host_total_ms=0.5 total_ms=15.0 platform_wait_ms=1.0
+[2025-05-13T19:51:07.100Z WARN  app.frame] app.frame: slow frame=14 presented=true gap_ms=210.0 dominant=phases.frame_tail dominant_ms=180.0
+  cost phases.frame_tail=180.0
+  cost pool.elapsed=14.0
+  cost vm.input_events=3.0
+  cost host.render=4.0
+  cost wait.unaccounted=6.0
+  residual tick_residual_ms=3.0 host_residual_ms=0.4 unaccounted_ms=6.0 pool_jobs=3
+  total body_ms=180.0 tick_ms=190.0 host_sync_ms=0.3 host_total_ms=6.0 total_ms=200.0 platform_wait_ms=8.0
+[2025-05-13T19:51:07.500Z WARN  app.frame] app.frame: slow frame=16 presented=true gap_ms=20.0 dominant=phases.sound dominant_ms=14.0
+  cost phases.sound=14.0
+  cost pool.elapsed=2.0
+  cost wait.unaccounted=1.0
+  residual tick_residual_ms=1.0 host_residual_ms=0.2 unaccounted_ms=1.0 pool_jobs=1
+  total body_ms=1.0 tick_ms=15.0 host_sync_ms=0.1 host_total_ms=1.0 total_ms=18.0 platform_wait_ms=1.0
+[2025-05-13T19:51:08.100Z WARN  app.frame] app.frame: slow frame=21 presented=true gap_ms=45.0 dominant=pool.elapsed dominant_ms=30.0
+  cost pool.elapsed=30.0
+  cost vm.input_events=5.0
+  cost wait.unaccounted=2.0
+  residual tick_residual_ms=1.0 host_residual_ms=0.1 unaccounted_ms=2.0 pool_jobs=8
+  total body_ms=2.0 tick_ms=9.0 host_sync_ms=0.2 host_total_ms=1.0 total_ms=40.0 platform_wait_ms=2.0
+app.frame: slow frame=22 presented=true gap_ms=60.0 dominant=host.render dominant_ms=48.0
+  cost host.render=48.0
+  cost pool.elapsed=6.0
+  cost gpu.present=1.5
+  cost wait.unaccounted=1.0
+  residual tick_residual_ms=1.0 host_residual_ms=0.2 unaccounted_ms=1.0 pool_jobs=1
+  total body_ms=2.0 tick_ms=5.0 host_sync_ms=0.2 host_total_ms=52.0 total_ms=56.0 platform_wait_ms=2.0
+[2025-05-13T19:51:09.100Z WARN  app.frame] app.frame: slow-frame reporting stopped: the reporting budget is spent budget_ms=10 reports=2
+[2025-05-13T19:51:09.500Z INFO  app.frame] app.frame: the slow frame report budget is 10 ms

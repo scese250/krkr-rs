@@ -1,0 +1,10 @@
+{
+  "threshold_ms": 20.0,
+  "reported_frames": 20,
+  "slow_frames": 20,
+  "mean_ms": 30.5,
+  "p50_ms": 30.0,
+  "p90_ms": 38.0,
+  "p99_ms": 40.0,
+  "worst_ms": 40.0
+}

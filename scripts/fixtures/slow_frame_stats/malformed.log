@@ -1,0 +1,10 @@
+[2025-05-13T19:51:00.000Z INFO  app.startup] app.startup: archives mounted count=1 entries=12 bytes=4096 mount_ms=3.1
+  cost phases.frame_tail=480.0
+[2025-05-13T19:51:01.000Z WARN  app.frame] app.frame: slow frame=3 presented=true gap_ms=44.0 dominant=host.render dominant_ms=30.0
+  cost host.render=30.0
+  cost vm.input_events=abc
+[2025-05-13T19:51:02.000Z WARN  app.audio] app.audio: the device underran
+  note something=1
+[2025-05-13T19:51:03.000Z WARN  app.frame] app.frame: slow frame=4 presented=true gap_ms=notanumber dominant=host.render dominant_ms=30.0
+  cost host.render=30.0
+[2025-05-13T19:51:04.000Z INFO  app.runner] app.runner: the run is over

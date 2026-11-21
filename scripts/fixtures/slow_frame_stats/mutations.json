@@ -1,0 +1,58 @@
+[
+  {
+    "name": "a changed gap",
+    "old": "gap_ms=880.0 dominant=gpu.fence_wait",
+    "new": "gap_ms=1880.0 dominant=gpu.fence_wait",
+    "probe": "worst_ms",
+    "value": 1880.0
+  },
+  {
+    "name": "a dropped cost line",
+    "old": "  cost gpu.fence_wait=700.0\n",
+    "new": "",
+    "probe": "aggregate_cost:gpu.fence_wait",
+    "value": 0.0
+  },
+  {
+    "name": "a changed dominant cost",
+    "old": "dominant=phases.frame_tail dominant_ms=480.0",
+    "new": "dominant=vm.tick dominant_ms=470.0",
+    "probe": "dominant:phases.frame_tail",
+    "value": 1.0
+  },
+  {
+    "name": "a dropped record",
+    "old": "[2025-05-13T19:51:08.100Z WARN  app.frame] app.frame: slow frame=21 presented=true gap_ms=45.0 dominant=pool.elapsed dominant_ms=30.0\n  cost pool.elapsed=30.0\n  cost vm.input_events=5.0\n  cost wait.unaccounted=2.0\n  residual tick_residual_ms=1.0 host_residual_ms=0.1 unaccounted_ms=2.0 pool_jobs=8\n  total body_ms=2.0 tick_ms=9.0 host_sync_ms=0.2 host_total_ms=1.0 total_ms=40.0 platform_wait_ms=2.0\n",
+    "new": "",
+    "probe": "reported_frames",
+    "value": 8.0
+  },
+  {
+    "name": "a gap under the threshold",
+    "old": "gap_ms=35.0 dominant=vm.input_events",
+    "new": "gap_ms=5.0 dominant=vm.input_events",
+    "probe": "slow_frames",
+    "value": 7.0
+  },
+  {
+    "name": "an unreadable gap",
+    "old": "gap_ms=120.0 dominant=host.render",
+    "new": "gap_ms=abc dominant=host.render",
+    "probe": "unusable_frames",
+    "value": 1.0
+  },
+  {
+    "name": "an orphaned continuation line",
+    "old": "[2025-05-13T19:51:00.000Z INFO  app.startup] app.startup: archives mounted count=2 entries=1372 bytes=2458104 mount_ms=41.2\n",
+    "new": "  cost bogus=1.0\n[2025-05-13T19:51:00.000Z INFO  app.startup] app.startup: archives mounted count=2 entries=1372 bytes=2458104 mount_ms=41.2\n",
+    "probe": "orphan_lines",
+    "value": 1.0
+  },
+  {
+    "name": "an unreadable cost value",
+    "old": "  cost gpu.present=2.5\n",
+    "new": "  cost gpu.present=abc\n",
+    "probe": "skipped_lines",
+    "value": 1.0
+  }
+]

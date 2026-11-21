@@ -1,0 +1,8 @@
+{
+  "reported_frames": 2,
+  "unusable_frames": 1,
+  "orphan_lines": 1,
+  "skipped_lines": 2,
+  "slow_frames": 1,
+  "aggregate_cost": [["host.render", 30.0]]
+}

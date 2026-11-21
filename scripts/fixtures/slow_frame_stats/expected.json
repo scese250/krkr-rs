@@ -1,0 +1,60 @@
+{
+  "threshold_ms": 20.0,
+  "reported_frames": 9,
+  "slow_frames": 8,
+  "unusable_frames": 0,
+  "mean_ms": 236.25,
+  "p50_ms": 60.0,
+  "p90_ms": 880.0,
+  "p99_ms": 880.0,
+  "worst_ms": 880.0,
+  "slow_total_ms": 1890.0,
+  "reported_total_ms": 1908.0,
+  "slow_time_share_pct": 99.06,
+  "pool_jobs": 21,
+  "orphan_lines": 0,
+  "skipped_lines": 0,
+  "aggregate_cost": [
+    ["gpu.fence_wait", 700.0],
+    ["phases.frame_tail", 660.0],
+    ["host.render", 217.0],
+    ["pool.elapsed", 106.0],
+    ["wait.unaccounted", 36.5],
+    ["vm.input_events", 30.0],
+    ["phases.sound", 14.0],
+    ["gpu.acquire", 4.0],
+    ["gpu.present", 4.0]
+  ],
+  "aggregate_residual": [
+    ["unaccounted_ms", 36.5],
+    ["tick_residual_ms", 14.0],
+    ["host_residual_ms", 3.9]
+  ],
+  "dominant": [
+    ["host.render", 2],
+    ["phases.frame_tail", 2],
+    ["gpu.fence_wait", 1],
+    ["phases.sound", 1],
+    ["pool.elapsed", 1],
+    ["vm.input_events", 1]
+  ],
+  "worst_frames": ["12", "7", "14"],
+  "worst_presented": ["false", "false", "true"],
+  "worst_front_end": [
+    ["lexer_ms", 0.5],
+    ["parser_ms", 1.0],
+    ["generator_ms", 0.3],
+    ["image_ms", 0.2],
+    ["residual_ms", 0.0],
+    ["total_ms", 2.0]
+  ],
+  "worst_totals": [
+    ["body_ms", 5.0],
+    ["tick_ms", 8.0],
+    ["host_sync_ms", 1.0],
+    ["host_total_ms", 70.0],
+    ["total_ms", 850.0],
+    ["platform_wait_ms", 25.0]
+  ],
+  "frames": [7, 8, 9, 12, 14, 16, 21, 22]
+}

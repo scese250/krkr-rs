@@ -51,6 +51,29 @@ directly, with the standard library only, so it needs no SDK tool and no
 device; `--self-test` mutates the real package four ways and asserts that each
 mutation is caught.
 
+### The slow-frame statistics
+
+`slow_frame_stats.py` turns a run's slow-frame records into the statistics of
+the slow frames. The engine reports every frame whose gap reaches the
+threshold the caller set (`--slow-frame-ms`), as one record: a header that
+names the frame, the gap and the cost that dominates it, and the continuation
+lines that carry the frame's own costs. The script reads those records by
+their `key=value` fields and reports how many frames reached the threshold,
+the distribution of their gaps, every cost summed over them and ranked, which
+cost dominated how many of them, and the worst frames with their own
+breakdown. The record is parsed by its fields, never by the position of a
+column, and a broken record is counted and left out rather than guessed at.
+
+```bash
+python3 scripts/slow_frame_stats.py --threshold-ms 20 run.log
+python3 scripts/slow_frame_stats.py --self-test
+```
+
+The threshold is the caller's: 20 ms is a 50 fps budget, 33.3 ms is a 30 fps
+one. The output is plain text, one `key=value` fact per line, prefixed with
+`slow-frame-stats `, and it carries the frame numbers and the cost names
+only — nothing of the game's own content.
+
 ### The fixtures are the checks' own tests
 
 Every check carries a `--self-test` that runs it against a small corpus of

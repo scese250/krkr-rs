@@ -1,0 +1,3 @@
+[2025-05-13T19:51:00.000Z INFO  app.startup] app.startup: archives mounted count=2 entries=1372 bytes=2458104 mount_ms=41.2
+[2025-05-13T19:51:01.000Z INFO  app.startup] app.startup: entry scripts count=3 scripts_ms=812.4 startup_ms=845.1
+[2025-05-13T19:51:09.100Z WARN  app.frame] app.frame: slow-frame reporting stopped: the reporting budget is spent budget_ms=10 reports=2
