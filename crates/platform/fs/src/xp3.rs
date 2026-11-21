@@ -785,27 +785,29 @@ impl Xp3Archive {
             reader.read_exact(&mut buf)?;
 
             let method = seg.flags & SEGM_ENCODE_METHOD_MASK;
-            let decoded = match method {
-                SEGM_ENCODE_RAW => buf,
+            let begin = out.len();
+            match method {
+                SEGM_ENCODE_RAW => out.extend_from_slice(&buf),
                 SEGM_ENCODE_ZLIB => {
                     let org_len = usize::try_from(seg.org_size)
                         .map_err(|_| Xp3Error::CorruptIndex("segment too large"))?;
+                    // The segment is inflated into the entry's own buffer:
+                    // the decoded bytes are not copied a second time. The
+                    // buffer is reserved before the loop, so the resize
+                    // cannot fail.
+                    out.resize(begin + org_len, 0);
                     let mut dec = ZlibDecoder::new(&buf[..]);
-                    let mut chunk = alloc_zeroed(org_len, "segment too large")?;
-                    dec.read_exact(&mut chunk)
+                    dec.read_exact(&mut out[begin..])
                         .map_err(|_| Xp3Error::Inflate(entry.name.to_string()))?;
-                    chunk
                 }
                 other => return Err(Xp3Error::UnknownSegmentMethod(other, seg.flags)),
-            };
-            let begin = out.len();
-            out.extend_from_slice(&decoded);
+            }
             segments.push(DecodedSegment {
                 offset,
                 range: begin..out.len(),
             });
             offset = offset
-                .checked_add(decoded.len() as u64)
+                .checked_add((out.len() - begin) as u64)
                 .ok_or(Xp3Error::CorruptIndex("entry size overflow"))?;
         }
         // The entry header's `org_size` must agree with what the segments

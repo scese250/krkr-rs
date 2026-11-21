@@ -12,9 +12,6 @@
 use crate::decompress::{EmoteCtx, open_decompressed_stream};
 use crate::error::{PsbError, PsbResult};
 
-/// The container's string table, keyed by the string index.
-type StringMap = hashbrown::HashMap<u32, String, ahash::RandomState>;
-
 /// The `PSB\0` magic.
 const PSB_MAGIC: [u8; 4] = *b"PSB\0";
 /// The `MDF\0` archive magic.
@@ -39,6 +36,11 @@ impl<'a> Reader<'a> {
 
     fn len(&self) -> usize {
         self.data.len()
+    }
+
+    /// The bytes that are left after the cursor.
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
     }
 
     fn set_pos(&mut self, pos: usize) -> PsbResult<()> {
@@ -415,7 +417,12 @@ struct Parser<'a> {
     header: PsbHeader,
     names: Vec<String>,
     string_offsets: Vec<u32>,
-    strings: StringMap,
+    /// The string of every index of the string table, read on first use.
+    ///
+    /// The table is indexed by the string index, so a lookup is an index
+    /// and not a hash: the table holds the strings the tree uses once each,
+    /// and the unused slots cost nothing but their size.
+    strings: Vec<Option<String>>,
     resources: Vec<ResourceRef>,
     extra_resources: Vec<ResourceRef>,
 }
@@ -440,21 +447,31 @@ impl<'a> Parser<'a> {
 
     /// Look a string up by index, reading and caching it on first use.
     fn load_string(&mut self, index: u32) -> PsbResult<String> {
-        if let Some(value) = self.strings.get(&index) {
-            return Ok(value.clone());
+        let slot = index as usize;
+        if slot >= self.strings.len() {
+            return Err(PsbError::Format(format!(
+                "string index {index} out of range"
+            )));
         }
-        let offset = self
-            .string_offsets
-            .get(index as usize)
-            .copied()
-            .ok_or_else(|| PsbError::Format(format!("string index {index} out of range")))?;
+        let cached = self.strings[slot].clone();
+        if let Some(value) = cached {
+            return Ok(value);
+        }
+        let offset = self.string_offsets[slot];
         let start = self.header.offset_strings_data as usize + offset as usize;
         let mut reader = Reader::at(self.data, start);
         let value = reader.null_terminated_string()?;
-        self.strings.insert(index, value.clone());
+        self.strings[slot] = Some(value.clone());
         Ok(value)
     }
 
+    /// Register a chunk the tree names.
+    ///
+    /// The tree may name the same chunk more than once. The list is sorted
+    /// and deduplicated when the chunks are loaded, so the registration is
+    /// a push: the lookup that would keep the list free of duplicates is a
+    /// scan of the whole list, and the list is as long as the tree names
+    /// chunks.
     fn register_resource(&mut self, index: u32, extra: bool) -> ResourceRef {
         let reference = ResourceRef { index, extra };
         let list = if extra {
@@ -462,9 +479,7 @@ impl<'a> Parser<'a> {
         } else {
             &mut self.resources
         };
-        if !list.contains(&reference) {
-            list.push(reference);
-        }
+        list.push(reference);
         reference
     }
 
@@ -528,7 +543,7 @@ impl<'a> Parser<'a> {
         let count_size = read_count_size(reader.u8()?)?;
         let offsets = read_list_body(reader, count_size)?;
         let base = reader.pos;
-        let mut items = Vec::with_capacity(offsets.len().min(1 << 16));
+        let mut items = Vec::with_capacity(offsets.len());
         for offset in offsets {
             reader.set_pos(base + offset as usize)?;
             if let Some(value) = self.unpack(reader)? {
@@ -549,7 +564,7 @@ impl<'a> Parser<'a> {
         let offset_count_size = read_count_size(reader.u8()?)?;
         let offsets = read_list_body(reader, offset_count_size)?;
         let base = reader.pos;
-        let mut entries = Vec::with_capacity(name_indexes.len().min(1 << 16));
+        let mut entries = Vec::with_capacity(name_indexes.len());
         for (position, name_index) in name_indexes.iter().enumerate() {
             let Some(name) = self.names.get(*name_index as usize).cloned() else {
                 log::warn!("psb_file: name index {name_index} out of range");
@@ -571,7 +586,7 @@ impl<'a> Parser<'a> {
         let count_size = read_count_size(reader.u8()?)?;
         let offsets = read_list_body(reader, count_size)?;
         let base = reader.pos;
-        let mut entries = Vec::with_capacity(offsets.len().min(1 << 16));
+        let mut entries = Vec::with_capacity(offsets.len());
         for offset in offsets {
             reader.set_pos(base + offset as usize)?;
             let type_byte = reader.u8()?;
@@ -625,7 +640,18 @@ fn read_list_body(reader: &mut Reader, count_size: usize) -> PsbResult<Vec<u32>>
             "array entry width {entry_width} too large"
         )));
     }
-    let mut values = Vec::with_capacity(count.min(1 << 16));
+    // The entries are in the stream: a count that does not fit is a
+    // malformed container, and the check bounds the allocation the entries
+    // need by the bytes the container holds.
+    if entry_width > 0 {
+        let needed = count
+            .checked_mul(entry_width)
+            .ok_or_else(|| PsbError::Format("array size overflow".into()))?;
+        if needed > reader.remaining() {
+            return Err(PsbError::Truncated("bytes"));
+        }
+    }
+    let mut values = Vec::with_capacity(count);
     for _ in 0..count {
         values.push(if entry_width == 0 {
             0
@@ -643,8 +669,11 @@ fn read_list_body(reader: &mut Reader, count_size: usize) -> PsbResult<Vec<u32>>
 /// name index is a slot whose `names_data` entry is the terminal node.
 fn decode_names(charset: &[u32], names_data: &[u32], name_indexes: &[u32]) -> Vec<String> {
     let mut names = Vec::with_capacity(name_indexes.len());
+    // The bytes of a name are collected in a buffer that is reused, so the
+    // table costs one allocation and not one per name.
+    let mut bytes: Vec<u8> = Vec::new();
     for &index in name_indexes {
-        let mut bytes = Vec::new();
+        bytes.clear();
         let mut chr = names_data.get(index as usize).copied().unwrap_or(0);
         let mut guard = 0usize;
         while chr != 0 {
@@ -755,12 +784,15 @@ pub fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
         read_list_body(&mut reader, count_size)?
     };
 
+    let string_count = string_offsets.len();
     let mut parser = Parser {
         data: &data,
         header,
         names: Vec::new(),
         string_offsets,
-        strings: StringMap::default(),
+        // The string table is indexed by the string index: a slot holds the
+        // string once it has been read.
+        strings: vec![None; string_count],
         resources: Vec::new(),
         extra_resources: Vec::new(),
     };
@@ -823,6 +855,19 @@ pub fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
             .ok_or_else(|| PsbError::Format("root object is empty".into()))?
     };
 
+    // The tree may name the same chunk more than once. The chunks are
+    // loaded once each: the list is sorted and deduplicated, so the order
+    // the tree named them in is not kept.
+    let first_extra = parser.extra_resources.first().copied();
+    parser
+        .resources
+        .sort_unstable_by_key(|reference| (reference.extra, reference.index));
+    parser.resources.dedup();
+    parser
+        .extra_resources
+        .sort_unstable_by_key(|reference| (reference.extra, reference.index));
+    parser.extra_resources.dedup();
+
     let mut resources = Vec::new();
     load_chunks(
         &data,
@@ -841,7 +886,7 @@ pub fn parse(mut data: Vec<u8>, seed: i64) -> PsbResult<PsbDocument> {
             &parser.extra_resources,
             &mut resources,
         )?;
-    } else if let Some(reference) = parser.extra_resources.first() {
+    } else if let Some(reference) = first_extra {
         // A container without the extra chunk tables cannot resolve a chunk
         // that names one.
         return Err(PsbError::Format(format!(
