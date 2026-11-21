@@ -82,10 +82,9 @@ For every window, in `Scene::windows` order, and for every layer in
    node: its pixels are already in the ancestor's rendered cache bitmap. The
    descendants that are visible under that ancestor are still reported as
    drawn, because their pixels are baked into the emitted cache.
-2. **Pick the image to draw** — the layer's transition *frame* (the two
-   sources a composited transition placed for this tick), its transition self
-   image (which stands in for the main image while the children keep drawing
-   live), its rendered cache bitmap, or its main image.
+2. **Pick the image to draw** — the layer's transition self image (which
+   stands in for the main image while the children keep drawing live), its
+   rendered cache bitmap, or its main image.
 3. **Compose** the absolute rectangle (ancestor `x`/`y` accumulate, the layer
    keeps its own `w`/`h`), the opacity (the product of the layer and every
    ancestor, each clamped to `[0, 1]`, NaN → 0), the visibility (the AND of
@@ -102,11 +101,10 @@ For every window, in `Scene::windows` order, and for every layer in
 6. **Resolve the blend**: the stored generic `BlendMode` passes through,
    except that an opaque `Replace` below full composed opacity degrades to
    `SourceOver` — it must still blend.
-7. **Emit** the node and record the layer id as drawn. A transition frame
-   emits its two sources instead of one node: source 1 with the layer's blend
-   and opacity, source 2 over it at the frame's alpha (source-over, because it
-   fades), each with its own `dst`/`src` inside the frame (`Scroll`) or the
-   whole frame (`CrossFade`).
+7. **Emit** the node and record the layer id as drawn. A transition the
+   backend draws with a custom shader emits one node per pass instead of one
+   node: the passes are placed inside the draw's own frame, and the frame
+   where the layer's own image would be.
 8. **Emit the pose.** A layer whose pose lives on the backend draws its own
    image and then the pose over it: the pose surface mirrors the image's
    layout, so it is placed where the image is, and it composites with the
@@ -130,18 +128,16 @@ across windows are globally ordered by insertion.
 * **A layer is skipped** when it is hidden anywhere in its chain, has no
   texture, is fully clipped away, or sits under a layer whose cache bitmap
   already contains its pixels.
-* **A transition frame is two nodes of one layer**: the layer id is reported
-  once, the second source's node is the layer's `nearest` node for its
-  children, and a whole-subtree frame covers the children exactly like a cache
-  bitmap (they are reported, not emitted).
+* **A transition draw is one node per pass of one layer**: the layer id is
+  reported once, and a whole-subtree draw covers the children exactly like a
+  cache bitmap (they are reported, not emitted).
 * **A layer's pose is a second node of the same layer**: its own image is
   drawn first, and the pose surface over it.
 * **A transition draw takes precedence over the cached subtree.** While a
-  layer owns a transition frame or effect draw, its own `cache_bitmap` is
-  not drawn: the frame/effect replaces the image the cache holds. A frame
-  that covers only the layer's own image leaves the children live and never
-  becomes a cached-subtree root; a whole-subtree frame holds them like a
-  cache does.
+  layer owns an effect draw, its own `cache_bitmap` is not drawn: the draw
+  replaces the image the cache holds. A draw that covers only the layer's own
+  image leaves the children live and never becomes a cached-subtree root; a
+  whole-subtree draw holds them like a cache does.
 * **A transition self image takes precedence over the cached subtree**: it
   covers only the layer's own image, so the children keep drawing live and
   the layer never becomes a cached-subtree root.
@@ -210,11 +206,11 @@ project_scene_report(scene, |id| textures.get(&id).cloned())
 ## 9. Tests
 
 * `crates/engine/tests/projection.rs` — the composition rules, the blend
-  downgrade, the sprite placement, the cache behaviour, the emit report, the
-  transition frame's two nodes (including the offscreen composition that must
-  agree with the CPU blend within the documented tolerance, see
-  [trans.md](trans.md) §6.1), and an engine frame that draws a composited
-  transition without a display bitmap.
+  downgrade, the sprite placement, the cache behaviour, the emit report, and
+  an engine frame that draws a composited transition without a display bitmap.
+* `crates/engine/tests/transition_exact.rs` — the transition's own nodes: the
+  pass over the two endpoints, the placement, the whole-subtree hold and the
+  return to the main image.
 * `crates/engine/tests/motion_draw_list_gpu.rs` — the pose on the backend
   against the CPU path: the two draw the same picture, and they differ only
   where a pixel is sampled from the other texel.

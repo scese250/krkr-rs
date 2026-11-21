@@ -99,7 +99,6 @@ pub use projection::{
 };
 pub use scene::{
     BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
-    TransitionFrame, TransitionSource,
 };
 pub use startup::{StartupError, discover_startup};
 pub use storage::{Location, Storage, StorageReadError};

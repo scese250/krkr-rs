@@ -31,6 +31,7 @@ pub struct Scene {
     pub bitmaps: Vec<BitmapState>,
     pub fonts: Vec<FontState>,
     pub host_draws_lists: bool,
+    pub effect_pipelines: EffectPipelines,
     // private:
     next_window / next_layer / next_bitmap / next_font: u32,
     window_index / layer_index / bitmap_index / font_index: Map<u32, usize>,
@@ -53,18 +54,16 @@ itself. The engine draws them on its backend, so it turns the flag on and the
 compatibility layer leaves the lists to it; a host that leaves the flag off
 has the list drawn on the CPU.
 
-`Scene::composite_transition_frames` is the one host-selected field: it says
-whether a running transition draws from `LayerState::transition_frame` (the
-projection composites it) or is blended into the layer's display bitmap on the
-CPU. It defaults to the CPU path, which is what a bare `Scene` (a test, the
-headless host) gets; `Engine::new` turns it on for a backend that draws the
-projected scene.
+`Scene::effect_pipelines` holds the backend handles of the programs the
+layers' custom-shader draws name. The engine fills the table when it creates
+the pipelines for the programs it ships; a table without an entry means the
+backend cannot run effect pipelines, and a transition that needs one blends on
+the CPU.
 
 | type | owns |
 |---|---|
 | `WindowState` | the client size, visibility, opacity, the primary layer, the focus domains and their focus, and the window's layer list |
-| `LayerState` | the parent/child links, the focus domain, the rect, visibility, opacity, the generic `BlendMode`, the sibling sort key, the image placement, the province plane, the hit-test mode, the clip rect, the focus and hint properties, the cache slots (`cache_bitmap`, `cache_content`, `transition_self`, `transition_frame`, `cache_enabled_count`, `cache_recalc`), the content region (`content_region`), the draw list the layer shows (`draws`) and the `pending_paint` / `shutdown` flags |
-| `TransitionFrame` / `TransitionSource` | the frame a composited transition draws on a layer: its pixel size, whether it covers the layer rect, and the two source draws (`bitmap`, `src`, `dst`, `alpha`) |
+| `LayerState` | the parent/child links, the focus domain, the rect, visibility, opacity, the generic `BlendMode`, the sibling sort key, the image placement, the province plane, the hit-test mode, the clip rect, the focus and hint properties, the cache slots (`cache_bitmap`, `cache_content`, `transition_self`, `effect`, `cache_enabled_count`, `cache_recalc`), the content region (`content_region`), the draw list the layer shows (`draws`) and the `pending_paint` / `shutdown` flags |
 | `BitmapState` | the RGBA8 pixels, the dimensions, the dirty flag and dirty region, the script-ownership flag and the pending decode (`pending`) |
 | `FontState` | the requested face, height, colour and the style flags |
 | `Rect` | a rectangle (`x`, `y`, `w`, `h`) in the space of whatever holds it: a layer's rectangle is in its parent's space, a content region in the layer's own space |
@@ -111,7 +110,7 @@ bitmaps and fonts are released with them.
 | lifetime | `remove_layer` (detach), `destroy_layer` (destroy the subtree), `invalidate_layer` |
 | focus | `set_focus`, `clear_focus`, `focused_in`, `set_domain_focus`, `window_input_root`, `next_focusable`, `prev_focusable`, `node_focusable` |
 | visibility / hit-test | `node_visible`, `node_enabled`, `layer_hit_next`, `layer_hit_outcome` |
-| caches | `inc_cache_enabled_count`, `dec_cache_enabled_count`, `set_cache_bitmap`, `set_transition_self_image`, `set_transition_frame`, `update_layer` |
+| caches | `inc_cache_enabled_count`, `dec_cache_enabled_count`, `set_cache_bitmap`, `set_transition_self_image`, `set_effect`, `update_layer` |
 | pixels | `main_image_pixel_buffer`, `main_image_pixel_buffer_for_write`, `province_image_pixel_buffer`, `province_image_pixel_buffer_for_write`, `with_main_image_pixels`, `with_main_image_pixels_mut`, `with_province_pixels`, `with_province_pixels_mut`, `allocate_province_image`, `resize_province_image`, `deallocate_province_image`, `province_pixel`, `set_province_pixel` |
 
 ### Bitmaps
@@ -332,11 +331,11 @@ accumulates on it exactly as it accumulates on the CPU.
 * **The transition self image stands in for the main image** in a cached
   subtree, the reference's `CopySelfForRect`
   (`reference/cpp/core/visual/LayerIntf.cpp:6781-6783`).
-* **A running transition frame or effect leaves the endpoint subtrees
-  reusable.** A frame update marks only the layer's caching **ancestors**
-  stale; the layer's own composited content is one of the frame's sources and
-  does not change. Clearing the frame invalidates the layer itself, because
-  it resumes drawing its own subtree.
+* **A running transition draw leaves the endpoint subtrees reusable.** The
+  draw is a display of the layer's content, not the content itself: the
+  layer's composited subtree and every caching ancestor's stay reusable.
+  Clearing the draw invalidates the layer itself, because it resumes drawing
+  its own subtree.
 
 ---
 

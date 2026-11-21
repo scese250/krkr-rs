@@ -236,8 +236,8 @@ into it and `frame` put it at the injected value.
     presentation/texture table invalidated the projection);
 11. `hooks.after_project(&drawn_layers)`;
 12. `sync_presentation()` again;
-13. upload the dirty bitmap regions again (a CPU-blended transition frame is a bitmap
-    the hook rewrote without changing the tree) and prune again;
+13. upload the dirty bitmap regions again (a CPU-blended transition writes a
+    bitmap the hook rewrote without changing the tree) and prune again;
 14. project again if the hook changed the scene's structure;
 15. one `render` call — into the surface, or into the offscreen target;
 16. recover a lost surface, then record the frame in the presentation stall —

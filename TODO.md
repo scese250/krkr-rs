@@ -483,21 +483,18 @@ every transition frame goes through the software rasterizer.
   does not single it out. The core cross-fade and universal handlers use the
   same three-way selection (`TransIntf.cpp:664-686` and `:737-761`) and are
   implemented; the `wave` provider keeps the four-channel mix.
-* **The composited frame is the GPU path's remaining gap.** A host that
-  cannot run the cross-fade program falls back to the composited frame, which
-  draws the two sources with the phase as their weights — the reference's
-  plain blend (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3265-3268`)
-  — so it mixes the four channels alike whatever the destination's type is
-  (`engine/src/trans/mod.rs` `Trans::transition_frame`,
-  `engine/src/projection.rs`). A destination that uses its alpha channel gets
-  the coverage mix instead (`reference/cpp/core/visual/TransIntf.cpp:664-673`),
-  which the composited frame cannot express: at a full-screen fade the two
-  differ by up to five 8-bit levels per channel. The cross-fade program
-  (`engine/shaders/crossfade.frag`) runs the coverage mix, so a host that can
-  run it — the desktop and the Android build — matches the reference; the
-  composited frame is the fallback for a host that cannot. The rule-based
-  kinds have no program at all and are blended on the CPU on every host, with
-  the mix the destination's alpha handling selects.
+* **The kinds without a program are blended on the CPU.** `universal`, `mask`
+  and the seven `extrans` kinds need a per-pixel rule or a coordinate warp, so
+  they have no program and `Trans::apply` blends them into the destination
+  bitmap on every host, with the mix the destination's alpha handling selects.
+  The cross-fade and the scroll have a program
+  (`engine/shaders/crossfade.frag`), so a host that can run it — the desktop
+  and the Android build — draws the transition with it. A host that cannot
+  run the program blends the cross-fade on the CPU, and that blend is the
+  one the program runs: the coverage mix for a destination with a straight
+  alpha (`reference/cpp/core/visual/TransIntf.cpp:664-673`) and the plain
+  mix for every other destination
+  (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3265-3268`).
 * **The shipped build's plugin surface is larger than the port's.** The
   shipped `textrender.dll` registers members the port does not have: `setFont`,
   `setStyle`, `timeScale`, `renderLines`, `contains`, `maxScrollOffset`,
@@ -1883,3 +1880,81 @@ back on demand and cached per pose revision. Two gaps are open.
   change, the projected node would keep the old texture handle. No test covers
   the engine's frame with a draw list:
   `crates/engine/tests/motion_draw_list_gpu.rs` drives the scene directly.
+
+## 21. The pre-rendered font's shadow is placed one pixel off
+
+The pre-rendered font path draws the blurred shadow at the sharp character's
+origin, while the reference moves the blurred character's origin by
+`-blur_width`
+(`reference/krkr2/cpp/core/visual/CharacterData.cpp:141-158`,
+`reference/krkr2/cpp/core/visual/LayerBitmapImpl.cpp:911-912`). The
+rasterized path in this engine places it correctly, so only the `.tft` path
+differs, by `blur_width` pixels (one pixel for the game's edge font).
+
+The drawn pixels are script-observable (`getPixel`, `saveLayerImage`), so this
+is a divergence from the reference and not a rounding difference. It was found
+while measuring the extras route's text cost and was deliberately left alone:
+the fix changes the drawn pixels, and it belongs in its own reviewed stage
+rather than inside a performance change.
+
+The fix is to place the blurred mask at `glyph.x + blurred.x()` (and the same
+for the vertical offset) in the pre-rendered draw path.
+
+
+## 22. The transition has a second, inexact GPU description - CLOSED
+
+**Closed by the removal of the composited frame.** The engine has one
+description of a transition: the effect draw the projection renders, and the
+CPU blend `Trans::apply` for every kind that has no program.
+
+The removed path was `TransitionFrame`: two source-over draws whose weights
+are the phase, so it composed the two sources as `s2*t + s1*(1-t)`. It was
+inexact in two ways, and both are gone with it:
+
+* it could not express the reference's **coverage mix** — a destination with
+  a straight alpha is covered by the source with the share the two alphas
+  give it (`reference/cpp/core/visual/TransIntf.cpp:664-673`) — while the
+  frame mixed the four channels alike, so at a full-screen fade the two
+  differ by up to **five** 8-bit levels per channel;
+* it applied the layer's **opacity and blend mode per source**, where the
+  reference applies them to the blend result
+  (`reference/cpp/core/visual/TransIntf.cpp:592-600`).
+
+**The path was unreachable for the game's cross-fade and for every
+transition the tree can run.** The game's scene transition is a cross-fade —
+the game's own `transitions` table carries an empty `method`, which becomes a
+cross-fade — and on the Vulkan backend a cross-fade is one pass over the two
+endpoint textures (`crates/engine/src/trans/effect.rs`): the effect draw wins
+before any other description is consulted. On the null backend the flag that
+selected the frame was off, so the CPU blend ran. For the kinds whose effect
+draw is `None` (`universal`, `mask` and the seven `extrans` kinds) the frame
+was `None` too, so they took the CPU blend as well.
+
+**The one behaviour change in the tree** is the corner case of a non-null
+backend with no pipeline for the `CrossFade` program: it took the inexact
+frame, and it now takes the exact CPU blend.
+
+**Still open:** `universal` and `mask` can be a GPU pass (the reference has
+`UnivTransBlend`), and the endpoint composite belongs on the device (the
+reference composites into a device texture and reads the source from the
+source layer's cache). The seven `extrans` kinds stay on the CPU: the
+reference's core does not implement them either, they are the plugin's own
+providers. The programs that would replace the CPU blend are listed in §16.
+
+
+## 23. The class instances keep their script evaluator
+
+The compat's data containers - the fresh arrays and dictionaries - are built
+with the VM's own constructors, behind one helper
+(`crates/compat/src/natives/construct.rs`). The class instances are not, and
+they are not going to be: `new Date()`, `new GdiPlus.*`, `new Bitmap`,
+`new Rect`, `new MenuItem`, `new Motion.*` and the rest still reach the
+script evaluator, because the VM's ABI exposes no constructor for a
+registered class - only the compiler reaches one.
+
+That limit is deliberate. Exposing a class constructor would change the VM's
+API, and the API is where the mistakes would live: a constructor that does
+not run the class's initializer, or that runs it in a different order, or
+that lets a script observe a half-built object. The performance win does not
+justify that risk, so the work stays inside L2 and L3.
+

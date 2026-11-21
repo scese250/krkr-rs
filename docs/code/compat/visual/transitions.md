@@ -121,10 +121,10 @@ an unreadable member raises
 
 | `withchildren` | What is blended |
 |---|---|
-| `true` (the default) | the **whole layer tree**. Caching is enabled for both layers, and each frame blends the fully rendered **subtrees**: the source's content is published as the source's cache bitmap and a separate transition **frame** bitmap is the blend target. That frame is what the projection draws in place of the subtree while the transition runs. |
+| `true` (the default) | the **whole layer tree**. Caching is enabled for both layers, and the two fully rendered **subtrees** are the transition's sources: the source's content is published as the source's cache bitmap. Where the transition is blended on the CPU, a separate transition **frame** bitmap is the blend target, and the projection draws that frame in place of the subtree while the transition runs. Where the host draws the transition with its program, the two subtrees are sampled by the transition's passes instead. |
 | `false` | the two **main images**, blended into the destination's **self image**. The source is the destination's own main image plus the source layer's main image. The self image is what the projection draws where the main image would be, while the destination's children keep drawing live. Neither main image is ever written. |
 
-The teardown clears the self image and the recorded transition frame.
+The teardown clears the self image and the recorded effect draw.
 
 ### The blend the destination's type selects
 
@@ -142,20 +142,23 @@ vocabulary the engine's transition machine understands; the engine never sees
 the script's type numbering. The `universal` and `mask` kinds and the
 `extrans` providers keep the four-channel mix.
 
-### The composited form
+### The drawn form
 
-`Scene::composite_transition_frames` is the one host-selected field: it says
-whether the host draws the projected scene. When it is set, the two sources
-are **not** blended into a bitmap. `Trans::transition_frame` returns the
-frame for the two composition kinds (`crossfade` and `scroll`) — the two
-sources placed inside one rectangle, with the fade source carrying the phase
-weight — and the layer records it in `LayerState::transition_frame`. The
-projection then draws the frame's two sources in place of the layer's image or
-subtree, so a GPU host writes no pixels and uploads no bitmap per tick.
+`Trans::effect_draw` returns the draw for the two kinds that have a program
+(`crossfade` and `scroll`): the passes over the two endpoint textures, with
+the phase as the blend weight. The layer records the draw in
+`LayerState::effect` and the projection draws one node per pass in place of
+the layer's image or subtree, so a GPU host writes no pixels and uploads no
+bitmap per tick.
 
-Every other kind needs a per-pixel rule or a coordinate warp, so
-`transition_frame` returns nothing and the transition is blended with
-`Trans::apply` on every host — GPU included.
+`Scene::transition_effect_draw` hands the draw over only when the scene holds
+a pipeline for every program the draw names. A scene without one — the
+headless host, whose backend runs no effect pipelines — blends the transition
+on the CPU instead.
+
+Every other kind needs a per-pixel rule or a coordinate warp, so it has no
+program and the transition is blended with `Trans::apply` on every host —
+GPU included.
 
 The two **rendered** sources must have the same size in both forms; a mismatch
 is `TransError::SizeMismatch` — `"transition source size mismatch: {src1:?} vs
@@ -163,15 +166,14 @@ is `TransError::SizeMismatch` — `"transition source size mismatch: {src1:?} vs
 provider's own up-front size check, which compares the endpoints' declared
 sizes.
 
-A composited frame changes every tick, but only because its blend weights (or
-placements) change: the endpoint **subtrees** it samples do not. The frame
-update therefore marks **no** cache stale: the frame is a display of the
-layer's content, not the content itself, so the layer's composited subtree
-and every caching ancestor's stay reusable and a full-screen endpoint subtree
-is not recomposited on every transition tick. Clearing the frame does
-invalidate the layer itself, because it then returns to drawing its own
-subtree and any cache kept from before or during the transition is stale.
-The same rule applies to the custom-shader effect draw.
+A drawn transition changes every tick, but only because its blend weights (or
+placements) change: the endpoint **subtrees** it samples do not. The draw
+therefore marks **no** cache stale: the draw is a display of the layer's
+content, not the content itself, so the layer's composited subtree and every
+caching ancestor's stay reusable and a full-screen endpoint subtree is not
+recomposited on every transition tick. Clearing the draw does invalidate the
+layer itself, because it then returns to drawing its own subtree and any
+cache kept from before or during the transition is stale.
 
 The endpoints' composites are kept the same way: `Complete` returns the
 cached bitmap untouched while the cache region is empty
@@ -184,9 +186,9 @@ the cache on the two endpoints marks no cache stale either: the content
 behind the cache is the content the layer already had
 (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:3996-4006`).
 
-While a layer owns a frame or effect draw, the projection never draws that
-layer's own `cache_bitmap`: the draw replaces the image the cache holds.
-A frame that covers only the layer's own image does not hold its children, so
+While a layer owns an effect draw, the projection never draws that layer's
+own `cache_bitmap`: the draw replaces the image the cache holds.
+A draw that covers only the layer's own image does not hold its children, so
 they keep drawing live underneath it.
 
 The reference's layer exchange uses the swap form for a transition that ran
@@ -240,8 +242,8 @@ For each active transition:
    is the difference against the tick the transition started at — the form the
    reference computes its phase in, a tick difference rather than an
    accumulated frame delta.
-6. **Rendering**: the transition frame is written through the borrowed
-   machine.
+6. **Rendering**: the transition's blend target is written through the
+   borrowed machine.
 7. **Completion**: the transition is torn down.
 
 The teardown **removes the entry before the dispatch**, so a handler that
@@ -272,7 +274,7 @@ The per-frame step of `Layer.cached`:
   bitmap edit, no timer-driven composite and no revision bump means no cache
   can be stale.
 * The pass runs **after** the transition step (so a cache that contains a
-  transition sees the frame just blended) and **before** the engine uploads
+  transition sees the blend just written) and **before** the engine uploads
   and projects.
 * A layer that owns an active transition is skipped — it keeps its cache
   slots for the transition step.
@@ -314,7 +316,7 @@ This is what makes an `AffineLayer` render: its `onPaint` copies the hidden
 | the runtime state (`self_update`, the retained tick callback, `pending_ms`) | L3 `TransitionRuntimeState` |
 | the cache revisions | L3 `LayerExtras::cache_revisions` |
 | the cache slots and the consumer count | L2 `Scene` |
-| the recorded transition frame | L2 `Scene` (`LayerState::transition_frame`) |
+| the recorded effect draw | L2 `Scene` (`LayerState::effect`) |
 
 ---
 

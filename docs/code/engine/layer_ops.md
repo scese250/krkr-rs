@@ -142,7 +142,8 @@ the low byte is what the kernel produces.
 | `stretch_blit` / `stretch_blit_plane` | resample a source region into a destination rectangle |
 | `stretch_blit_mode` | resample and blend with an operation mode |
 | `operate_rect` | blend a source region onto the destination with a mode and opacity |
-| `fill_operate_rect` | fill a rectangle with a solid colour through a blend mode |
+| `fill_color_on_alpha` / `fill_color_on_add_alpha` / `fill_color_hold_alpha` | fill a rectangle with a solid colour through a blend mode |
+| `fill_mask` | fill a rectangle with a mask value |
 | `affine_blit` | map the source rect's LT/RT/LB corners and resample |
 | `affine_blit_clipped` | the same, with an explicit clip rectangle the pass writes inside |
 | `copy_9patch` | scale a bitmap with a 9-slice margin |
@@ -165,10 +166,10 @@ the low byte is what the kernel produces.
 | `ensure_transition_display(scene, root, w, h)` | allocate or reuse the whole-subtree transition frame |
 | `ensure_transition_self_image(scene, root, w, h)` | allocate or reuse the transition's self image |
 
-Neither slot is allocated for a transition a GPU backend composites: that host
-records the frame on the layer (`Scene::set_transition_frame`) and the
-projection draws the two sources, so nothing is written to a bitmap per tick
-(see [trans.md](trans.md) §6.1).
+Neither slot is allocated for a transition the host draws with its program:
+that host records the effect draw on the layer (`Scene::set_effect`) and the
+projection draws one node per pass, so nothing is written to a bitmap per tick
+(see [trans.md](trans.md) §6).
 
 ### The composited content's validity
 

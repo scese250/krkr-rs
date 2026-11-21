@@ -106,8 +106,6 @@ impl Trans {
     pub fn apply(&self, dst: &mut BitmapState, src1: &BitmapState, src2: &BitmapState,
                  region: RectI) -> Result<(), TransError>;
     pub fn full_region(bitmap: &BitmapState) -> RectI;
-    pub fn transition_frame(&self, src1: u32, src2: u32, size: (u32, u32),
-                            covers_layer: bool) -> Option<TransitionFrame>;
     pub fn effect_draw(&self, src1: u32, src2: u32, size: (u32, u32),
                        covers_layer: bool) -> Option<EffectDraw>;
 }
@@ -136,19 +134,16 @@ impl Trans {
 
 All of them are `ttExchange` (two sources).
 
-A kind is composited in one of three ways, and the host picks the first one
+A kind is composited in one of two ways, and the host picks the first one
 it can serve:
 
 * **A custom-shader draw** — `CrossFade` and `Scroll` have a program, so
   `Trans::effect_draw` builds the passes the projection draws with the
   backend's effect pipeline. No bitmap is written and none is uploaded.
-* **A composited frame** — `CrossFade` and `Scroll` are the two
-  **composition** kinds: their frame is the two sources placed in one
-  rectangle (a per-pixel fade of the second source, or two disjoint
-  placements), so a host that draws the projected scene never rasterizes it.
 * **A CPU blend** — `Universal`, `Mask` and the seven `extrans` kinds need a
-  per-pixel rule or coordinate warp, so they have no program and no frame;
-  `Trans::apply` blends them into the destination bitmap.
+  per-pixel rule or coordinate warp, so they have no program; every kind on
+  a backend that runs no effect pipeline is blended with `Trans::apply` into
+  the destination bitmap.
 
 ---
 
@@ -177,12 +172,6 @@ it can serve:
 * **A rule is required by `Universal` and `Mask`, and rejected by the other
   kinds** — a rule supplied to a kind that does not use one is an error, not
   a silently ignored argument.
-* **A composited frame is the same two sources the blend reads.**
-  `transition_frame` returns the frame for `CrossFade` and `Scroll` only, with
-  the endpoints as one source at full opacity (the reference's endpoint
-  short-circuit) and the fade source carrying `phase / 256` — the weight
-  `blend_level` applies. Every other kind returns `None`; a zero-sized frame
-  returns `None` too.
 * **The rule mask is tiled** over the source; `RuleMask::at` does the tiling.
 * **The mix follows the destination's alpha handling.**
   `Trans::dest_alpha` names the mix: a destination that ignores its alpha
@@ -215,45 +204,24 @@ Trans::new / Trans::with_rule ──► TransError on an invalid parameter
 Trans::step(dt_ms) ──► TransStep { progress, phase, completed }
    │
    ▼
-three hosts, one frame:
+two hosts, one frame:
    ├─ Trans::apply(dst, src1, src2, region)
    │     → the destination bitmap (VM pixels)
    │     → the layer's transition slot (cache_bitmap / transition_self)
    │     → the projection draws that slot in place of the layer's image/subtree
-   ├─ Trans::transition_frame(src1, src2, size, covers_layer)
-   │     → LayerState::transition_frame (a TransitionFrame)
-   │     → the projection draws the frame's two sources in its place
    └─ Trans::effect_draw(src1, src2, size, covers_layer)
          → LayerState::effect (an EffectDraw)
          → the projection draws one node per pass, in place of the layer's image
 ```
 
-The second form exists for a host that draws the projected scene: the frame is
-composited by the pipeline from the two source textures, so the transition
-writes no pixels and uploads no bitmap per tick. The headless CPU path keeps
-`Trans::apply` and the display bitmap. On either path the endpoint subtree
-content is recomposited only when a source actually changes; a new frame's
-blend weights or placements do not invalidate it.
-
-The third form is the same idea with a program instead of two fixed-function
-sources: the passes are the effect draw the projection renders in place of
-the layer's image, and the sources are the two transition bitmaps the passes
-sample. The draw is a value the layer tree holds, so the transition writes
-no pixels and uploads no bitmap per tick either.
-
-### 6.1 The composited frame's tolerance
-
-The composited frame draws source 1 and then source 2 over it at the phase
-weight, while `Trans::apply` writes the reference's per-channel lerp of the two
-straight-alpha sources. Where source 2 is opaque the two agree within one
-8-bit level per channel; where it carries alpha `a`, the frame's contribution
-fades by `phase × a` instead of `phase`, so a channel may differ by up to
-`255 × t × (1 − a)` (with `t = phase / 256`). A translucent *first* source is
-additionally composited over what lies beneath the layer, where the CPU blend
-writes straight-alpha pixels. The transition display is not a script-observable
-value (scripts read `MainImage`, never the blend result), so this is the D34
-tolerance for non-script-visible composition; `Scroll` has no blend and
-matches the CPU blit exactly.
+The second form is the one a host that draws the projected scene uses: the
+passes are the effect draw the projection renders in place of the layer's
+image, and the sources are the two transition bitmaps the passes sample. The
+draw is a value the layer tree holds, so the transition writes no pixels and
+uploads no bitmap per tick. The headless CPU path keeps `Trans::apply` and
+the display bitmap. On either path the endpoint subtree content is
+recomposited only when a source actually changes; the draw's blend weights or
+placements do not invalidate it.
 
 ---
 
@@ -285,9 +253,9 @@ typed error, and L3 turns it into the script error text.
   them is documented in [shader.md](shader.md).
 * **The custom-shader draw needs a backend that runs effect pipelines.** A
   backend that cannot build one (the headless backend) has no pipeline for
-  any program, so the transition takes the composited frame or the CPU
-  blend instead. The choice is the backend's and is made once, when the
-  engine installs the programs' pipelines.
+  any program, so the transition is blended on the CPU with `Trans::apply`
+  instead. The choice is the backend's and is made once, when the engine
+  installs the programs' pipelines.
 * **The non-self-updating transition pumps still run inside the L3 hook**,
   not inside L2. The self-updating ones advance from the frame hook's
   `after_project`, which sees the projection's draw report.
@@ -299,12 +267,6 @@ typed error, and L3 turns it into the script error text.
   lookup per pixel instead of two divisions. A source that does not cover
   the destination's columns falls back to the per-pixel read, which reads
   the missing columns as transparent.
-* **The composited frame does not honour the destination's alpha
-  handling.** The cross-fade's own program
-  (`crates/engine/shaders/crossfade.frag`) does: it takes the mix from the
-  uniform the transition's effect draw writes. The composited frame — the
-  fallback for a host that cannot run the program — draws the two sources
-  with the phase as their weights, so it mixes the four channels alike.
 * **The `extrans` providers keep the four-channel mix.** The reference's
   `wave` plugin picks its blend by the destination's type too, but it names
   the straight-alpha type alone, which the generic handling does not single
@@ -319,6 +281,13 @@ typed error, and L3 turns it into the script error text.
 * `crates/engine/tests/trans_blend.rs` — the blend the CPU path writes: the
   cross-fade and the rule blend against the per-channel arithmetic of the
   reference, and a timing measurement of the 1920x1080 cross-fade.
+* `crates/engine/tests/trans_effect.rs` — the draw the transition records:
+  the sources it binds, the weight it carries and the places it puts them.
+* `crates/engine/tests/transition_exact.rs` — the one description of a
+  transition: the pass over the two endpoints, the arithmetic of the CPU
+  blend, and the projection's use of the draw.
+* `crates/engine/tests/trans_effect_gpu.rs` — the drawn pixels against the
+  CPU blend and the CPU blit.
 * `crates/engine/tests/extrans_wave.rs`, `extrans_mosaic.rs`,
   `extrans_turn.rs`, `extrans_rotate.rs`, `extrans_ripple.rs` — one file per
   `extrans` provider.

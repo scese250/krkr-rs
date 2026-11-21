@@ -70,7 +70,7 @@ These are the crate root's re-exports, complete:
 | the mapping | `PixelTranslation`, `TranslateError` |
 | the lookup map | `Map` |
 | the archive naming rule | `normalize_in_archive_name` |
-| the scene | `Scene`, `LayerState`, `BitmapState`, `FontState`, `Rect`, `TransitionFrame`, `TransitionSource`, `DecodedImageKey`, `DecodedImageMode` |
+| the scene | `Scene`, `LayerState`, `BitmapState`, `FontState`, `Rect`, `DecodedImageKey`, `DecodedImageMode` |
 | the projection | `ComposedLayer`, `compose_layer`, `project_scene`, `project_window`, `project_window_report`, `resolve_blend` |
 | the storage namespace | `Storage`, `Location`, `StorageReadError` |
 | the startup discovery | `discover_startup`, `StartupError` |
@@ -253,7 +253,6 @@ values; the projection reads them back.
 | `layers: Vec<LayerState>` | one entry per layer, in creation order |
 | `bitmaps: Vec<BitmapState>` | one entry per bitmap, in creation order |
 | `fonts: Vec<FontState>` | one entry per font, in creation order |
-| `composite_transition_frames: bool` | the one host-selected field: whether a running transition draws from the layer's transition frame (the projection composites it) or is blended into the layer's display bitmap on the CPU |
 | `effect_pipelines: EffectPipelines` | the backend handles of the programs the layers' custom-shader draws name |
 
 The four vectors may be edited directly by a caller; the id lookups then
@@ -265,12 +264,10 @@ fall back to a linear scan and still return the correct result.
 |---|---|---|
 | `Scene` | `engine::Scene` | the whole tree, plus the decoded-image cache, the pending images, the id→index tables and the two revisions |
 | `WindowState` | `engine::scene::WindowState` | the window id and title, the client size, the visibility and the opacity, the primary layer, the focus domains and their focus, and the window's layer list |
-| `LayerState` | `engine::LayerState` | the id, the owning window, the parent, the focus domain, the children, the main image, the rect, the visibility, the opacity, the blend mode, the sibling sort key, the image placement, the province plane, the hit-test properties, the clip rect, the focus properties, the cache slots (`cache_bitmap`, `cache_content`, `transition_self`, `transition_frame`, `effect`, the cache counters), the font, the hint properties and the lifetime flags |
+| `LayerState` | `engine::LayerState` | the id, the owning window, the parent, the focus domain, the children, the main image, the rect, the visibility, the opacity, the blend mode, the sibling sort key, the image placement, the province plane, the hit-test properties, the clip rect, the focus properties, the cache slots (`cache_bitmap`, `cache_content`, `transition_self`, `effect`, the cache counters), the font, the hint properties and the lifetime flags |
 | `BitmapState` | `engine::BitmapState` | the id, the dimensions, the straight-alpha RGBA8 pixels, the storage name it was loaded from, the dirty flag and the dirty region, the script-ownership flag, the content-generation counter and the pending decode |
 | `FontState` | `engine::FontState` | the id, the requested face, the requested height, the colour and the style flags |
 | `Rect` | `engine::Rect` | a window-coordinate rectangle: `x`, `y`, `w`, `h` |
-| `TransitionFrame` | `engine::TransitionFrame` | the frame a composited transition draws on a layer: its pixel size, whether it covers the layer's whole rect, and its two sources |
-| `TransitionSource` | `engine::TransitionSource` | one source of a transition frame: the bitmap it samples, the sub-rectangle it reads, the rectangle it occupies in the frame and its opacity |
 | `DecodedImageKey` | `engine::DecodedImageKey` | the cache key of one decoded image: the normalized storage name, the colour-key index, the load variant and the desired size |
 | `DecodedImageMode` | `engine::DecodedImageMode` | the load variant: `Full` (a full-colour RGBA load) or `Province` (a province plane read from the decoded image's red channel) |
 
@@ -362,9 +359,10 @@ Two rules govern what is drawn:
   texture, is fully clipped away, or sits under a layer whose cache bitmap
   already contains its pixels. A skipped layer is absent from
   `drawn_layers`, which makes the skip visible rather than silent.
-* **A transition frame is two nodes of one layer.** The layer id is reported
-  once; the second source's node is the layer's nearest node for its
-  children.
+* **A transition draw is one node per pass of one layer.** The layer id is
+  reported once; the last pass's node is the layer's nearest node for its
+  children, and a whole-subtree draw covers the children exactly like a cache
+  bitmap.
 
 ### 4.3 What crosses into L1
 
@@ -465,14 +463,13 @@ duration_ms, rule)`, the named constructors `cross_fade`, `universal`,
 `elapsed_ms`, `progress`, `phase`, `phase_max`, `is_complete`,
 `rule`; the drivers `step(dt_ms)`, `seek_ms(elapsed_ms)`,
 `start_at(tick)`, `advance_to(tick)`, `complete()`, `reset()`; and the
-three rendering forms `apply(dst, src1, src2, region)`,
-`transition_frame(src1, src2, size, covers_layer)` and
+two rendering forms `apply(dst, src1, src2, region)` and
 `effect_draw(src1, src2, size, covers_layer)`.
 
-A kind is composited in one of three ways, and the host picks the first one
-it can serve: a **custom-shader draw** (`CrossFade` and `Scroll`), a
-**composited frame** (the same two kinds), or a **CPU blend**
-(`Universal`, `Mask` and the seven `extrans` kinds).
+A kind is composited in one of two ways, and the host picks the first one
+it can serve: a **custom-shader draw** (`CrossFade` and `Scroll`) or a
+**CPU blend** (`Universal`, `Mask` and the seven `extrans` kinds, and every
+kind on a backend that runs no effect pipeline).
 
 Invariants: the phase runs from 0 to `PHASE_MAX` (255) and is computed as
 `elapsed × phase_max / duration`, truncated and clamped; a completed
@@ -981,7 +978,7 @@ What crosses it:
 
 | group | items |
 |---|---|
-| `engine::scene` | `Scene`, `LayerState`, `BitmapState`, `FontState`, `Rect`, `TransitionFrame`, `DecodedImageKey`, `DecodedImageMode`, and the hit candidate `engine::scene::HitCandidate` |
+| `engine::scene` | `Scene`, `LayerState`, `BitmapState`, `FontState`, `Rect`, `DecodedImageKey`, `DecodedImageMode`, and the hit candidate `engine::scene::HitCandidate` |
 | `engine::imagedecode` | `DecodePool`, `PendingImage`, `DecodePass` |
 | `engine::storage` | `Storage`, `Location`, `StorageReadError`, `normalize_in_archive_name` |
 | `engine::input` | `InputState` |

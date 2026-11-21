@@ -1701,7 +1701,8 @@ the step after it: the source's cache read, the way the reference reads it.
 
 **Open:** the route has to reach the settings page before the scene change
 can be measured, and the measurement has to be repeated on the real scene
-before it means anything against the target.
+before it means anything against the target. **The route arrives now**
+(§13.1): the click is the one the game's own layout gives.
 
 ## 12. The motion player's draw list on the GPU: what the measurement says
 
@@ -1806,3 +1807,226 @@ together; and the pose's own non-source-over draw modes composite against a
 transparent surface instead of against the content, because the Photoshop modes
 are not associative. The reference's per-item leaf composition is the second
 behaviour, not ours.
+
+---
+
+## 13. The round of the routes
+
+**2026-11-21.** Release build, headless Vulkan, the real game. The load
+average is named with each measurement, and a measurement taken under a
+load above about four does not count.
+
+### 13.1 The routes arrive by a click
+
+The title page's buttons are read from the layout the game ships, and the
+click that presses one is delivered in the game's logical pixels. The
+layout's rows are the script's rows: the game's interface loader makes
+every entry relative to the layout's base and moves the layer the menu
+lives on to the base's row, so the settings button's row is the screen
+band 615 to 660 and the click lands at **(110, 640)** — on the button's own
+picture, inside the band.
+
+Before that the harness scaled the layout by 1.5 and pressed at (165, 960).
+The press hit no layer at all: the hit test walked the window's paint order
+and found no rectangle containing the point, so the press went to the
+window and the button never saw it. The point was 300 pixels below the
+button, and no backend and no dispatch budget were involved: the null
+backend failed in the same way with the same coordinates. **Every
+"title to settings" number measured before that was the text route's number
+under another name** (§11.8).
+
+The routes now arrive:
+
+| the route | the page it loads | the frame it loads it on |
+|---|---|---:|
+| the settings route | `option.ks` | 928 |
+| the extras route | `extra.ks` | 927 |
+
+The run prints the page it loaded and the frame it loaded it on:
+
+```
+the route: option.ks was loaded on frame 928
+```
+
+**The route is reached by a click and not by a direct page load.** There is
+no fallback that loads the page directly: the harness presses the button,
+and the page the run reports is the page the log recorded. The run proves
+the route it drove.
+
+### 13.2 The native census of the extras route
+
+The instrument is a **native census**: every native member's callback is
+wrapped where the member is registered — the registration path is the only
+place that knows the member's name — so the census times each member's own
+body and counts its calls. It is a temporary instrument and is not in the
+tree.
+
+The ledger of the extras route, before and after the two changes below:
+
+| the native | before | after |
+|---|---:|---:|
+| `Layer::loadImages` | 235.9 ms | **134.7 ms** |
+| `Layer::drawText` | 74.9 ms | 65.4 ms |
+| `TextRenderBase::getCharacters` | 58.8 ms | **11.7 ms** |
+| `Layer::operateRect` | 48.8 ms | 55.9 ms |
+| `Scripts::foreach` | 35.6 ms | 39.6 ms |
+| `Layer::assignImages` | 34.6 ms | 39.8 ms |
+| `CSVParser::parseStorage` | 25.3 ms | 18.4 ms |
+| `Layer::colorRect` | 21.4 ms | 23.4 ms |
+| **the sum of the rows** | **535 ms** | **389 ms** |
+
+The natives are named as the census names them — the member's class and
+the member. The call counts behind the table: `loadImages` 531,
+`getCharacters` 576, `drawText` 9 168, `operateRect` 559, `colorRect` 11.
+
+Two changes account for the win.
+
+* **The name resolution no longer re-reads the directory for every probe.**
+  A name that carries no extension is looked up as given and then under
+  each of the registered extensions, and the province name is looked up the
+  same way: 44 candidates for one image. Every candidate that reached the
+  disk branch read the directory again, so one image load cost **29 live
+  directory listings**. The storage owns one listing per directory now and
+  reads it again only when the directory's modification time moves, so the
+  29 listings became **one cached listing per directory**. The reference
+  keeps one table of each search folder's contents and a placed-path cache
+  in front of it, so a lookup there is a table hit.
+* **The compatibility layer's data objects are built with the VM's own
+  constructors.** Every array and dictionary it handed to a script was
+  built by evaluating a script literal (`[]`, `%[]`), and a named
+  expression is not cached, so every call compiled the literal afresh —
+  about 5.3 µs a container (§3.3). The literals are gone: the objects come
+  from the VM's own `new_array` and `new_dictionary`, which is what the
+  reference builds them with. That is where `getCharacters` (the message
+  window's characters) and `CSVParser` (the CSV's rows) lose their compile.
+
+Four of the eight rows measured slower in the after run —
+`Layer::operateRect`, `Layer::assignImages`, `Scripts::foreach` and
+`Layer::colorRect` — and the ledger names no cause for them.
+
+The census times a member's own body, so a member that calls another member
+is counted inside the caller's time as well: the rows overlap, and the
+**sum** is the census's own total for the route.
+
+### 13.3 The frame's worst frame is not an instrument
+
+The same tree, the extras transition, measured across three runs:
+
+| the run | the transition's worst frame |
+|---|---:|
+| 1 | 881 ms |
+| 2 | 577 ms |
+| 3 | 745 ms |
+
+The same work, three numbers, and a spread of more than 300 ms. **The
+frame's worst frame is not a usable instrument for this work**; the
+per-native census is, because it attributes the cost to the member that
+carries it (§13.2). The census's own overhead is **80 ns a call** — two
+clock reads and two locks — and it sits outside the member's measured
+time, so it inflates the frame and not the member.
+
+### 13.4 The scenario route after the round
+
+The scenario route — the text route, the one the run drives into the
+game's own scenario — release build, headless Vulkan, the real game:
+
+| | before | after |
+|---|---:|---:|
+| the worst frame | 173.2 ms | **127.0 ms** |
+| the 1% low | 32.3 ms | **30.2 ms (33.1 fps)** |
+
+### 13.5 The PSB container's load, split
+
+The instrumented load of the title's background container (`title_bg.psb`,
+13.8 MB), release build, headless Vulkan, the load average 1.14:
+
+| the stage | the cost |
+|---|---:|
+| the wait for the bytes | 47.2 ms |
+| the parse | 7.5 ms |
+| the TJS object tree | 9.8 ms |
+| the snapshot | 0.6 ms |
+| **the whole load** | **57.0 ms** |
+
+The wait for the bytes is the load's cost; the parse is a seventh of it.
+
+**The tree's cost follows the number of objects, not the size of the
+container.** A 103 KB container's tree costs 9.5 ms, and this one — 134
+times the size — costs 9.8 ms. The tree's cost was a compilation per
+object, and it is not one any more: the tree is built with the VM's own
+constructors (§13.2), the same change §3.4 measured on the scene load.
+
+---
+
+## 14. The pose, the save and the gate
+
+### 14.1 The pose on the CPU and on the GPU, one tree
+
+The clean comparison: the same tree, the same run shape, the CPU path and
+then the GPU path, release build, headless Vulkan, the real game. The load
+average was **2.04** before the CPU run and **1.72** before the GPU run.
+
+| | the CPU path | the GPU path |
+|---|---:|---:|
+| the engine's mean | 1.73 ms | **1.58 ms** |
+| the engine's p99 | 4.79 ms | **3.23 ms** |
+| the engine's 1% low | 26.73 ms | **23.51 ms** |
+| the engine's worst | 177.21 ms | **158.62 ms** |
+| the frame gap's 1% low | 36.63 ms | **33.87 ms** |
+| the frame gap's worst | 184.14 ms | **165.94 ms** |
+
+The GPU path is ahead on every line, and the win is **modest**, because the
+pose surface is copied into the tree texture every frame: the round trip is
+gone (§12.2), the copy is not.
+
+### 14.2 The deferred image save
+
+The save's encode and its write ran on the frame thread, and the title
+frame spent **96.5 ms** in one save. Both run on a worker of the engine's
+job pool now, and the frame does not wait for them.
+
+Three things keep the deferred write what the script sees:
+
+* **A reader waits for the write.** Every image read waits for the write of
+  the name it is about to read, so a script that saves a name and loads it
+  back sees the written file.
+* **Two writes of one name never race.** A second save of the same name
+  waits for the first write to land.
+* **The failures stay where the script can see them.** An unknown format
+  still fails **at the save**: the check needs no pixels, and the reference
+  raises it before it writes. A write that failed — a full disk, a bad path
+  — cannot raise from the deferred write, so it surfaces **at the next read
+  of that name**, and it is logged when it happens, so it is never
+  swallowed.
+
+### 14.3 The gate's own cost
+
+| the gate | the cost |
+|---|---:|
+| a warm gate | about 47 s |
+| a cold gate, after the debug target was deleted | about 80 min |
+
+**Never delete the whole target cache again.** The debug cache is what
+makes a cold rebuild cheap — the compatibility crate alone is over 100 000
+lines — and 80 minutes is what the rebuild cost.
+
+### 14.4 The corpus digest
+
+The corpus digest is the check that no script's compiled form moved: it
+compares every script of the corpus against the committed fixture, by the
+SHA-256 of its canonical compiled block. The corpus holds the shipped
+scripts and the generated ones (the scenarios the compatibility layer
+converts), so the digest is also the proof that the conversion is
+bit-identical.
+
+This round:
+
+| | |
+|---|---:|
+| the scripts | 279 |
+| the compared | 276 |
+| the skipped | 3 |
+| the digests that differ from the fixture's | **0** |
+
+The three skipped are the ones the front end cannot compile; the fixture
+lists them.
