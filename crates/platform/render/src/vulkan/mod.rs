@@ -369,6 +369,7 @@ impl VulkanPipeline {
                 surface_size,
                 frame_index: 0,
                 swapchain_ready: true,
+                held_image: HeldImage::default(),
                 swapchain_presented: false,
                 present_fault: None,
                 last_timings: None,
@@ -451,8 +452,13 @@ impl VulkanPipeline {
         // A surface event that repeats the extent the swapchain already has
         // cannot change the frame the display shows, so it does not rebuild
         // one. An unusable swapchain is always rebuilt, even for the same
-        // size, because the retry is what makes it usable again.
-        if presentation.swapchain_ready && (current.width, current.height) == size {
+        // size, because the retry is what makes it usable again: a swapchain
+        // the engine holds an image of is one image short, and the rebuild is
+        // what releases the image with it.
+        if presentation.swapchain_ready
+            && !presentation.holds_image()
+            && (current.width, current.height) == size
+        {
             presentation.surface_size = size;
             return Ok(SurfaceEvent::Resized(current.width, current.height));
         }
@@ -760,6 +766,7 @@ impl VulkanPipeline {
             if let Some(fault) = swapchain_fault(
                 presentation.swapchain_ready,
                 presentation.swapchain.images.len(),
+                presentation.holds_image(),
             ) {
                 // After a failed rebuild the fault stays `RebuildFailed` until a
                 // frame presents, so the retry loop logs each cause once.
@@ -781,6 +788,7 @@ impl VulkanPipeline {
                 if let Some(fault) = swapchain_fault(
                     presentation.swapchain_ready,
                     presentation.swapchain.images.len(),
+                    presentation.holds_image(),
                 ) {
                     // A rebuild that leaves the swapchain unusable is reported as
                     // out of date so the caller retries instead of treating this
@@ -840,7 +848,12 @@ impl VulkanPipeline {
             };
             let acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
             let (image_index, suboptimal) = match acquire_outcome(acquire_result) {
-                Ok(AcquireOutcome::Image { index, suboptimal }) => (index, suboptimal),
+                Ok(AcquireOutcome::Image { index, suboptimal }) => {
+                    // The image is out of the pool until the frame presents
+                    // it: the engine holds it from here on.
+                    presentation.held_image.acquired(index);
+                    (index, suboptimal)
+                }
                 Ok(AcquireOutcome::OutOfDate) => {
                     presentation.report_present_fault(PresentFault::AcquireOutOfDate);
                     let recreate_started = Instant::now();
@@ -1112,6 +1125,11 @@ impl VulkanPipeline {
                     );
                     return Err(RenderError::SurfaceOutOfDate);
                 }
+                // The frame failed between the acquire and the present, so its
+                // image was never returned to the pool: the engine holds it.
+                // The swapchain that owns it is one image short, so it is
+                // rebuilt before the next frame uses it, and the image goes
+                // with the old swapchain.
                 return Err(error);
             }
 
@@ -1138,6 +1156,10 @@ impl VulkanPipeline {
                 SwapchainRecovery::None => {}
                 SwapchainRecovery::RebuildSwapchain => needs_recreate = true,
                 SwapchainRecovery::RecreateSurface => {
+                    // The present did not take the image: it is still held,
+                    // and the surface it belongs to is lost. The recovery
+                    // destroys the swapchain that owns it, so the image goes
+                    // with it.
                     return Ok(Presentation {
                         presented: false,
                         surface_event: Some(SurfaceEvent::Lost),
@@ -1159,7 +1181,9 @@ impl VulkanPipeline {
                 });
                 // The frame was presented on the swapchain the recreate just
                 // replaced, so it is on screen until a frame of the replacement
-                // presents; it is retired, not destroyed.
+                // presents; it is retired, not destroyed. Its image is back in
+                // its pool, so the engine holds none.
+                presentation.held_image.released();
                 presentation.clear_present_fault();
                 return Ok(Presentation {
                     presented: true,
@@ -1175,6 +1199,8 @@ impl VulkanPipeline {
                 recreate_ms,
                 fence_wait_ms,
             });
+            // The image is back in the pool: the engine holds none.
+            presentation.held_image.released();
             presentation.clear_present_fault();
             presentation.swapchain_presented = true;
             presentation.dispose_retired_swapchain(&device);
@@ -1267,6 +1293,42 @@ pub(crate) struct VulkanFrame {
     pub(crate) in_flight: vk::Fence,
     /// Semaphore signalled when a swapchain image is acquired.
     pub(crate) image_available: vk::Semaphore,
+}
+
+/// The swapchain image the engine holds.
+///
+/// The image is acquired before the frame records and presented after it
+/// submits, so it is out of the pool while the frame draws. A frame that
+/// fails between the two never presents its image, and the image is not back
+/// in the pool: the swapchain that owns it is one image short, so it is
+/// rebuilt before the next frame uses it, and the image goes with it.
+///
+/// The tracker is the balance between the images the engine takes and the
+/// images it returns: at most one image is out of the pool at a time, and it
+/// is out of it only while one frame draws.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HeldImage {
+    /// The index of the swapchain image the engine holds, if it holds one.
+    index: Option<u32>,
+}
+
+impl HeldImage {
+    /// Records the image a frame acquired: it is out of the pool until the
+    /// frame presents it.
+    fn acquired(&mut self, index: u32) {
+        self.index = Some(index);
+    }
+
+    /// Records that the held image is back in the pool: the frame presented
+    /// it, or the swapchain that owned it went.
+    fn released(&mut self) {
+        self.index = None;
+    }
+
+    /// Whether the engine holds an image.
+    fn is_held(&self) -> bool {
+        self.index.is_some()
+    }
 }
 
 /// The frame slots' fences and whether their submissions may still be running.
@@ -1828,6 +1890,17 @@ pub(crate) struct VulkanPresentation {
     pub(crate) frame_index: u64,
     /// Whether the swapchain is usable.
     pub(crate) swapchain_ready: bool,
+    /// The swapchain image the engine holds, if it holds one.
+    ///
+    /// An image is acquired before the frame records and presented after it
+    /// submits, so it is out of the pool while the frame draws. A frame that
+    /// fails between the two never presents its image, and the image is not
+    /// back in the pool: the swapchain that owns it is one image short, so it
+    /// is rebuilt before the next frame uses it, and the image goes with it.
+    ///
+    /// The tracker is what says so: an image the engine holds and never
+    /// returns is a defect, and the swapchain's usability follows it.
+    held_image: HeldImage,
     /// Whether the current swapchain presented a frame.
     ///
     /// A swapchain that never presented has no image on screen, so a recreate
@@ -1886,6 +1959,15 @@ impl VulkanPresentation {
         // The render pass is shared with the swapchain that replaced this one
         // and is destroyed with the last swapchain that uses it.
         retired.destroy(device, &self.swapchain_loader);
+    }
+
+    /// Whether the engine holds a swapchain image it has not returned.
+    ///
+    /// A swapchain the engine holds an image of is one image short: the
+    /// image is not back in the pool, so the swapchain is rebuilt before it
+    /// is used again, and the image goes with the old one.
+    fn holds_image(&self) -> bool {
+        self.held_image.is_held()
     }
 
     /// Reports `fault` as a warning when it is not the fault already reported.
@@ -2242,6 +2324,8 @@ enum PresentFault {
     SwapchainNotReady,
     /// The swapchain reports no images to acquire.
     NoImages,
+    /// The engine holds a swapchain image and did not return it.
+    HeldImage,
     /// `acquire_next_image` reported the swapchain out of date.
     AcquireOutOfDate,
     /// Rebuilding the unusable swapchain failed.
@@ -2254,6 +2338,7 @@ impl PresentFault {
         match self {
             Self::SwapchainNotReady => "the swapchain is not ready",
             Self::NoImages => "the swapchain has no images",
+            Self::HeldImage => "the engine holds a swapchain image it did not return",
             Self::AcquireOutOfDate => "the swapchain was out of date at image acquire",
             Self::RebuildFailed => "rebuilding the swapchain failed",
         }
@@ -2296,8 +2381,15 @@ fn acquire_outcome(result: Result<(u32, bool), vk::Result>) -> Result<AcquireOut
 
 /// Returns the fault an unusable-swapchain state implies, or `None` when the
 /// swapchain can present.
-fn swapchain_fault(ready: bool, image_count: usize) -> Option<PresentFault> {
-    if !ready {
+///
+/// A swapchain the engine holds an image of is one image short, so it is the
+/// first fault: the image is not back in the pool, and the swapchain is
+/// rebuilt before the next frame uses it, which releases the image with the
+/// old one.
+fn swapchain_fault(ready: bool, image_count: usize, held: bool) -> Option<PresentFault> {
+    if held {
+        Some(PresentFault::HeldImage)
+    } else if !ready {
         Some(PresentFault::SwapchainNotReady)
     } else if image_count == 0 {
         Some(PresentFault::NoImages)
@@ -2357,6 +2449,10 @@ fn recreate_swapchain(
 
     match new_swapchain {
         Ok(new_swapchain) => {
+            // The old swapchain is gone, and the image the engine held
+            // belonged to it: the image goes with the old swapchain, so the
+            // engine holds none.
+            presentation.held_image.released();
             if presentation.swapchain_presented {
                 // The display may still be showing the last image the current
                 // swapchain presented, so it is retired and destroyed only
@@ -2469,6 +2565,10 @@ fn recreate_surface(
     let old_surface = std::mem::replace(&mut presentation.surface, new_surface);
     surface.surface = new_surface;
     let old_swapchain = std::mem::replace(&mut presentation.swapchain, new_swapchain);
+    // The old swapchain is destroyed with the surface, and the image the
+    // engine held belonged to it: the image goes with it, so the engine
+    // holds none.
+    presentation.held_image.released();
     old_swapchain.destroy(device, &presentation.swapchain_loader);
     presentation.swapchain_presented = false;
     // SAFETY: the old swapchain is gone and the device is idle.
@@ -2732,17 +2832,20 @@ fn upload_submit_count(state: &RenderState) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AcquireOutcome, FrameFences, PresentFault, SwapchainRecovery, acquire_outcome,
+        AcquireOutcome, FrameFences, HeldImage, PresentFault, SwapchainRecovery, acquire_outcome,
         present_recovery, swapchain_fault, upload_submit_count,
     };
-    use api::geometry::PixelRegion;
+    use api::geometry::{PixelRegion, RectF};
     use ash::vk;
     use ash::vk::Handle;
     use testkit::headless_window;
 
+    use crate::scene::{RenderContent, RenderNode, RenderScene};
     use crate::{
-        PipelineConfig, TextureDesc, TextureUpload, begin_render_state, create_render_pipeline,
-        create_texture, upload_textures,
+        PipelineConfig, RenderPipeline, TextureDesc, TextureFilter, TextureUpload,
+        begin_offscreen_render_state, begin_render_state, create_render_pipeline,
+        create_render_target, create_texture, read_render_target, render_to_target, upload_texture,
+        upload_textures,
     };
 
     /// The upload ring merges every texture of one `upload_textures` call into
@@ -2909,10 +3012,168 @@ mod tests {
     #[test]
     fn an_unusable_swapchain_names_the_fault_that_blocks_presentation() {
         assert_eq!(
-            swapchain_fault(false, 2),
+            swapchain_fault(false, 2, false),
             Some(PresentFault::SwapchainNotReady)
         );
-        assert_eq!(swapchain_fault(true, 0), Some(PresentFault::NoImages));
-        assert_eq!(swapchain_fault(true, 2), None);
+        assert_eq!(
+            swapchain_fault(true, 0, false),
+            Some(PresentFault::NoImages)
+        );
+        assert_eq!(swapchain_fault(true, 2, false), None);
+    }
+
+    /// The image the engine acquired is out of the pool until the frame
+    /// presents it, and a frame that fails between the two leaves it out of
+    /// the pool: the swapchain that owns it is one image short, so it is
+    /// rebuilt before the next frame uses it, and the image goes with it.
+    ///
+    /// The engine holds at most one image, and it holds it only while one
+    /// frame draws.
+    #[test]
+    fn the_acquired_image_is_held_until_it_is_presented_or_its_swapchain_goes() {
+        let mut held = HeldImage::default();
+        assert!(!held.is_held(), "no image is held before the first frame");
+
+        held.acquired(2);
+        assert!(
+            held.is_held(),
+            "the acquired image is out of the pool while the frame draws"
+        );
+
+        // The frame failed between the acquire and the present: the image was
+        // never returned to the pool, so the engine holds it.
+        assert!(
+            held.is_held(),
+            "a frame that failed before the present holds the image"
+        );
+        assert_eq!(
+            swapchain_fault(true, 3, held.is_held()),
+            Some(PresentFault::HeldImage),
+            "the swapchain is one image short, so it is rebuilt"
+        );
+
+        // The swapchain that owned the image goes: the image goes with it.
+        held.released();
+        assert!(
+            !held.is_held(),
+            "the image is released with the swapchain that owned it"
+        );
+        assert_eq!(
+            swapchain_fault(true, 3, held.is_held()),
+            None,
+            "the swapchain serves the next frame"
+        );
+    }
+
+    /// A frame the display could not give an image for holds nothing: the
+    /// acquire timed out, so no image was taken out of the pool, and the
+    /// swapchain is not rebuilt because the display is late, not out of date.
+    #[test]
+    fn a_skipped_frame_holds_no_image() {
+        assert_eq!(
+            acquire_outcome(Err(vk::Result::TIMEOUT)),
+            Ok(AcquireOutcome::TimedOut),
+            "the timeout is a skipped frame, not an image"
+        );
+        let held = HeldImage::default();
+        assert!(
+            !held.is_held(),
+            "a skipped frame holds no image: the acquire took none"
+        );
+        assert_eq!(
+            swapchain_fault(true, 3, held.is_held()),
+            None,
+            "the swapchain is not rebuilt for a frame that was skipped"
+        );
+    }
+
+    /// The pixels a magnified texture is read into, on one backend.
+    ///
+    /// The texture is two texels wide — black on the left, white on the
+    /// right — and the quad is four pixels wide, so the two texels are
+    /// magnified into four pixels.
+    fn magnified_pixels(pipeline: &RenderPipeline) -> Option<Vec<u8>> {
+        let mut state = begin_offscreen_render_state(pipeline).ok()?;
+        let target = create_render_target(pipeline, crate::RenderTargetDesc::new(4, 1)).ok()?;
+        let texture = create_texture(pipeline, TextureDesc::new(2, 1)).ok()?;
+        upload_texture(
+            pipeline,
+            &mut state,
+            &texture,
+            PixelRegion::new(0, 0, 2, 1),
+            &[0, 0, 0, 255, 255, 255, 255, 255],
+        )
+        .ok()?;
+        let mut scene = RenderScene::with_root_node();
+        let root = scene.root;
+        let child = scene.push(RenderNode {
+            parent: Some(root),
+            content: RenderContent::Texture(texture),
+            dst: RectF::new(0.0, 0.0, 4.0, 1.0),
+            src: PixelRegion::new(0, 0, 2, 1),
+            ..RenderNode::default()
+        });
+        if let Some(node) = scene.node_mut(root) {
+            node.children = vec![child];
+        }
+        render_to_target(pipeline, &mut state, &target, &scene).ok()?;
+        let mut pixels = vec![0u8; 4 * 4];
+        read_render_target(
+            pipeline,
+            &state,
+            &target,
+            PixelRegion::new(0, 0, 4, 1),
+            &mut pixels,
+        )
+        .ok()?;
+        Some(pixels)
+    }
+
+    /// The GPU and the CPU read a magnified texture the same way.
+    ///
+    /// The CPU rasterizer is the correctness baseline (`cpu.rs`), so the
+    /// GPU's picture is the one checked. The two agree everywhere but for the
+    /// rounding of the filter's weights: the GPU's filter weights are eight
+    /// bits, so a blended texel can be one level off the exact arithmetic.
+    /// That is the tolerance the motion draw list's GPU path uses as well.
+    ///
+    /// A host without a Vulkan device skips the comparison: the null backend
+    /// is the CPU path, and it is not what this test is about.
+    #[test]
+    fn the_gpu_and_the_cpu_read_a_magnified_texture_the_same_way() {
+        let cpu = create_render_pipeline(PipelineConfig {
+            filter: TextureFilter::Linear,
+            ..PipelineConfig::null()
+        })
+        .expect("null pipeline");
+        let Some(expected) = magnified_pixels(&cpu) else {
+            panic!("the null backend renders the picture");
+        };
+        let Ok(gpu) = create_render_pipeline(PipelineConfig {
+            filter: TextureFilter::Linear,
+            ..PipelineConfig::vulkan()
+        }) else {
+            eprintln!("the host has no Vulkan device: the GPU picture is not checked");
+            return;
+        };
+        let Some(actual) = magnified_pixels(&gpu) else {
+            eprintln!("the host has no Vulkan device: the GPU picture is not checked");
+            return;
+        };
+        for (index, (expected, actual)) in expected
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(actual.as_chunks::<4>().0.iter())
+            .enumerate()
+        {
+            for (channel, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+                assert!(
+                    expected.abs_diff(*actual) <= 2,
+                    "the two backends disagree on pixel {index} channel {channel}: \
+                     {expected} against {actual}"
+                );
+            }
+        }
     }
 }
