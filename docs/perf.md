@@ -2030,3 +2030,36 @@ This round:
 
 The three skipped are the ones the front end cannot compile; the fixture
 lists them.
+
+## 15. The rate the Vulkan backend can hold
+
+The frame gap is paced by the harness, so a frame gap measured at a 60 Hz
+pacing says what the pacing asked for, not what the engine cost. The
+engine's own cost is the engine's own work column.
+
+The real game's gameplay route, release, headless Vulkan:
+
+| the pacing | the frame gap's p50 | the p90 | the p99 | the 1% low | the worst |
+|---|---|---|---|---|---|
+| 120 Hz | 8.39 ms (119.2 fps) | 8.54 ms | **10.49 ms (95.3 fps)** | 23.94 ms (41.8 fps) | 136.17 ms |
+| 60 Hz | 16.75 ms | 17.74 ms | 18.14 ms (55.1 fps) | 32.68 ms (30.6 fps) | 199.23 ms |
+| none | 1.05 ms (948 fps) | 1.22 ms | **2.76 ms (362 fps)** | 19.32 ms (51.7 fps) | 128.58 ms |
+
+The engine's own work, unpaced: the mean 0.66 ms, the p50 0.68 ms, the
+p90 0.77 ms, the p99 2.17 ms (461 fps), the 1% low 19.04 ms.
+
+So the backend holds far more than 120 frames a second: unpaced, the p99
+is 362 fps and the 1% low is already at 51.7 fps. What does not yet hold
+is the 120 Hz deadline: at that pacing about one frame in a hundred
+overruns the 8.33 ms period.
+
+Those frames were measured with the slow-frame report at a 9 ms threshold:
+18 frames over 9 ms, and the phase that dominates them most often is the
+frame tail (11 of the 18, 308.8 ms in total), then the async phase (6,
+295.3 ms) and the pool the frame waits for (1, 170.2 ms).
+
+The frame tail is the compatibility layer's transition work: the CPU
+composite of the transition's endpoints. The reference composites them
+into a device texture and reads the source from the source layer's cache,
+so this is a shape difference and not a tuning one.
+
