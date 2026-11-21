@@ -159,6 +159,7 @@ fn the_headless_script_clock_tracks_the_wall_clock() {
         dump_frame: None,
         slow_report_budget: None,
         slow_frame_threshold_ms: None,
+        policy: app::RenderPolicy::default(),
         frame_report: true,
     })
     .expect("headless run");

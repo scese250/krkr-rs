@@ -113,6 +113,29 @@ impl BackendKind {
     }
 }
 
+/// The filter a sampler uses when it reads a texture.
+///
+/// The filter is a property of the pipeline: the samplers are device
+/// resources created with the device, so the mode is chosen when the
+/// pipeline is created and every draw the pipeline makes reads its textures
+/// the same way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TextureFilter {
+    /// The nearest source texel: the classic draw copies texel for texel.
+    ///
+    /// This is the mode the software renderer uses: it starts at the
+    /// nearest-neighbour stretch type and selects the point copy for anything
+    /// below the fast-linear threshold.
+    #[default]
+    Point,
+    /// The blend of the four texels around the sample point.
+    ///
+    /// This is the fast-linear mode the software renderer also has: it
+    /// exposes the mode as a render-manager parameter and does not default to
+    /// it.
+    Linear,
+}
+
 /// Immutable configuration for [`create_render_pipeline`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineConfig {
@@ -124,6 +147,11 @@ pub struct PipelineConfig {
     pub preferred_format: TextureFormat,
     /// Whether backend validation should be enabled.
     pub validation: bool,
+    /// The filter the samplers read textures with.
+    ///
+    /// The default is the point filter, which is the mode the software
+    /// renderer uses.
+    pub filter: TextureFilter,
     /// Frame period the caller paces its loop at.
     ///
     /// The presentation budget a frame may spend waiting for the display is
@@ -139,6 +167,7 @@ impl Default for PipelineConfig {
             application_name: "krkr-rs".to_owned(),
             preferred_format: TextureFormat::Rgba8Srgb,
             validation: false,
+            filter: TextureFilter::Point,
             frame_interval: Duration::from_secs_f64(
                 api::config::FrameRateLimit::DEFAULT.period_secs(),
             ),
@@ -222,10 +251,14 @@ enum PipelineKind {
 }
 
 impl RenderPipeline {
-    /// Creates a headless pipeline backed by [`NullRenderPipeline`].
+    /// Creates a headless pipeline with the default point sampling.
+    ///
+    /// The point filter is the mode the software renderer uses.
+    /// A caller that wants another mode builds the pipeline through
+    /// [`create_render_pipeline`] and its [`PipelineConfig::filter`].
     pub fn null() -> Self {
         Self {
-            kind: PipelineKind::Null(NullRenderPipeline::new()),
+            kind: PipelineKind::Null(NullRenderPipeline::new(TextureFilter::Point)),
         }
     }
 
@@ -293,7 +326,9 @@ pub fn create_render_pipeline(config: PipelineConfig) -> Result<RenderPipeline, 
     // error instead of a substituted acquire wait.
     let acquire_timeout = presentation_budget(config.frame_interval)?;
     match config.backend {
-        BackendKind::Null => Ok(RenderPipeline::null()),
+        BackendKind::Null => Ok(RenderPipeline {
+            kind: PipelineKind::Null(NullRenderPipeline::new(config.filter)),
+        }),
         BackendKind::Vulkan => {
             let backend = VulkanPipeline::new(&config, acquire_timeout)?;
             Ok(RenderPipeline {

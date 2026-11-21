@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use api::config::{CacheLimit, RuntimeConfig};
 use engine::FrameTimeSource;
+use engine::RenderPolicy;
 use media::Media;
 use platform::{
     EventHandler, Flow, FramePacing, PlatformConfig, PlatformError, PlatformEvent, PlatformWindow,
@@ -105,6 +106,11 @@ pub struct Launch {
     /// and the slowest frame, the percentiles and the 1% low. A run that
     /// does not report it measures no history at all.
     pub frame_report: bool,
+    /// The rendering policy: how the device draws the scene.
+    ///
+    /// The policy is the one switch the launcher turned. The default draws
+    /// the way the software renderer does: every texture is point-sampled.
+    pub policy: RenderPolicy,
 }
 
 /// What a completed [`run`] produced.
@@ -309,6 +315,7 @@ fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
         .with_backend(launch.backend)
         .with_debug_overlay(launch.runtime.debug_overlay)
         .with_graphic_cache_limit(launch.runtime.graphic_cache_limit)
+        .with_policy(launch.policy)
         // The dump reads the frame the CPU rasterizer composited, so the
         // host has to composite it.
         .with_cpu_presentation(launch.dump_frame.is_some());
@@ -593,6 +600,11 @@ struct DesktopApp {
     /// The handler records every gap the platform measured; the runner reads
     /// the history when the platform loop returns.
     frame_times: Option<Rc<RefCell<FrameTimes>>>,
+    /// The rendering policy: how the device draws the scene.
+    ///
+    /// The host is created with it, and the host's own copy of it is what
+    /// the startup record names.
+    policy: RenderPolicy,
     /// The image encoder the frame dump writes through.
     media: Media,
     /// Input and focus events received since the last frame, delivered to
@@ -741,6 +753,7 @@ impl DesktopApp {
             slow_report_budget: launch.slow_report_budget,
             slow_frame_threshold_ms: launch.slow_frame_threshold_ms,
             frame_times,
+            policy: launch.policy,
             media: Media::new(),
         }
     }
@@ -833,6 +846,7 @@ impl EventHandler for DesktopApp {
             debug_overlay: self.debug_overlay,
             graphic_cache_limit: self.graphic_cache_limit,
             frame_interval: self.frame_interval,
+            policy: self.policy,
             // The null backend composites the frame on the CPU, and the
             // window shows that frame; the dump reads the same frame.
             cpu_presentation: self.backend == BackendKind::Null || self.dump_frame.is_some(),
@@ -858,6 +872,9 @@ impl EventHandler for DesktopApp {
                 // is stepped with.
                 let source = source as *const (dyn FrameTimeSource + 'static);
                 let host = host.with_frame_time_source(source);
+                // The engine holds the policy the run draws with, and the
+                // startup record names it.
+                let native_resolution = host.policy() == RenderPolicy::NativeResolution;
                 // The window's size is the resolution the run was created at:
                 // the framebuffer follows the window in every mode, because
                 // the swapchain's extent is the window's extent.
@@ -1080,6 +1097,7 @@ mod tests {
             slow_report_budget: None,
             slow_frame_threshold_ms: None,
             frame_report: true,
+            policy: RenderPolicy::default(),
         })
         .expect("headless run");
         let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1123,6 +1141,7 @@ mod tests {
             slow_report_budget: None,
             slow_frame_threshold_ms: None,
             frame_report: true,
+            policy: RenderPolicy::default(),
         })
         .expect("headless run");
         let elapsed = started.elapsed();
@@ -1147,6 +1166,7 @@ mod tests {
             slow_report_budget: None,
             slow_frame_threshold_ms: None,
             frame_report: false,
+            policy: RenderPolicy::default(),
         }
     }
 

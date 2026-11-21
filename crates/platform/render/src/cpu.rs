@@ -22,6 +22,7 @@ use api::error::RenderError;
 use api::geometry::{Affine2, PixelRegion, RectF};
 
 use crate::MAX_TRAVERSAL_DEPTH;
+use crate::TextureFilter;
 use crate::blend::PhotoshopBlend;
 use crate::scene::{
     Clip, RenderContent, RenderNode, RenderNodeId, RenderScene, child_sort_key,
@@ -63,6 +64,10 @@ struct Vertex {
 /// target is cleared with `background` (defaulting to opaque black, matching
 /// the Vulkan clear value) before traversal.
 ///
+/// A scene that names the part of the target it writes clears that part
+/// alone and draws into it: the target keeps the content it holds outside
+/// it, the way the Vulkan backend's load operation keeps it.
+///
 /// # Errors
 ///
 /// Returns [`RenderError::Unsupported`] for a GPU-only feature the CPU path
@@ -75,6 +80,7 @@ pub(crate) fn render_scene<P: TextureProvider>(
     background: Option<[f32; 4]>,
     scene: &RenderScene,
     textures: &P,
+    filter: TextureFilter,
 ) -> Result<(), RenderError> {
     let expected = (width as usize) * (height as usize) * 4;
     if pixels.len() != expected {
@@ -93,8 +99,19 @@ pub(crate) fn render_scene<P: TextureProvider>(
         to_u8(clear[2]),
         to_u8(clear[3]),
     ];
-    for texel in pixels.as_chunks_mut::<4>().0 {
-        texel.copy_from_slice(&clear);
+    // The part of the target the scene writes: the whole target unless the
+    // scene names a part of it.
+    let whole = PixelRegion::new(0, 0, width, height);
+    let coverage = scene
+        .coverage
+        .and_then(|region| region.intersection(&whole))
+        .unwrap_or(whole);
+    for y in coverage.y..coverage.bottom() {
+        let row = (y as usize) * (width as usize) * 4;
+        for x in coverage.x..coverage.right() {
+            let offset = row + (x as usize) * 4;
+            pixels[offset..offset + 4].copy_from_slice(&clear);
+        }
     }
 
     if scene.is_empty() || scene.node(scene.root).is_none() {
@@ -106,9 +123,10 @@ pub(crate) fn render_scene<P: TextureProvider>(
         height,
         pixels,
         textures,
+        filter,
     };
-    let full = PixelRegion::new(0, 0, width, height);
-    canvas.visit(scene, scene.root, &Affine2::IDENTITY, 1.0, full, 0)
+    // The traversal is confined to the part of the target the scene writes.
+    canvas.visit(scene, scene.root, &Affine2::IDENTITY, 1.0, coverage, 0)
 }
 
 /// Mutable rasterization state.
@@ -117,6 +135,8 @@ struct Canvas<'a, P: TextureProvider> {
     height: u32,
     pixels: &'a mut [u8],
     textures: &'a P,
+    /// The filter every texture of this frame is read with.
+    filter: TextureFilter,
 }
 
 impl<P: TextureProvider> Canvas<'_, P> {
@@ -211,9 +231,11 @@ impl<P: TextureProvider> Canvas<'_, P> {
                 Ok(())
             }
             RenderContent::Texture(texture) => {
-                // Copy the provider handle out of `self` so the sampled view does
-                // not borrow `self` while the canvas is mutated.
+                // Copy the provider handle and the filter out of `self` so the
+                // sampled view does not borrow `self` while the canvas is
+                // mutated.
                 let textures = self.textures;
+                let filter = self.filter;
                 let Some(view) = textures.texture(texture.key()) else {
                     return Ok(());
                 };
@@ -236,7 +258,7 @@ impl<P: TextureProvider> Canvas<'_, P> {
                     node,
                     corners,
                     uv,
-                    |uv| sample_texture(&view, uv.0, uv.1, tint),
+                    |uv| sample_texture(&view, uv.0, uv.1, tint, filter),
                     opacity,
                     scissor,
                 );
@@ -541,35 +563,79 @@ fn screen_channel(d: f32, s: f32) -> f32 {
     (d + s - d * s).clamp(0.0, 1.0)
 }
 
-/// Samples a texture at texel coordinates `(u, v)` with point (nearest)
-/// filtering.
+/// Samples a texture at texel coordinates `(u, v)` with `filter`.
 ///
-/// This is the default layer blit sampling: the software renderer starts at
-/// the nearest-neighbour stretch type and selects the point copy for anything
-/// below the fast-linear threshold. The GPU backend uses the same rule, so a
-/// magnified layer is point-scaled rather than interpolated.
-fn sample_texture(view: &CpuTexture<'_>, u: f64, v: f64, tint: [f32; 4]) -> [f32; 4] {
-    let format = view.format;
+/// The point filter takes the nearest source texel: the software renderer
+/// starts at the nearest-neighbour stretch type and selects the point copy
+/// for anything below the fast-linear threshold. The GPU backend uses the
+/// same rule, so a magnified layer is point-scaled rather than interpolated.
+///
+/// The linear filter blends the four texels around the sample point. The
+/// texel centres sit at the half-integer coordinates, so the sample point is
+/// `u - 0.5` texels away from the first texel's centre — the convention the
+/// GPU's linear filter uses — and the texel indices are clamped to the
+/// texture, so the border repeats its edge texel.
+fn sample_texture(
+    view: &CpuTexture<'_>,
+    u: f64,
+    v: f64,
+    tint: [f32; 4],
+    filter: TextureFilter,
+) -> [f32; 4] {
+    let colour = match filter {
+        TextureFilter::Point => texel(view, u.floor() as i64, v.floor() as i64),
+        TextureFilter::Linear => {
+            let (x, y) = (u - 0.5, v - 0.5);
+            let (x0, y0) = (x.floor(), y.floor());
+            let (fx, fy) = (x - x0, y - y0);
+            let (ix0, ix1) = (x0 as i64, (x0 as i64).saturating_add(1));
+            let (iy0, iy1) = (y0 as i64, (y0 as i64).saturating_add(1));
+            let top = lerp4(texel(view, ix0, iy0), texel(view, ix1, iy0), fx);
+            let bottom = lerp4(texel(view, ix0, iy1), texel(view, ix1, iy1), fy);
+            lerp4(top, bottom, fy)
+        }
+    };
+    [
+        colour[0] * tint[0],
+        colour[1] * tint[1],
+        colour[2] * tint[2],
+        colour[3] * tint[3],
+    ]
+}
+
+/// The value of one texel, in the texture's own colour space.
+///
+/// An `R8` coverage texture carries its value in the alpha channel, the way
+/// the GPU's component swizzle maps it, so the tint carries the colour.
+fn texel(view: &CpuTexture<'_>, x: i64, y: i64) -> [f32; 4] {
     let width = view.width as i64;
     let height = view.height as i64;
-    let ix = (u.floor() as i64).clamp(0, width - 1) as usize;
-    let iy = (v.floor() as i64).clamp(0, height - 1) as usize;
-    let index = (iy * view.width as usize + ix) * format.bytes_per_pixel() as usize;
-    match format {
+    let ix = x.clamp(0, width - 1) as usize;
+    let iy = y.clamp(0, height - 1) as usize;
+    let index = (iy * view.width as usize + ix) * view.format.bytes_per_pixel() as usize;
+    match view.format {
         TextureFormat::Rgba8Srgb | TextureFormat::Rgba8Unorm => {
             let pixel = &view.pixels[index..index + 4];
             [
-                pixel[0] as f32 / 255.0 * tint[0],
-                pixel[1] as f32 / 255.0 * tint[1],
-                pixel[2] as f32 / 255.0 * tint[2],
-                pixel[3] as f32 / 255.0 * tint[3],
+                pixel[0] as f32 / 255.0,
+                pixel[1] as f32 / 255.0,
+                pixel[2] as f32 / 255.0,
+                pixel[3] as f32 / 255.0,
             ]
         }
-        TextureFormat::R8Unorm => {
-            let coverage = view.pixels[index] as f32 / 255.0;
-            [tint[0], tint[1], tint[2], coverage * tint[3]]
-        }
+        TextureFormat::R8Unorm => [1.0, 1.0, 1.0, view.pixels[index] as f32 / 255.0],
     }
+}
+
+/// The per-channel blend of two colours by `t`.
+fn lerp4(from: [f32; 4], to: [f32; 4], t: f64) -> [f32; 4] {
+    let t = t as f32;
+    [
+        from[0] + (to[0] - from[0]) * t,
+        from[1] + (to[1] - from[1]) * t,
+        from[2] + (to[2] - from[2]) * t,
+        from[3] + (to[3] - from[3]) * t,
+    ]
 }
 
 /// Returns the four unit-quad corners transformed into target pixels.
@@ -730,7 +796,16 @@ mod tests {
             dest[3] as f32 / 255.0,
         ];
         let mut pixels = [0u8; 4];
-        render_scene(1, 1, &mut pixels, Some(background), &scene, &NoTextures).expect("the frame");
+        render_scene(
+            1,
+            1,
+            &mut pixels,
+            Some(background),
+            &scene,
+            &NoTextures,
+            TextureFilter::Point,
+        )
+        .expect("the frame");
         pixels
     }
 
@@ -977,7 +1052,9 @@ mod tests {
             format: TextureFormat::Rgba8Unorm,
         };
         let opaque = [1.0f32; 4];
-        let sample = |u: f64, v: f64| sample_texture(&texture, u, v, opaque).map(to_u8);
+        let sample = |u: f64, v: f64| {
+            sample_texture(&texture, u, v, opaque, TextureFilter::Point).map(to_u8)
+        };
         // Anywhere inside a texel's cell returns that texel unchanged; a
         // bilinear read partway into a cell would return a blend of corners.
         assert_eq!(sample(0.25, 0.25), [0, 0, 0, 255]);
@@ -986,6 +1063,46 @@ mod tests {
         assert_eq!(sample(1.25, 1.25), [0, 0, 255, 255]);
         // A coordinate on a texel boundary belongs to the higher texel.
         assert_eq!(sample(1.0, 0.0), [255, 0, 0, 255]);
+    }
+
+    /// Reference: the fast-linear stretch type blends the texels around the
+    /// sample point; the sampler kinds are
+    /// `reference/krkr2/cpp/core/visual/LayerBitmapIntf.h:63-65` and the
+    /// render manager exposes the mode as a parameter
+    /// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:3012-3022`).
+    ///
+    /// The texel centres sit at the half-integer coordinates, so the sample
+    /// point is `u - 0.5` texels from the first texel's centre: the
+    /// convention the GPU's linear filter uses, and the reason the two
+    /// backends read the same picture.
+    #[test]
+    fn the_linear_filter_blends_the_texels_around_the_sample_point() {
+        // The same four corners: black, red / green, blue.
+        let pixels = [
+            0u8, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255,
+        ];
+        let texture = CpuTexture {
+            pixels: &pixels,
+            width: 2,
+            height: 2,
+            format: TextureFormat::Rgba8Unorm,
+        };
+        let opaque = [1.0f32; 4];
+        let sample = |u: f64, v: f64| {
+            sample_texture(&texture, u, v, opaque, TextureFilter::Linear).map(to_u8)
+        };
+        // A sample point on a texel centre returns that texel unchanged: the
+        // picture that is not magnified is the same picture.
+        assert_eq!(sample(0.5, 0.5), [0, 0, 0, 255]);
+        assert_eq!(sample(1.5, 0.5), [255, 0, 0, 255]);
+        assert_eq!(sample(0.5, 1.5), [0, 255, 0, 255]);
+        assert_eq!(sample(1.5, 1.5), [0, 0, 255, 255]);
+        // A quarter of the way between two centres the result is a quarter
+        // of the way between the colours: a ramp, not a block.
+        assert_eq!(sample(0.75, 0.5), [64, 0, 0, 255]);
+        assert_eq!(sample(1.25, 0.5), [191, 0, 0, 255]);
+        // Halfway between four centres the result is the average of the four.
+        assert_eq!(sample(1.0, 1.0), [64, 64, 64, 255]);
     }
 
     /// Reference: every Photoshop mode has its own per-channel function, and

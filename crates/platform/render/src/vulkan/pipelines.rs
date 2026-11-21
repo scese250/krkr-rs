@@ -24,6 +24,7 @@ use api::error::RenderError;
 use super::device;
 use super::shaders::{self, DESTINATION_DESCRIPTOR, SOURCE_DESCRIPTOR, TABLES_DESCRIPTOR};
 use super::texture::find_memory_type;
+use crate::TextureFilter;
 use crate::blend_shader::{PLAIN_COLOR_DODGE, PLAIN_DARKEN, PLAIN_LIGHTEN};
 
 /// Number of fixed-function blend variants compiled per program.
@@ -251,6 +252,7 @@ impl PipelineResources {
     pub(crate) fn create(
         device: &ash::Device,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        filter: TextureFilter,
     ) -> Result<Self, RenderError> {
         let descriptor_set_layout = create_descriptor_set_layout(device)?;
         let dst_descriptor_set_layout = match create_dst_descriptor_set_layout(device) {
@@ -316,7 +318,7 @@ impl PipelineResources {
                 return Err(error);
             }
         };
-        let sampler = match create_sampler(device) {
+        let sampler = match create_sampler(device, filter) {
             Ok(sampler) => sampler,
             Err(error) => {
                 // SAFETY: all three handles were created here and are unused.
@@ -971,20 +973,25 @@ fn create_descriptor_pool(device: &ash::Device) -> Result<vk::DescriptorPool, Re
     })
 }
 
-/// Creates a clamp-to-edge point sampler with no mip filtering.
+/// Creates a clamp-to-edge sampler with no mip filtering.
 ///
-/// The sampler takes the nearest source texel: the classic draw copies the
-/// source texel for texel, and the software rasterizer this backend is
+/// The point filter takes the nearest source texel: the classic draw copies
+/// the source texel for texel, and the software rasterizer this backend is
 /// checked against takes the nearest source texel as well, so a magnified or
 /// a minified layer is point-scaled on both.
 ///
-/// The destination-dependent program reads the destination through the same
-/// sampler, so its per-channel functions see the destination's own texels and
-/// not an interpolation of them.
-fn create_sampler(device: &ash::Device) -> Result<vk::Sampler, RenderError> {
+/// The linear filter blends the four texels around the sample point. The
+/// destination-dependent program reads the destination through the same
+/// sampler, so its per-channel functions see the destination's own texels
+/// and not an interpolation of them.
+fn create_sampler(device: &ash::Device, filter: TextureFilter) -> Result<vk::Sampler, RenderError> {
+    let mag_min = match filter {
+        TextureFilter::Point => vk::Filter::NEAREST,
+        TextureFilter::Linear => vk::Filter::LINEAR,
+    };
     let create_info = vk::SamplerCreateInfo::default()
-        .mag_filter(vk::Filter::NEAREST)
-        .min_filter(vk::Filter::NEAREST)
+        .mag_filter(mag_min)
+        .min_filter(mag_min)
         .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
         .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
         .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)

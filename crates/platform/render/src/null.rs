@@ -23,7 +23,7 @@ use crate::scene::{
 };
 use crate::state::{RenderState, StateKind, Surface, SurfaceKind};
 use crate::texture::{Texture, TextureDesc};
-use crate::{FrameTimings, MAX_TRAVERSAL_DEPTH};
+use crate::{FrameTimings, MAX_TRAVERSAL_DEPTH, TextureFilter};
 
 /// Maximum width/height the null backend accepts for a texture or a render
 /// target.
@@ -60,13 +60,19 @@ pub struct FrameStats {
 /// It is the test double for the Vulkan pipeline: presentation frames are
 /// accepted with CPU-side bookkeeping only, while offscreen render targets
 /// are composited by a real CPU software rasterizer.
+///
+/// The filter is the pipeline's configuration, exactly as the Vulkan
+/// sampler's mode is: the rasterizer reads every texture the same way.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct NullRenderPipeline;
+pub struct NullRenderPipeline {
+    /// The filter the software rasterizer reads textures with.
+    filter: TextureFilter,
+}
 
 impl NullRenderPipeline {
-    /// Creates a null render pipeline.
-    pub const fn new() -> Self {
-        Self
+    /// Creates a null render pipeline that reads textures with `filter`.
+    pub const fn new(filter: TextureFilter) -> Self {
+        Self { filter }
     }
 
     /// Reports that the headless backend runs no effect pipeline.
@@ -285,6 +291,7 @@ impl NullRenderPipeline {
             scene.background,
             scene,
             textures,
+            self.filter,
         )
     }
 
@@ -431,7 +438,7 @@ impl NullRenderPipeline {
         null.last_frame = Some(stats);
         null.last_timings = Some(FrameTimings::default());
         if let Some(slot) = &null.presented_slot {
-            composite_presented(slot, &null.textures, scene, null.surface_size)?;
+            composite_presented(slot, &null.textures, scene, null.surface_size, self.filter)?;
         }
         Ok(Presentation {
             presented: true,
@@ -716,6 +723,7 @@ fn composite_presented(
     textures: &Map<u64, NullImage>,
     scene: &RenderScene,
     size: (u32, u32),
+    filter: TextureFilter,
 ) -> Result<(), RenderError> {
     let (width, height) = size;
     if width == 0 || height == 0 {
@@ -750,6 +758,7 @@ fn composite_presented(
         scene.background,
         scene,
         textures,
+        filter,
     )
 }
 
@@ -873,7 +882,7 @@ mod tests {
     /// the texture cannot hold is left out.
     #[test]
     fn a_render_target_is_copied_into_a_texture() {
-        let pipeline = NullRenderPipeline::new();
+        let pipeline = NullRenderPipeline::new(TextureFilter::Point);
         let mut state = pipeline.begin_offscreen().expect("offscreen state");
         let target = pipeline
             .create_render_target(RenderTargetDesc::new(2, 2))
@@ -917,7 +926,7 @@ mod tests {
     /// A texture as large as the target holds the whole target.
     #[test]
     fn a_texture_as_large_as_the_target_holds_every_pixel() {
-        let pipeline = NullRenderPipeline::new();
+        let pipeline = NullRenderPipeline::new(TextureFilter::Point);
         let mut state = pipeline.begin_offscreen().expect("offscreen state");
         let target = pipeline
             .create_render_target(RenderTargetDesc::new(2, 2))
@@ -962,7 +971,7 @@ mod tests {
 
     #[test]
     fn the_headless_backend_counts_an_effect_draw() {
-        let pipeline = NullRenderPipeline::new();
+        let pipeline = NullRenderPipeline::new(TextureFilter::Point);
         let (surface, mut state) = pipeline.begin(&testkit::headless_window()).expect("begin");
         let stats = {
             pipeline
@@ -977,7 +986,7 @@ mod tests {
 
     #[test]
     fn the_cpu_rasterizer_refuses_an_effect_scene() {
-        let pipeline = NullRenderPipeline::new();
+        let pipeline = NullRenderPipeline::new(TextureFilter::Point);
         let (_surface, mut state) = pipeline.begin(&testkit::headless_window()).expect("begin");
         let target = pipeline
             .create_render_target(RenderTargetDesc::new(4, 4))
@@ -988,6 +997,74 @@ mod tests {
         assert!(
             matches!(error, RenderError::Unsupported { .. }),
             "unexpected error: {error}"
+        );
+    }
+
+    /// The red channel of every pixel of a black-and-white texture magnified
+    /// into four pixels.
+    ///
+    /// The texture is two texels wide — black on the left, white on the
+    /// right — and the quad is four pixels wide, so the two texels are
+    /// magnified into four pixels.
+    fn magnified_red_channel(filter: TextureFilter) -> Vec<u8> {
+        let pipeline = NullRenderPipeline::new(filter);
+        let mut state = pipeline.begin_offscreen().expect("offscreen state");
+        let target = pipeline
+            .create_render_target(RenderTargetDesc::new(4, 1))
+            .expect("target");
+        let texture = pipeline
+            .create_texture(TextureDesc::new(2, 1))
+            .expect("texture");
+        pipeline
+            .upload_texture(
+                &mut state,
+                &texture,
+                PixelRegion::new(0, 0, 2, 1),
+                &[0, 0, 0, 255, 255, 255, 255, 255],
+            )
+            .expect("upload");
+        let mut scene = RenderScene::with_root_node();
+        let root = scene.root;
+        let child = scene.push(RenderNode {
+            parent: Some(root),
+            content: RenderContent::Texture(texture),
+            dst: RectF::new(0.0, 0.0, 4.0, 1.0),
+            src: PixelRegion::new(0, 0, 2, 1),
+            ..RenderNode::default()
+        });
+        if let Some(node) = scene.node_mut(root) {
+            node.children = vec![child];
+        }
+        pipeline
+            .render_to_target(&mut state, &target, &scene)
+            .expect("render");
+        let mut pixels = vec![0u8; 4 * 4];
+        pipeline
+            .read_render_target(&state, &target, PixelRegion::new(0, 0, 4, 1), &mut pixels)
+            .expect("read");
+        pixels.chunks(4).map(|pixel| pixel[0]).collect()
+    }
+
+    /// The pipeline's filter reaches the rasterizer: the point filter
+    /// point-scales a magnified texture and the linear filter blends it.
+    ///
+    /// Reference: the reference's software renderer starts at the
+    /// nearest-neighbour stretch type and selects the point copy for anything
+    /// below the fast-linear threshold
+    /// (`reference/cpp/core/visual/RenderManager.cpp:2902`, `:3191-3226`); the
+    /// fast-linear mode is the reference's own alternative
+    /// (`reference/krkr2/cpp/core/visual/LayerBitmapIntf.h:63-65`).
+    #[test]
+    fn the_filter_reaches_the_rasterizer() {
+        assert_eq!(
+            magnified_red_channel(TextureFilter::Point),
+            vec![0, 0, 255, 255],
+            "the point filter copies the texel for texel"
+        );
+        assert_eq!(
+            magnified_red_channel(TextureFilter::Linear),
+            vec![0, 64, 191, 255],
+            "the linear filter blends the texels around the sample point"
         );
     }
 }

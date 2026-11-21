@@ -98,6 +98,12 @@ pub(crate) struct VulkanPipeline {
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Preferred swapchain format requested by the caller.
     preferred_format: TextureFormat,
+    /// The filter the samplers read textures with.
+    ///
+    /// The samplers are device resources created with the device, so the
+    /// mode is chosen when the pipeline is created and every draw the
+    /// pipeline makes reads its textures the same way.
+    filter: crate::TextureFilter,
     /// Nanoseconds a frame may wait for the display to release a swapchain
     /// image, derived from the configured frame period.
     acquire_timeout_ns: u64,
@@ -169,6 +175,7 @@ impl VulkanPipeline {
             max_texture_dimension: bundle.max_texture_dimension,
             memory_properties: bundle.memory_properties,
             preferred_format: config.preferred_format,
+            filter: config.filter,
             acquire_timeout_ns,
         })
     }
@@ -247,6 +254,7 @@ impl VulkanPipeline {
             self.physical_device,
             &self.memory_properties,
             device::PresentTarget::Surface(&surface_loader, surface),
+            self.filter,
         ) {
             Ok(device) => device,
             Err(error) => {
@@ -393,6 +401,7 @@ impl VulkanPipeline {
             self.physical_device,
             &self.memory_properties,
             device::PresentTarget::Offscreen,
+            self.filter,
         )?;
         Ok(RenderState {
             kind: StateKind::Vulkan(Box::new(VulkanState::Offscreen(Box::new(device)))),
@@ -1399,18 +1408,20 @@ impl VulkanDevice {
         physical_device: vk::PhysicalDevice,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
         target: device::PresentTarget<'_>,
+        filter: crate::TextureFilter,
     ) -> Result<Self, RenderError> {
         let bundle = device::create_device(&instance_guard.instance, physical_device, target)?;
         let device = bundle.device;
 
-        let resources = match pipelines::PipelineResources::create(&device, memory_properties) {
-            Ok(resources) => resources,
-            Err(error) => {
-                // SAFETY: the device was created here and nothing uses it.
-                unsafe { device.destroy_device(None) };
-                return Err(error);
-            }
-        };
+        let resources =
+            match pipelines::PipelineResources::create(&device, memory_properties, filter) {
+                Ok(resources) => resources,
+                Err(error) => {
+                    // SAFETY: the device was created here and nothing uses it.
+                    unsafe { device.destroy_device(None) };
+                    return Err(error);
+                }
+            };
         let upload = match texture::UploadRing::new(
             &device,
             bundle.queue_family_index,

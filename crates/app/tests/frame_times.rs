@@ -34,6 +34,7 @@ fn launch(frame_report: bool) -> Launch {
         dump_frame: None,
         slow_report_budget: None,
         slow_frame_threshold_ms: None,
+        policy: app::RenderPolicy::default(),
         frame_report,
     }
 }

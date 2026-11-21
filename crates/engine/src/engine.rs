@@ -41,6 +41,10 @@ use render::{
     UploadTimings, create_render_target, create_texture, destroy_render_target, drop_texture,
     last_frame_timings, last_upload_timings, read_render_target, recover_surface, render,
     render_to_target, resize as resize_render, supports_effect_pipelines, upload_textures,
+    RenderTarget, RenderTargetDesc, Surface, Texture, TextureDesc, TextureFilter, TextureUpload,
+    create_render_target, create_texture, destroy_render_target, drop_texture, last_frame_timings,
+    read_render_target, recover_surface, render, render_to_target, resize as resize_render,
+    supports_effect_pipelines, upload_textures,
 };
 
 use crate::clock::{FrameClock, FrameTimeSource, InjectedFrameTime};
@@ -53,6 +57,48 @@ use crate::shader::{PipelineId, Program, ProgramDesc, ShaderError, ShaderId, Sha
 use crate::storage::{StoragePoolConfig, StoragePoolError, StorageReadPool, StorageReader};
 use crate::timer::{TimerState, deliver_due};
 use crate::translate::{PixelTranslation, TranslateError};
+
+/// The engine's rendering policy.
+///
+/// The policy says how the device draws the scene. It is the one switch the
+/// composition root turns: the plain rendering, or the experimental
+/// native-resolution rendering.
+///
+/// The policy is a rendering choice and not a script-visible one: every value
+/// a script reads stays in VM pixels, and the logical screen does not move.
+/// What it changes is the picture the device draws.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RenderPolicy {
+    /// The plain rendering: every texture is point-sampled.
+    ///
+    /// The software renderer starts at the nearest-neighbour stretch type and
+    /// selects the point copy for anything below the fast-linear threshold,
+    /// so a magnified layer is point-scaled.
+    #[default]
+    Reference,
+    /// The experimental native-resolution rendering: every texture is read
+    /// with a bilinear filter.
+    ///
+    /// This is the fast-linear mode the software renderer also has: it
+    /// exposes the mode as a render-manager parameter and does not default to
+    /// it. The picture the device draws is smoother; the values a script
+    /// reads do not move.
+    NativeResolution,
+}
+
+impl RenderPolicy {
+    /// The filter the samplers read textures with.
+    ///
+    /// The samplers are device resources created with the device, so the
+    /// mode is chosen when the pipeline is created; the policy is what the
+    /// composition root derives it from.
+    pub fn texture_filter(self) -> TextureFilter {
+        match self {
+            Self::Reference => TextureFilter::Point,
+            Self::NativeResolution => TextureFilter::Linear,
+        }
+    }
+}
 
 /// Where the engine's frames are drawn.
 ///
@@ -559,6 +605,8 @@ pub struct Engine {
     /// The run of frames the display has not accepted, ended by the next
     /// presented frame.
     stall: PresentationStall,
+    /// The engine's rendering policy: how the device draws the scene.
+    policy: RenderPolicy,
 }
 
 /// The device the engine draws through.
@@ -775,6 +823,7 @@ impl Engine {
             pending_window_resize: None,
             presentation_skipped_logged: false,
             stall: PresentationStall::default(),
+            policy: RenderPolicy::default(),
         };
         // The surface is sized to the requested size; an offscreen target is
         // created at that size by the caller, so it is only checked.
@@ -815,6 +864,23 @@ impl Engine {
         // The first frame draws: the surface holds nothing yet.
         engine.scene.mark_dirty();
         Ok(engine)
+    }
+
+    /// Returns this engine with a different rendering policy.
+    ///
+    /// The policy is fixed here: the samplers that carry it are device
+    /// resources, created with the pipeline, so a policy that could change
+    /// later could disagree with the sampler the device actually uses. The
+    /// composition root builds the policy once, derives the sampler's filter
+    /// from it and hands the same value here.
+    pub fn with_policy(mut self, policy: RenderPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// The engine's rendering policy.
+    pub fn policy(&self) -> RenderPolicy {
+        self.policy
     }
 
     /// Creates the pipelines for the programs the engine ships.
@@ -2138,12 +2204,19 @@ mod tests {
         Engine, EngineParts, FrameTarget, GameFrame, PresentFault, PresentationStall, Scene,
         StallAge, StallCause, StallSummary, add_upload_timings, clear_uploaded_dirty,
         describe_stall_causes, present_outcome, reported_surface_size,
+        Engine, EngineParts, FrameTarget, GameFrame, PixelTranslation, PresentFault,
+        PresentationStall, RenderPolicy, Scene, StallAge, StallCause, StallSummary,
+        add_upload_timings, clear_uploaded_dirty, describe_stall_causes, present_outcome,
+        reported_surface_size,
     };
+    use crate::hasher::{Map, map};
     use api::geometry::PixelRegion;
     use api::host::{PresentSkip, Presentation, SurfaceEvent};
     use render::{
         NullRenderPipeline, PipelineConfig, UploadTimings, begin_render_state,
         create_render_pipeline,
+        NullRenderPipeline, PipelineConfig, RenderContent, RenderNode, RenderPipeline, Texture,
+        TextureDesc, UploadTimings, begin_render_state, create_render_pipeline, create_texture,
     };
     use testkit::headless_window;
 
@@ -2172,17 +2245,233 @@ mod tests {
         .expect("engine")
     }
 
+    /// Builds a headless engine over the null backend, with the sampler's
+    /// filter derived from `policy`.
+    ///
+    /// The filter is the one thing the policy reaches: the samplers are
+    /// device resources created with the pipeline, so the composition root
+    /// derives the filter from the policy and hands the same value to the
+    /// engine.
+    fn headless_engine_with_policy(size: (u32, u32), policy: RenderPolicy) -> Engine {
+        let pipeline = create_render_pipeline(PipelineConfig {
+            filter: policy.texture_filter(),
+            ..PipelineConfig::null()
+        })
+        .expect("null pipeline");
+        let handle = headless_window();
+        let (surface, render_state) = begin_render_state(&pipeline, &handle).expect("surface");
+        Engine::new(EngineParts {
+            pipeline,
+            target: FrameTarget::Surface(surface),
+            render_state,
+            surface_size: size,
+            headless: true,
+            overlay: None,
+        })
+        .expect("engine")
+        .with_policy(policy)
+    }
+
+    /// The projected tree, the translation and the uploaded textures of an
+    /// engine with `policy`, after one frame.
+    ///
+    /// The window is half the size of the framebuffer, so the Fit mapping
+    /// scales by two and the root transform is not the identity.
+    fn projected_tree(
+        policy: RenderPolicy,
+    ) -> (Vec<RenderNode>, Option<PixelTranslation>, Map<u32, Texture>) {
+        let mut engine = headless_engine_with_policy((64, 64), policy);
+        let mut hooks = NoFrame;
+        let window = engine.scene_mut().add_window("w", (32, 32));
+        let layer = engine.scene_mut().add_layer(window, None);
+        let bitmap = engine.scene_mut().add_bitmap(8, 8, vec![0u8; 8 * 8 * 4]);
+        let state = engine.scene_mut().layer_mut(layer).expect("layer");
+        state.rect = crate::Rect::new(0, 0, 8, 8);
+        state.visible = true;
+        state.bitmap = Some(bitmap);
+        state.image_width = 8;
+        state.image_height = 8;
+        engine.frame(0, &mut hooks).expect("frame");
+        (
+            engine.render_scene().nodes.clone(),
+            engine.translation(),
+            engine.textures().clone(),
+        )
+    }
+
+    /// The picture a texture handle names.
+    ///
+    /// The handle names a device allocation, so two engines that draw the
+    /// same picture hold two handles and a handle is never equal to another
+    /// one. The picture is the bitmap the handle holds — the engine's table
+    /// says which — together with the descriptor the sampler reads, so two
+    /// handles name the same picture when they hold the same bitmap with the
+    /// same descriptor.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    struct Picture {
+        /// The bitmap the engine's table holds the handle for, when it holds
+        /// one.
+        bitmap: Option<u32>,
+        /// The descriptor the sampler reads.
+        desc: TextureDesc,
+    }
+
+    /// The tree's nodes with their texture handles replaced by canonical
+    /// ones.
+    ///
+    /// Every handle is replaced by the one canonical handle for its picture,
+    /// so two trees that draw the same pictures compare equal and two trees
+    /// that draw different ones do not. Every other field of the node is
+    /// compared as it is.
+    fn canonical_picture(
+        nodes: &[RenderNode],
+        sources: &Map<u32, Texture>,
+        handles: &mut Map<Picture, Texture>,
+        pipeline: &RenderPipeline,
+    ) -> Vec<RenderNode> {
+        nodes
+            .iter()
+            .map(|node| {
+                let mut node = node.clone();
+                if let RenderContent::Texture(texture) = &node.content {
+                    node.content = RenderContent::Texture(canonical_handle(
+                        handles,
+                        pipeline,
+                        picture_of(texture, sources),
+                    ));
+                }
+                node
+            })
+            .collect()
+    }
+
+    /// The picture a handle names.
+    fn picture_of(texture: &Texture, sources: &Map<u32, Texture>) -> Picture {
+        let bitmap = sources
+            .iter()
+            .find(|(_bitmap, held)| **held == *texture)
+            .map(|(bitmap, _held)| *bitmap);
+        Picture {
+            bitmap,
+            desc: *texture.desc(),
+        }
+    }
+
+    /// The canonical handle for one picture.
+    ///
+    /// The handle is created once per picture and shared by every tree the
+    /// comparison reads, so the same picture names the same handle and a
+    /// different picture names a different one.
+    fn canonical_handle(
+        handles: &mut Map<Picture, Texture>,
+        pipeline: &RenderPipeline,
+        picture: Picture,
+    ) -> Texture {
+        if let Some(texture) = handles.get(&picture) {
+            return texture.clone();
+        }
+        let texture = create_texture(pipeline, picture.desc).expect("the canonical texture");
+        handles.insert(picture, texture.clone());
+        texture
+    }
+
+    /// The rendering policy does not move the picture the engine projects.
+    ///
+    /// The policy is a rendering choice and not a script-visible one: the
+    /// projected tree — its nodes, their `dst` and `src`, their transform,
+    /// their affine, their blend, their opacity, their colour, their `z`,
+    /// their children and their order, and the root's Fit transform — and
+    /// the translation are the same with the policy on and off. The policy's
+    /// only reach is the sampler's filter, which the composition root
+    /// derives from it when it creates the pipeline.
+    ///
+    /// The one field that may differ is the texture handle the node draws:
+    /// a handle names a device allocation, so the two engines hold two
+    /// handles for the same picture and a handle is never equal to another
+    /// one. The comparison replaces every handle with the canonical handle
+    /// for the picture it names, so the picture is compared and the
+    /// allocation is not.
+    #[test]
+    fn the_policy_does_not_move_the_projected_tree() {
+        assert_ne!(
+            RenderPolicy::Reference.texture_filter(),
+            RenderPolicy::NativeResolution.texture_filter(),
+            "the two policies sample the textures differently"
+        );
+        let (reference_nodes, reference_translation, reference_sources) =
+            projected_tree(RenderPolicy::Reference);
+        let (native_nodes, native_translation, native_sources) =
+            projected_tree(RenderPolicy::NativeResolution);
+        assert!(
+            !reference_nodes.is_empty(),
+            "the window's layer is projected into a node"
+        );
+        // The two engines uploaded the same pictures: the tables agree,
+        // bitmap by bitmap.
+        for (bitmap, texture) in &reference_sources {
+            let native = native_sources
+                .get(bitmap)
+                .expect("both engines uploaded the same bitmap");
+            assert_eq!(
+                texture.desc(),
+                native.desc(),
+                "the bitmap {bitmap} is the same picture in both engines"
+            );
+        }
+        let pipeline = create_render_pipeline(PipelineConfig::null()).expect("canonical pipeline");
+        let mut handles: Map<Picture, Texture> = map();
+        let reference_picture = canonical_picture(
+            &reference_nodes,
+            &reference_sources,
+            &mut handles,
+            &pipeline,
+        );
+        let native_picture =
+            canonical_picture(&native_nodes, &native_sources, &mut handles, &pipeline);
+        assert_eq!(
+            reference_picture, native_picture,
+            "the projected tree is the same picture"
+        );
+        assert_eq!(
+            reference_translation, native_translation,
+            "the translation is the same mapping"
+        );
+    }
+
+    /// The engine holds the policy it was built with, so the composition root
+    /// can report what the run draws with.
+    #[test]
+    fn the_engine_holds_its_rendering_policy() {
+        let engine = headless_engine((64, 64));
+        assert_eq!(engine.policy(), RenderPolicy::Reference);
+        let engine = engine.with_policy(RenderPolicy::NativeResolution);
+        assert_eq!(engine.policy(), RenderPolicy::NativeResolution);
+    }
+
     /// A bitmap that changed in a rectangle uploads that rectangle alone.
+    ///
+    /// The bitmap is the one a layer shows: the copies the device holds
+    /// follow the layers, so the bitmap of a layer is the one that is
+    /// uploaded.
     #[test]
     fn a_dirty_region_uploads_only_its_own_pixels() {
         let mut engine = headless_engine((64, 64));
         let mut hooks = NoFrame;
         let id = engine.scene_mut().add_bitmap(8, 8, vec![0u8; 8 * 8 * 4]);
+        {
+            let scene = engine.scene_mut();
+            let window = scene.add_window("test", (64, 64));
+            let layer = scene.add_layer(window, None);
+            let state = scene.layer_mut(layer).expect("the layer");
+            state.visible = true;
+            state.rect = Rect::new(0, 0, 8, 8);
+            state.bitmap = Some(id);
+        }
 
         // The first frame creates the texture, so it takes every pixel.
         engine.frame(0, &mut hooks).expect("first frame");
         let texture = engine.textures().get(&id).expect("texture").clone();
-        let uploaded = NullRenderPipeline::texture_uploaded_bytes(&engine.render_state, &texture)
+        let uploaded = NullRenderPipeline::texture_uploaded_bytes(&engine.device.state, &texture)
             .expect("uploaded bytes");
         assert_eq!(uploaded, 8 * 8 * 4, "a new texture takes every pixel");
 

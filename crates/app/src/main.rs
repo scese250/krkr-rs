@@ -1,7 +1,7 @@
 //! `krkr` CLI: headless frame runner and windowed desktop frontend.
 //!
 //! ```text
-//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--preload-archives] [--graphic-cache-limit LIMIT] [--slow-report-ms N] [--no-frame-report] [--vm-report] [--archive XP3 ...] [--base-dir DIR] [GAME]
+//! krkr [--headless] [--frames N] [--fps N] [--backend null|vulkan] [--preload-archives] [--graphic-cache-limit LIMIT] [--resolution WxH] [--fullscreen] [--slow-report-ms N] [--no-frame-report] [--vm-report] [--native-resolution] [--archive XP3 ...] [--base-dir DIR] [GAME]
 //! ```
 //!
 //! * `--headless` runs an empty scene for `N` frames (default 120) through
@@ -70,6 +70,12 @@
 //!   number of compiles, the size of the scripts they read, and the time the
 //!   compiler's phases took. The measurement is off by default, because a
 //!   clock read per token costs tens of milliseconds.
+//! * `--native-resolution` reads every texture with a bilinear filter instead
+//!   of point-sampling it, so a magnified picture is smooth instead of
+//!   blocky. It is an experimental rendering choice and not a scaling mode:
+//!   the Fit-with-letterbox presentation, the logical screen the script sees
+//!   and every value a script reads stay exactly as they are. It is off by
+//!   default.
 //! * Configuration is resolved **by this launcher** and handed to
 //!   [`app::run`] as an already-loaded value: the `key=value` file named by
 //!   the `KRKR_CONFIG` environment variable supplies overrides, the launch
@@ -89,6 +95,7 @@ use api::config::{
     CacheLimit, ConfigError, FrameRateLimit, RuntimeConfig, RuntimeConfigOverrides, parse_overrides,
 };
 use app::{BackendKind, GameInput, Launch, Resolution, RunMode};
+use engine::RenderPolicy;
 
 /// One documented launch option.
 struct OptionDoc {
@@ -176,6 +183,11 @@ const OPTIONS: &[OptionDoc] = &[
         help: "Measure the VM's script compilation and print its analysis at the end of the run.",
     },
     OptionDoc {
+        flag: "--native-resolution",
+        value: "",
+        help: "Read every texture with a bilinear filter instead of point-sampling it (experimental; off by default).",
+    },
+    OptionDoc {
         flag: "--archive",
         value: "XP3",
         help: "Mount an XP3 archive (repeatable, later wins); with none, every *.xp3 under the base directory mounts.",
@@ -248,6 +260,8 @@ struct Cli {
     frame_report: bool,
     /// Whether `--vm-report` was given.
     vm_report: bool,
+    /// Whether `--native-resolution` was given.
+    native_resolution: bool,
     /// Explicit `--archive` list, in mount order (later wins).
     archives: Vec<PathBuf>,
     /// App path override (`--base-dir`); defaults to the current directory.
@@ -312,6 +326,7 @@ impl Cli {
             slow_frame_ms: None,
             frame_report: true,
             vm_report: false,
+            native_resolution: false,
             archives: Vec::new(),
             base_dir: None,
             positional: None,
@@ -388,6 +403,7 @@ impl Cli {
                     })?);
                 }
                 "--vm-report" => cli.vm_report = true,
+                "--native-resolution" => cli.native_resolution = true,
                 "--no-frame-report" => cli.frame_report = false,
                 "--archive" => {
                     let value = args
@@ -473,6 +489,18 @@ fn check_dump_backend(cli: &Cli) -> Result<(), String> {
 /// unbounded. A budget of zero reports no slow frame at all.
 fn slow_report_budget(cli: &Cli) -> Option<Duration> {
     cli.slow_report_ms.map(Duration::from_millis)
+}
+
+/// The rendering policy the command line asks for.
+///
+/// The flag is a flag and not a value: it turns the experimental rendering on
+/// and nothing else. The default draws the way the software renderer does.
+fn render_policy(cli: &Cli) -> RenderPolicy {
+    if cli.native_resolution {
+        RenderPolicy::NativeResolution
+    } else {
+        RenderPolicy::Reference
+    }
 }
 
 /// Environment variable naming the desktop configuration file.
@@ -598,6 +626,7 @@ fn main() -> ExitCode {
     if cli.vm_report {
         compat::set_compile_stats_enabled(true);
     }
+    let policy = render_policy(&cli);
     let launch = Launch {
         runtime,
         backend: cli.backend,
@@ -612,6 +641,7 @@ fn main() -> ExitCode {
         slow_report_budget,
         slow_frame_threshold_ms: cli.slow_frame_ms.map(|ms| ms as f64),
         frame_report: cli.frame_report,
+        policy,
     };
 
     let outcome = app::run(launch);
@@ -1079,6 +1109,44 @@ mod tests {
     #[test]
     fn parse_rejects_unknown_flag() {
         assert!(parse(&["--nope"]).is_err());
+    }
+
+    /// The native-resolution flag is a flag with no value: it turns the
+    /// experimental rendering on, and the default is the reference's own
+    /// rendering.
+    #[test]
+    fn the_native_resolution_flag_turns_the_experimental_rendering_on() {
+        let cli = parse(&["--headless"]).expect("parse");
+        assert!(
+            !cli.native_resolution,
+            "the default is the reference's rendering"
+        );
+        assert_eq!(render_policy(&cli), RenderPolicy::Reference);
+
+        let cli = parse(&["--headless", "--native-resolution"]).expect("parse");
+        assert!(cli.native_resolution, "the flag turns the rendering on");
+        assert_eq!(render_policy(&cli), RenderPolicy::NativeResolution);
+    }
+
+    /// The flag names the experimental rendering in the help, so a run that
+    /// asks for it says what it changed.
+    #[test]
+    fn the_help_names_the_native_resolution_flag() {
+        let text = usage();
+        assert!(text.contains("--native-resolution"), "{text}");
+        assert!(text.contains("experimental"), "{text}");
+    }
+
+    /// The flag is a launch argument and not a configuration key: the file
+    /// cannot set it, and an attempt is an unknown key.
+    #[test]
+    fn the_configuration_file_cannot_set_the_native_resolution() {
+        let path = temp_config("native_resolution=true\n");
+        let error = load_config_file(&path)
+            .expect_err("the file cannot set the flag")
+            .to_string();
+        assert!(error.contains("native_resolution"), "{error}");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

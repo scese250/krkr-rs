@@ -57,7 +57,7 @@ pub(crate) use audio::install_audio_decoder_metered;
 // measures the elapsed time between frames and the source reports the real
 // clock that measurement comes from, so the script's tick count moves inside a
 // frame.
-pub use engine::{FrameTimeSource, InjectedFrameTime};
+pub use engine::{FrameTimeSource, InjectedFrameTime, RenderPolicy};
 
 /// The windowed loop's clock source.
 ///
@@ -211,6 +211,13 @@ pub struct HostConfig {
     /// file can hold it. The compositing costs a full-frame rasterization,
     /// so it is off by default.
     pub cpu_presentation: bool,
+    /// The rendering policy: how the device draws the scene.
+    ///
+    /// The policy is the one switch the launcher turns. The default draws the
+    /// way the software renderer does: every texture is point-sampled. The
+    /// policy is a rendering choice and not a script-visible one: the
+    /// logical screen and every value a script reads stay where they are.
+    pub policy: RenderPolicy,
 }
 
 impl Default for HostConfig {
@@ -227,6 +234,7 @@ impl Default for HostConfig {
             graphic_cache_limit: None,
             frame_interval: Duration::from_secs_f64(FrameRateLimit::DEFAULT.period_secs()),
             cpu_presentation: false,
+            policy: RenderPolicy::default(),
         }
     }
 }
@@ -273,6 +281,12 @@ impl HostConfig {
     /// Returns this configuration with the CPU presentation on or off.
     pub fn with_cpu_presentation(mut self, enabled: bool) -> Self {
         self.cpu_presentation = enabled;
+        self
+    }
+
+    /// Returns this configuration with a different rendering policy.
+    pub fn with_policy(mut self, policy: RenderPolicy) -> Self {
+        self.policy = policy;
         self
     }
 }
@@ -331,11 +345,16 @@ impl Host {
     /// [`RenderError::DeviceUnavailable`] when the Vulkan loader, instance or
     /// device cannot be brought up.
     pub fn new(config: HostConfig) -> Result<Self, HostError> {
+        // The policy is the one switch the launcher turned: the samplers are
+        // created with the pipeline, so the filter is derived from it here,
+        // and the same value is handed to the engine.
+        let policy = config.policy;
         let pipeline = create_render_pipeline(PipelineConfig {
             backend: config.backend,
             application_name: config.application_name,
             preferred_format: TextureFormat::Rgba8Srgb,
             validation: config.validation,
+            filter: policy.texture_filter(),
             frame_interval: config.frame_interval,
         })?;
 
@@ -391,7 +410,8 @@ impl Host {
             surface_size: config.surface_size,
             headless: config.headless,
             overlay: overlay.map(|overlay| Box::new(overlay) as Box<dyn engine::EngineOverlay>),
-        })?;
+        })?
+        .with_policy(policy);
         if let Some(limit) = config.graphic_cache_limit {
             engine.scene_mut().set_decoded_image_cache_limit(limit);
         }
@@ -497,6 +517,11 @@ impl Host {
     /// Returns the backend the pipeline was created with.
     pub fn backend(&self) -> BackendKind {
         self.engine.backend()
+    }
+
+    /// The host's rendering policy.
+    pub fn policy(&self) -> RenderPolicy {
+        self.engine.policy()
     }
 
     /// Returns the layer tree.
