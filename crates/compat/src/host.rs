@@ -94,16 +94,38 @@ impl CompatHost {
     /// instead of fabricating a result.
     ///
     /// The three closures are owned by the host's dispatch state and live as
-    /// long as the host does; they are called from the VM's single thread.
+    /// long as the host does. The decode and the probe are called from the
+    /// VM's single thread; the **save is called from a worker thread** - the
+    /// compatibility layer submits the write to the engine's job pool, so
+    /// the frame thread does not encode the image and does not write the
+    /// file. The save closure is therefore `Send + Sync`.
     pub fn set_image_codec(
         &self,
         decode: impl Fn(&[u8], Option<&str>) -> Result<api::media::DecodedImage, String> + 'static,
         probe: impl Fn(&[u8], Option<&str>) -> Result<api::media::ImageInfo, String> + 'static,
-        save: impl Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String> + 'static,
+        save: impl Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String> + Send + Sync + 'static,
     ) {
         self.services()
             .state::<crate::resource::ResourceResolver>()
             .set_codec(decode, probe, save);
+    }
+
+    /// Install the host's check of a save type.
+    ///
+    /// The check runs on the thread that asks for the write, because it does
+    /// not need the pixels: the handler that accepts the mode is found before
+    /// the image is written, so an unknown format is raised at the save.
+    ///
+    /// A host that installed no check has no format table to consult: the
+    /// write then runs, and a format the host cannot encode is reported by
+    /// the write itself, at the next read of the written name.
+    pub fn set_image_save_type_check(
+        &self,
+        check: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        self.services()
+            .state::<crate::resource::ResourceResolver>()
+            .set_save_type_check(check);
     }
 
     /// Install the host decoder that reads an image's 8-bit index plane.

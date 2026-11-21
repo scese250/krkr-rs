@@ -89,6 +89,7 @@ pub fn probe_image(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<ImageI
 pub fn decode_image(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<DecodedImage, MediaError>;
 pub fn decode_index_plane(m: &Media, bytes: &[u8], hint: Option<&str>) -> Result<DecodedImage, MediaError>;
 pub fn encode_image(m: &Media, width: u32, height: u32, rgba: &[u8], hint: &str) -> Result<Vec<u8>, MediaError>;
+pub fn check_encode_hint(hint: &str) -> Result<(), MediaError>;
 ```
 
 The decode order is the reference router's:
@@ -110,6 +111,13 @@ reference's `TVPSaveTextureAsBMP` layout: a 14-byte file header, a 40-byte
 info header, an optional 1024-byte palette for 8 bpp, then the bottom-up
 scanlines with their 4-byte pitch padding. PNG and JPEG delegate to the
 `image` crate.
+
+`check_encode_hint` answers the same question **without the pixels**: does
+the encoder write this format? The handler that accepts the mode is found
+before the image is written, so an unknown format is rejected at the save and
+not at a later read of the written name. It accepts the same formats as
+`encode_image` and reports the same message for the same hint —
+`"no image encoder for format {hint:?}"` — as `MediaError::Unsupported`.
 
 Supported decode formats are the `image` crate's enabled feature list: png,
 jpeg, webp, bmp, gif, tiff, tga, dds, pnm, ico, qoi, hdr, exr, ff — plus
@@ -356,7 +364,9 @@ Every failure is a typed `MediaError` (the variants are listed in
 | the codec is not in this build | `MediaError::Unsupported` |
 | the bytes are garbage | `MediaError::Decode` — never a panic, never silence |
 | the stream ended | `MediaError::EndOfStream` |
-| an unknown encode target | `MediaError::Unsupported`; a wrong buffer length | `MediaError::InvalidData`; a codec failure | `MediaError::Encode` |
+| an unknown encode target | `MediaError::Unsupported` |
+| the encoded buffer does not hold the image's pixels | `MediaError::InvalidData` |
+| the codec itself fails | `MediaError::Encode`, naming the format |
 | the MediaCodec decoder cannot be created, configured or started | `MediaError::Unsupported`, with the mime and the reason logged |
 
 There is **no size cap**: a decode that cannot be performed (malformed,

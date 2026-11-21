@@ -13,6 +13,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
+use std::sync::Arc;
 
 use crate::engine_api::layer_ops::{self, GammaAdjust, RectI};
 use crate::engine_api::{BitmapState, DecodedImageKey, DecodedImageMode, DestAlpha, Scene};
@@ -28,7 +29,7 @@ use super::super::bitmap::{
 use super::super::common::scene_mut;
 use super::super::common::{
     DEFAULT_FONT_FACE, DEFAULT_FONT_HEIGHT, actual_color_bytes, argb_to_rgba, bound,
-    rgba_to_pixel_word, scene_ref, swap_red_blue,
+    decode_pool_mut, rgba_to_pixel_word, scene_ref, swap_red_blue,
 };
 use super::LayerInst;
 use super::util::{
@@ -2536,7 +2537,7 @@ fn load_auto_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(), 
         return Ok(());
     };
     // SAFETY: `attach_storage` guarantees the pointer stays valid.
-    let Some(province_name) = resolve_province_image(unsafe { &*storage }, name)? else {
+    let Some(province_name) = resolve_province_image(ctx, unsafe { &*storage }, name)? else {
         return Ok(());
     };
     load_layer_province(ctx, layer_id, &province_name)
@@ -2855,8 +2856,11 @@ extern "C" fn layer_save_layer_image(
         // file.
         let (width, height, rgba) =
             super::resolved_bitmap_pixels(scene, bitmap_id, "Layer.saveLayerImage")?;
+        // The write is submitted to the job pool: the frame thread does not
+        // encode the image and does not write the file.
+        let pool = decode_pool_mut(&ctx);
         resource_state(&ctx)
-            .save_image(&name, &type_name, width, height, &rgba)
+            .submit_save(pool, &name, &type_name, width, height, Arc::new(rgba))
             .map_err(|error| format!("Layer.saveLayerImage: {error}"))
     })();
     match result {

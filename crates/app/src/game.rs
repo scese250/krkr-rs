@@ -869,6 +869,20 @@ fn translate_event(translation: Option<PixelTranslation>, event: &PlatformEvent)
     }
 }
 
+impl Drop for GameHost {
+    fn drop(&mut self) {
+        // The image write of a name is deferred, so a run that ends while a
+        // write is in flight would leave the file unwritten, where the file
+        // is written before the save returns. The write is waited for here.
+        let Ok(ctx) = self.vm.compat().ctx() else {
+            return;
+        };
+        if let Err(error) = compat::flush_pending_writes(&ctx) {
+            log::warn!("app.frame: an image write did not land: {error}");
+        }
+    }
+}
+
 impl GameHost {
     /// Mounts `archives` in order (later archives win), binds the VM to the
     /// engine's scene and timer, to the L2 input state and to the storage,

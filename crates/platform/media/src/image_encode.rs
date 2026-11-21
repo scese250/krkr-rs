@@ -400,6 +400,26 @@ pub fn encode_image(
     }
 }
 
+/// Checks that `hint` names a format the encoder can write.
+///
+/// The check does not need the pixels: the handler that accepts the mode is
+/// found before the image is written, so an unknown format is raised at the
+/// save and not at a later read of the written name.
+///
+/// # Errors
+///
+/// [`MediaError::Unsupported`] when the hint names no format the encoder
+/// writes. The message is the one [`encode_image`] reports for the same
+/// hint.
+pub fn check_encode_hint(hint: &str) -> Result<(), MediaError> {
+    match target_for_encode_hint(hint) {
+        Some(_) => Ok(()),
+        None => Err(MediaError::Unsupported {
+            message: format!("no image encoder for format {hint:?}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BmpMode, EncodeTarget, encode_image, target_for_encode_hint};

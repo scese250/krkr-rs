@@ -26,7 +26,7 @@ use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::storages::extract_storage_ext;
 use crate::natives::system::value_as_i64;
-use crate::resource::ResourceResolver;
+use crate::resource::{ResourceResolver, await_pending_write};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -151,10 +151,11 @@ impl From<String> for ImageLoadError {
 /// request that carries none is read as given first and then under each
 /// registered extension.
 pub(crate) fn read_image_from_storage(
+    ctx: &CompatCtx,
     storage: &Storage,
     name: &str,
 ) -> Result<(String, Vec<u8>), ImageLoadError> {
-    let resolved = resolve_image(storage, name)?;
+    let resolved = resolve_image(ctx, storage, name)?;
     let resolved_name = resolved.name().to_string();
     let bytes = resolved.bytes(storage)?;
     Ok((resolved_name, bytes))
@@ -224,10 +225,14 @@ impl ResolvedImage {
 /// provider. A candidate that does not resolve costs a lookup and no read at
 /// all.
 pub(crate) fn resolve_image(
+    ctx: &CompatCtx,
     storage: &Storage,
     name: &str,
 ) -> Result<ResolvedImage, ImageLoadError> {
     for candidate in image_candidates(name) {
+        // A write of this name may still be in flight: the reader waits for
+        // it, so the file is in place when the name is resolved.
+        await_pending_write(ctx, &candidate).map_err(ImageLoadError::Message)?;
         match storage.resolve_entry(&candidate)? {
             Some(StorageEntry::File {
                 name: entry_name,
@@ -293,11 +298,12 @@ fn province_image_name(name: &str) -> String {
 /// name is: it carries an extension of its own, so it is looked up under that
 /// name alone. A storage without that image has no province image.
 pub(crate) fn resolve_province_image(
+    ctx: &CompatCtx,
     storage: &Storage,
     name: &str,
 ) -> Result<Option<String>, ImageLoadError> {
     let province_name = province_image_name(name);
-    match resolve_image(storage, &province_name) {
+    match resolve_image(ctx, storage, &province_name) {
         Ok(resolved) => Ok(Some(resolved.name().to_string())),
         // The storage holds no province image for this graphic.
         Err(ImageLoadError::Storage(StorageReadError::NotFound(_))) => Ok(None),
@@ -485,7 +491,7 @@ pub(crate) fn decode_storage_image_uncached(
         .ok_or_else(|| "no storage attached".to_string())?;
     let started = Instant::now();
     // SAFETY: `attach_storage` guarantees the pointer stays valid.
-    let (resolved, bytes) = read_image_from_storage(unsafe { &*storage }, name)?;
+    let (resolved, bytes) = read_image_from_storage(ctx, unsafe { &*storage }, name)?;
     let read_ms = started.elapsed().as_secs_f64() * 1000.0;
     let decode_started = Instant::now();
     let image = match mode {
@@ -807,7 +813,7 @@ pub(crate) fn resolve_pending_load(
         .ok_or_else(|| "no storage attached".to_string())?;
     let started = Instant::now();
     // SAFETY: `attach_storage` guarantees the pointer stays valid.
-    let entry = resolve_image(unsafe { &*storage }, name)?;
+    let entry = resolve_image(ctx, unsafe { &*storage }, name)?;
     Ok(Some(PendingLoad::Entry {
         name: name.to_string(),
         entry,
@@ -1600,7 +1606,7 @@ extern "C" fn bitmap_save(
     };
     // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `bitmap_save`.
     let services = unsafe { ctx.services() };
-    let resolver = services.state::<ResourceResolver>();
+    let mut resolver = services.state::<ResourceResolver>();
     let scene = match scene_mut(&ctx) {
         Ok(scene) => scene,
         Err(error) => return report_error(out_error, &format!("Bitmap.save: {error}")),
@@ -1610,7 +1616,7 @@ extern "C" fn bitmap_save(
     let Some(bitmap) = scene.bitmap(id) else {
         return report_error(out_error, "Bitmap.save: this bitmap no longer exists");
     };
-    let (width, height, rgba) = (bitmap.width, bitmap.height, bitmap.rgba.clone());
+    let (width, height, rgba) = (bitmap.width, bitmap.height, Arc::new(bitmap.rgba.clone()));
     // A bitmap that declares its size and holds no pixels has nothing to
     // encode: handing the encoder an empty buffer would write a truncated
     // image.
@@ -1620,7 +1626,10 @@ extern "C" fn bitmap_save(
             "Bitmap.save: this image does not hold its pixels",
         );
     }
-    match resolver.save_image(&name, &type_name, width, height, &rgba) {
+    // The write is submitted to the job pool: the frame thread does not
+    // encode the image and does not write the file.
+    let pool = decode_pool_mut(&ctx);
+    match resolver.submit_save(pool, &name, &type_name, width, height, rgba) {
         Ok(()) => {
             set_void(out);
             0
@@ -1790,7 +1799,7 @@ extern "C" fn bitmap_load_header(
         return report_error(out_error, "Bitmap.loadHeader: no storage attached");
     };
     // SAFETY: `storage` is the attached L2 storage the host keeps alive for the VM lifetime.
-    let (resolved_name, bytes) = match read_image_from_storage(unsafe { &*storage }, &name) {
+    let (resolved_name, bytes) = match read_image_from_storage(&ctx, unsafe { &*storage }, &name) {
         Ok(found) => found,
         Err(error) => {
             return report_error(out_error, &error.message_with("Bitmap.loadHeader: "));

@@ -72,6 +72,7 @@ pub use ctx::{CompatCtx, CompatServices};
 pub use event::{EventAdapter, EventValue, TjsEvent};
 pub use frame::{FrameBody, run_frame_body};
 pub use host::CompatHost;
+pub use resource::flush_pending_writes;
 // The built-in `Timer` delivery for a host or a test that advances the
 // attached registry itself. The frame body's own drain of the `onTimer` posts
 // is crate-internal: the frame body runs it, no host calls it.

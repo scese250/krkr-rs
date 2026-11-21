@@ -316,7 +316,7 @@ impl Env {
         &self,
         decode: impl Fn(&[u8], Option<&str>) -> Result<DecodedImage, String> + 'static,
         probe: impl Fn(&[u8], Option<&str>) -> Result<ImageInfo, String> + 'static,
-        save: impl Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String> + 'static,
+        save: impl Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String> + Send + Sync + 'static,
     ) {
         self._host.set_image_codec(decode, probe, save);
     }

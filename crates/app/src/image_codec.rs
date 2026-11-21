@@ -29,7 +29,9 @@ use engine::Storage;
 use engine::imagedecode::{ImageDecodeError, ImageDecoder};
 use engine::storage::local_name_in;
 use fs::FileSystem;
-use media::{Media, decode_image, decode_index_plane, encode_image, probe_image};
+use media::{
+    Media, check_encode_hint, decode_image, decode_index_plane, encode_image, probe_image,
+};
 
 use crate::startup::StartupStats;
 
@@ -115,6 +117,12 @@ fn install_image_codec_on_metered(
             write_storage_file(&fs, &base, name, &bytes)
         },
     );
+    // The save type is checked on the thread that asks for the write: the
+    // handler that accepts the mode is found before the image is written, so
+    // an unknown format is raised at the save.
+    host.set_image_save_type_check(|type_name| {
+        check_encode_hint(type_name).map_err(|error| error.to_string())
+    });
     // The province plane is the image's own 8-bit sample, so it is decoded
     // apart from the colour image.
     host.set_index_plane_decoder(index_plane_decoder());

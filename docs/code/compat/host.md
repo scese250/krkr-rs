@@ -89,12 +89,18 @@ destruction, which is safe but leaks the retention bookkeeping until then.
 | `set_clipboard_backend(backend)` | install the platform clipboard |
 | `set_desktop_rect(f)` | install the virtual-desktop rectangle (`System.desktop*`) |
 | `set_image_codec(decode, probe, save)` | install the host image codec (defined in `host.rs`) |
+| `set_image_save_type_check(check)` | install the host's check of a save type — the formats the host can write, so an unknown type is raised at the save (defined in `host.rs`) |
 | `set_index_plane_decoder(decode)` | install the host decoder that reads an image's 8-bit index plane, which the province plane is built from (defined in `host.rs`) |
 | `set_system_font_dirs(dirs)` | install the host's system-font directories (defined in `host.rs`) |
 | `set_window_ex_*` | install the `windowEx.dll` host facts (defined in `natives/plugins/window_ex/host.rs`) |
 
 Every `set_*` seam installs a **closure**; a member whose closure is missing
 raises a typed TJS error rather than fabricating a value.
+
+The image codec's **save** closure is the one that does **not** run on the
+VM's thread: the compatibility layer submits the write to the engine's job
+pool, so the closure runs on a pool worker and is `Send + Sync`. The decode
+and the probe are still called from the VM's thread.
 
 ---
 

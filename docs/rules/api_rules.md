@@ -179,6 +179,12 @@ overlay, the transitions, the raster primitives and the layer/bitmap
 operations. The short doc comments in the seam are the in-tree summary; the
 protocol document is the contract.
 
+A **deferred write** adds no protocol item. The image save's handle is the
+engine's existing `PendingJob`, and the write runs on the engine's existing
+job pool — the pool the decode path uses — so the seam carries nothing new.
+The table of in-flight writes is the compatibility layer's own dispatch
+state, and the readers that wait for a write are its own image path.
+
 The text group carries the **font registry** group beside the text engine:
 `FontId` and the text engine's own operations. The registry is the one place
 that knows which faces exist, what they are called and which of them holds

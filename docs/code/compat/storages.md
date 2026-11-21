@@ -25,7 +25,7 @@ more to the same class object** (see §6).
 | `removeAutoPath(path)` | removes one |
 | `getFullPath(path)` | the normalized storage name |
 | `getPlacedPath(path)` | where a name resolves: a disk path or `archive.xp3>inner/path` |
-| `isExistentStorage(name)` | whether the name resolves to a file or directory |
+| `isExistentStorage(name)` | whether the name resolves to a file or directory; a **pending image write of that name is waited for** first, so the answer covers a file the save has just written |
 | `extractStorageExt(name)` | the extension, including the dot |
 | `extractStorageName(name)` | the last path component |
 | `extractStoragePath(name)` | the path part, including the trailing delimiter |
@@ -153,6 +153,12 @@ raises `Invalid path name <path>` (the reference's `TVPInvalidPathName`
 message), because a script may match on it. Every other L2 error keeps the
 member prefix: `Storages.isExistentStorage: storage not found: x`.
 
+A **pending image write** of the name is waited for before the name is
+looked up, so `isExistentStorage` sees a file the save has just written. The
+write was deferred, so a write that failed raises its failure here — with the
+member prefix, as any other inner failure — instead of at the save. See
+[`resource.md`](resource.md) §3.
+
 ---
 
 ## 8. Tests
@@ -183,6 +189,16 @@ member prefix.
 4. **`getLocalName` returns the script spelling unchanged** on a miss rather
    than a normalized form.
 5. **`Storages.open` is not registered.**
+6. **A read that goes straight to the L2 storage does not wait for a pending
+   image write.** `isExistentStorage` waits for the pending write of the
+   name, but a direct `Storage::read` — the layer-ex plugin's own image read
+   — does not, because the table of in-flight writes lives in the L3
+   resolver. The reference would see the written file there too, because it
+   writes the file before the save returns
+   (`reference/cpp/core/visual/LayerIntf.cpp:2699-2807`). The gap is closed
+   by moving the table into `engine::Storage` — see
+   [`../../arch/l3.md`](../../arch/l3.md) §9 and
+   [`resource.md`](resource.md) §3.
 
 ---
 

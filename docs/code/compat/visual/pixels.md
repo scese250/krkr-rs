@@ -106,7 +106,7 @@ pixels than its buffer holds answers `0` like a missing one. The writes
 | `independProvinceImage([copy])` | allocates the layer's 8-bit province plane; the default keeps the existing content, `copy = false` clears it. |
 | `loadImages(name[, key])` | reads and probes the storage image, queues the decode in the L2 pool when possible, and installs it as the layer's main image (a pending bitmap until the pixels land). It also takes the graphic's **province image** when the storage holds one — the graphic whose name carries `_p` before the extension (`map.png` → `map_p.png`). Returns `null` — the reference's absent metainfo. |
 | `loadProvinceImage(name)` | loads an 8-bit province plane sized to the main image. A smaller image is tiled up to that size; a larger one is a size mismatch. The plane is the image's own 8-bit sample — the **palette index** of a palettized image, not the colour the palette maps it to — and its value becomes the province value. |
-| `saveLayerImage(name[, type])` | encodes the main image through the host encoder and writes it through the storage. `type` defaults to `"bmp"`. The main image is **resolved first** — a pending decode is waited for — and an image that declares more pixels than its buffer holds raises instead of encoding an empty image. |
+| `saveLayerImage(name[, type])` | **submits the write** to the engine's job pool: the encode and the file write run on a worker, not on the frame thread — see §7. `type` defaults to `"bmp"`. The main image is **resolved first** — a pending decode is waited for — and an image that declares more pixels than its buffer holds raises instead of encoding an empty image. |
 | `drawText(x, y, text, color[, opacity[, antialias[, shadowLevel[, shadowColor[, shadowWidth[, shadowOffsetX[, shadowOffsetY]]]]]]])` | rasterizes a text run into the layer's main image. The main image is **resolved first** and validated, so the text lands on the decoded pixels; an image that declares more pixels than its buffer holds raises. |
 | `drawGlyph(x, y, glyph, color[, …same optionals…])` | the same, but the text comes from the glyph object's `text`/`char`/`character` member. |
 | `getTextWidth(text)` | the layer font's unrotated width: the mapped pre-rendered `Inc` sum, falling back to the rasterizer advance for a code unit the `.tft` lacks. |
@@ -406,6 +406,42 @@ its buffer holds **raises** instead of encoding an empty image — a truncated
 file is never written. A layer with no main image raises
 `"Layer.saveLayerImage: unsupported layer type (no main image)"`.
 
+#### The write is deferred
+
+`saveLayerImage` does not write the file on the frame thread: it **submits
+the write** to the engine's job pool — the pool the decode path uses — and
+returns as soon as the write is queued; the encode and the file write run on
+a pool worker. The type check, the pixel collection and the wait a reader
+does for the write stay on the frame thread. (Two cases keep the write on the
+calling thread — see below.) The design record is in
+[`../resource.md`](../resource.md) §3.
+
+The write is recorded under the bare storage name, and every image read of
+that name waits for it, so the file is in place when the reader looks for it
+— the behaviour the reference has, because it writes the file before the
+save returns (`reference/cpp/core/visual/LayerIntf.cpp:2699-2807`).
+
+Where a failure surfaces:
+
+| Failure | Where it surfaces |
+|---|---|
+| no encoder installed | **at the save** — `"Layer.saveLayerImage: no image encoder is installed"` |
+| an unknown format | **at the save** — the handler that accepts the mode is found before the image is written, so the format is rejected before any byte is encoded. The reference raises it there too (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:348-367`). |
+| a write failure — a full disk, a bad path | **at the next read of that name**, and logged when it happens |
+
+The write failure is a **divergence from the reference**: the reference
+raises it from the save itself
+(`reference/cpp/core/visual/LayerIntf.cpp:2699-2807`, and the native member
+at `reference/cpp/core/visual/LayerIntf.cpp:8408-8420`). Here the write was
+deferred, so the save has already returned: the failure surfaces at the next
+read of the name — and it is logged when it happens, so it is never
+swallowed.
+
+Two cases keep the write on the calling thread, and both raise the failure
+at the save: **no pool is attached**, and **the pool refused the job** (the
+queue was full or the memory limit would be exceeded — the refusal is
+logged, and the write runs on the calling thread).
+
 ---
 
 ## 8. The text path
@@ -462,6 +498,7 @@ as the layer-bound `Font` wrapper.
 | the province plane | L2 `Scene`, per layer — an 8-bit plane separate from the RGBA bitmap, filled from the image's index plane |
 | the geometry, the clip, the face, `holdAlpha`, the blend, `neutralColor`, `imageModified` | L2 `Scene` → `LayerState` |
 | the decoded-image cache | L2 `Scene`, keyed by (name, colour key, mode, width, height) |
+| the pending image writes, and the handle each one's result lands in | the L3 `ResourceResolver` (`pending_saves`), with the handle itself being the engine's `PendingJob` |
 | the layer's `Font` object | the L3 `LayerInst` payload |
 | the host image codec | the L3 `ResourceResolver` |
 
@@ -500,7 +537,8 @@ as the layer-bound `Font` wrapper.
 | `"Layer.loadProvinceImage: the province plane could not be sized to the main image"` | the plane allocation did not produce the main-sized plane |
 | `"Layer.loadProvinceImage: the province plane is missing"` | the plane disappeared before it could be filled |
 | `"Layer.loadProvinceImage: the layer has no main image"` | the layer is imageless |
-| `"Layer.saveLayerImage: no image encoder is installed"` | the host encoder is missing |
+| `"Layer.saveLayerImage: no image encoder is installed"` | the host encoder is missing — raised at the save |
+| `"Layer.saveLayerImage: no image encoder for format {type:?}"` | the host's save-type check rejected the format — raised at the save, before the image is written |
 | `"Layer.saveLayerImage: unsupported layer type (no main image)"` | the layer is imageless |
 | `"Layer.saveLayerImage: the bitmap {id} holds {bytes} pixel bytes instead of its {width}x{height} image"` | the main image declares more pixels than its buffer holds |
 | `"Layer.copyToBitmapFromMainImage: the bitmap {id} holds {bytes} pixel bytes instead of its {width}x{height} image"` | the copied main image declares more pixels than its buffer holds — the generic main-image check above raises first |
@@ -540,6 +578,7 @@ exception — they answer the out-of-range value `0`.
 | `crates/compat/tests/layer_behaviour.rs` | the reference behaviour: the pixel argument counts, the opacity defaults and the negative removal, the `gaussianBlur` sigma default distinguishing a void from a missing argument, `adjustGamma` parsing string reals and accepting no arguments, the mask alpha and the hold-mask plane, `setMaskPixel` truncating to eight bits, the Layer-only members rejecting a bitmap source, the face validations, the `dfAuto` face resolution, and the filters being silent on an imageless layer. |
 | `crates/compat/tests/image_function.rs` | the same primitives through the `ImageFunction` surface. |
 | `crates/compat/tests/bitmap.rs` | the codec seam the image path uses. |
+| `crates/compat/tests/pending_save.rs` | the deferred save: the save returns before the write finished, a reader of the name waits for the write, a failed write is raised at the next read, and an unknown type is raised at the save. |
 | `crates/compat/tests/font.rs` | the pre-rendered font pixels matching the rasterizer's coverage. |
 | `crates/engine/tests/layer_ops.rs` | the L2 pixel primitives over an image that declares pixels it does not hold: a blit draws nothing from it, a fill writes nothing into it, and a transition leaves it alone. |
 
@@ -548,6 +587,6 @@ exception — they answer the out-of-range value `0`.
 ## See also
 
 * [`layer.md`](layer.md) — the class these members belong to
-* [`../resource.md`](../resource.md) — the resolver behind the text and image paths
+* [`../resource.md`](../resource.md) — the resolver behind the text and image paths, and the deferred save
 * [`../bitmap.md`](bitmap.md) — the `Bitmap` class and the codec seam
 * [`../../../../arch/l2.md`](../../../arch/l2.md) §8 — the L2 pixel operations

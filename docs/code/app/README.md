@@ -53,7 +53,7 @@ therefore contains no `#[cfg(target_os = …)]` of its own.
 | `audio` | `src/audio.rs` | the L1 decoder seam and the L1 output device the frame drains | [audio.md](audio.md) |
 | `video` | `src/video.rs` | the L1-backed video source installed on the `VideoOverlay` and movie seams | [video.md](video.md) |
 | `overlay` | `src/overlay.rs` | the render-only debug panel (FPS, CPU, I/O, memory, object counts) | [overlay.md](overlay.md) |
-| `image_codec` | `src/image_codec.rs` | the L1 image codec installed on `Bitmap.load` / `loadHeader` / `save`, and the index plane the province load reads | [game.md](game.md) §4 |
+| `image_codec` | `src/image_codec.rs` | the L1 image codec installed on `Bitmap.load` / `loadHeader` / `save`, the index plane the province load reads, and the check of a save type | [game.md](game.md) §4 |
 | `window_ex` | `src/window_ex.rs` | the emulated Windows host facts (monitors, metrics, environment) | [game.md](game.md) §4 |
 | `startup` | `src/startup.rs` | the start-up cost counters the installed seams record | [game.md](game.md) §2 |
 

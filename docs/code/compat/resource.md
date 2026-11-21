@@ -49,7 +49,8 @@ global) that owns:
 | Field | Purpose |
 |---|---|
 | `coverage_cache: TextCoverageCache` | the rasterized character masks and their blurred shadows, keyed like the reference font cache |
-| `decode` / `probe` / `save` | the host image codec closures |
+| `decode` / `probe` / `save` / `save_type_check` | the host image codec closures |
+| `pending_saves: Map<String, PendingSave>` | the image writes that are still in flight, keyed by the bare storage name — see §3 |
 | `prerendered_storage: HashMap<String, Rc<PrerenderedFont>>` | the loaded pre-rendered fonts, keyed by the resolved placed path |
 | `prerendered: Vec<(PrerenderedKey, Rc<PrerenderedFont>)>` | the font-value → pre-rendered font mappings, in registration order |
 | `font_files: Vec<String>` | the font files the script has looked for, in the order it looked for them |
@@ -92,7 +93,29 @@ host.set_image_codec(decode, probe, save);
 |---|---|---|
 | `decode` | `Fn(&[u8], Option<&str>) -> Result<DecodedImage, String>` | `Bitmap.load`, `Bitmap.loadAsync`, `Layer.loadImages` |
 | `probe` | `Fn(&[u8], Option<&str>) -> Result<ImageInfo, String>` | `Bitmap.loadHeader` |
-| `save` | `Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String>` | `Bitmap.save`, `Layer.saveLayerImage` |
+| `save` | `Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String>` — **`Send + Sync`** | `Bitmap.save`, `Layer.saveLayerImage` |
+
+The **save runs on a worker thread**: the compatibility layer submits the
+write to the engine's job pool, so the frame thread neither encodes the
+image nor writes the file. The save closure is therefore `Send + Sync`,
+while the decode and the probe are still called from the VM's thread.
+
+The format of a save is checked by a **fourth closure**, installed on its
+own:
+
+```rust
+host.set_image_save_type_check(check);
+```
+
+| Closure | Signature | Backs |
+|---|---|---|
+| `check` | `Fn(&str) -> Result<(), String>` — `Send + Sync` | the format check of `Bitmap.save` and `Layer.saveLayerImage` |
+
+The check does not need the pixels: the handler that accepts the mode is
+found before the image is written, so an unknown format is raised at the
+save (§3). A host that installed no check has no format table to consult:
+the write then runs, and a format the host cannot encode is reported by the
+write itself, at the next read of the written name.
 
 The province plane is the image's own **8-bit sample** — the palette index of
 a palettized image, the gray level of a grayscale one — so it is decoded
@@ -116,6 +139,116 @@ a result.
 
 The save path strips the media prefix before handing the name to the host
 writer, exactly as the read path does on the decode side.
+
+### The deferred save
+
+`Bitmap.save` and `Layer.saveLayerImage` do not write the file on the frame
+thread: the **encode and the write** run on the engine's job pool — the pool
+the decode path uses — and the save returns as soon as the write is queued.
+Two cases keep the write on the calling thread instead; the failure policy
+below names them.
+
+#### What moves off the frame thread
+
+| Step | Where it runs |
+|---|---|
+| the type check | the frame thread |
+| the pixel collection | the frame thread |
+| the encode and the file write | a pool worker |
+| the reader's wait for the write | the frame thread |
+| the same-name ordering wait | the frame thread |
+
+The type check does not need the pixels: the handler that accepts the mode
+is found before the image is written, so an unknown format is raised at the
+save. The pixels are collected on the frame thread, because they come out of
+the scene's bitmap store; the buffer is then shared with the worker, which
+encodes it and writes the file. The reader's wait and the same-name ordering
+wait stay on the frame thread as well: they are the price of a deferred
+write, and the script's next read of the name pays them.
+
+#### The failure policy
+
+| Failure | Where it surfaces |
+|---|---|
+| no encoder installed | **at the save** — `"no image encoder is installed"`, the message the save path already used |
+| an unknown format | **at the save** — the handler that accepts the mode is found before the image is written |
+| a write failure — a full disk, a bad path | **at the next read of that name**, and logged when it happens |
+
+The unknown format is raised at the save for the same reason the reference
+raises it there: `TVPSaveImage` finds the handler that accepts the mode and
+raises `TVPUnknownGraphicFormat` before it writes
+(`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:348-367`).
+
+**The write failure is a divergence from the reference.** The reference
+writes the file inside the save and raises the failure from the save itself
+(`reference/cpp/core/visual/LayerIntf.cpp:2699-2807`, and the native member
+at `reference/cpp/core/visual/LayerIntf.cpp:8408-8420`). Here the write was
+deferred: the save has already returned, so the failure is raised at the next
+read of the name, and it is **logged** when it happens — so a name that is
+never read again does not lose the failure either. The reference writes the
+file **before** the save returns — which is why the reader waits here.
+
+Two cases keep the write on the calling thread, and both raise the failure
+at the save, as the reference does:
+
+* **no pool is attached** — the host installed no decode pool, so there is no
+  worker to write on;
+* **the pool refused the job** — the queue was full or the memory limit would
+  be exceeded. The refusal is logged with the limit it refused the job
+  against, and the write runs on the calling thread.
+
+#### The pending-write table
+
+The table is `pending_saves`, in the L3 `ResourceResolver`, keyed by the bare
+storage name (the media prefix is stripped, exactly as the read path does).
+Each entry holds two things:
+
+| field | what it is |
+|---|---|
+| `job` | the engine's `PendingJob` — the handle the write's result lands in |
+| `earlier_failure` | the failure of an earlier write of the same name |
+
+* **The reader demands the write before it waits.** `await_pending_save`
+  calls `job.demand()` first, so a worker takes the write before a normal
+  job.
+* **Two writes of the same name are ordered.** The second save waits for the
+  first one (`await_previous_save`), so two writes of one name do not race.
+* **A superseded failure is kept.** A write that follows a failed one waits
+  for it and writes anyway; the earlier failure stays in the table and is
+  raised at the next read of the name.
+* **A finished write leaves the table.** A write that succeeded is dropped:
+  the file it wrote is in place, and a reader of that name does not wait for
+  it. A write that **failed** stays, so the reader of the name still sees
+  the failure.
+
+Every image **read** waits for the pending write of the name it resolves:
+`resolve_image` demands the write of each candidate before the candidate is
+resolved, so the file is in place when the name is looked up.
+`Bitmap.load`, `Bitmap.loadHeader`, `Layer.loadImages`,
+`Layer.loadProvinceImage` and `System.touchImages` resolve their names that
+way, and `Storages.isExistentStorage` waits for the same name. A load that
+hits the decoded-image cache resolves no name at all, so it does not wait.
+
+#### The known gap
+
+The table lives in the L3 `ResourceResolver`, so a read that goes **straight
+to the L2 storage** does not wait: the layer-ex plugin's own image read
+(`natives/plugins/layer_ex/image.rs`) and a direct `Storage::read` see no
+file while the write is still in flight. The reference would see the written
+file there too, because it writes the file before the save returns.
+
+Closing the gap means moving the table into `engine::Storage`: the namespace
+would own the in-flight writes, and every reader — the L3 image path and the
+L2 storage itself — would wait for them.
+
+#### The L3 ↔ L2 seam
+
+The handle is the engine's existing `PendingJob`, and the write runs on the
+engine's existing job pool — the pool the decode path uses
+(`DecodePool::submit_job`). **The L3 ↔ L2 protocol gains no new item**: the
+seam already carries `PendingJob`, `JobWork`, `JobOutcome` and `JobValue`,
+and the table of in-flight writes is L3 dispatch state. See
+[`../../rules/api_rules.md`](../../rules/api_rules.md) §4.
 
 ---
 
@@ -253,6 +386,7 @@ string, or an object's `text`, `char` or `character` member.
 | Seam | Installed by | Purpose |
 |---|---|---|
 | `set_image_codec(decode, probe, save)` | `CompatHost` (defined in `host.rs`) | the L1 `media` image codec |
+| `set_image_save_type_check(check)` | `CompatHost` (defined in `host.rs`) | the host's table of the formats it can write — the check an unknown format fails at the save |
 | `set_system_font_dirs(dirs)` | the composition root, on the attached L2 text service | where the host's system fonts live |
 | the host's two font roles | the composition root, on the attached L2 text service | which faces fill the default-face and the coverage-face role |
 
@@ -268,6 +402,8 @@ sources.
 | `"no image decoder is installed"` | a decode was requested and no decoder is installed |
 | `"no image header prober is installed"` | a header probe was requested and no prober is installed |
 | `"no image encoder is installed"` | a save was requested and no encoder is installed |
+| `"no image encoder for format {type:?}"` | the host's save-type check rejected the format — raised at the save (§3) |
+| the host's own write failure | the write ran on the calling thread (no pool, or the pool refused the job) — raised at the save; a write that ran on a worker raises it at the next read of the name (§3) |
 | `"no font is available for face '{face}'"` | no candidate resolved and the registry holds no face at all |
 | `"Cannot find storage {storage}"` | the pre-rendered font's storage does not resolve |
 | `"Prerendered font mapping failed : {sub}"` | the `.tft` header is invalid |
@@ -285,6 +421,7 @@ sources.
 | `crates/compat/tests/font.rs` | the face metrics, `getList`, `defaultFaceName`, the pre-rendered measurements and the reference header errors |
 | `crates/compat/tests/font_registry.rs` | the registered name list, the default face name, `System.addFont`'s results, the per-character measurement and the KAG-shaped text render |
 | `crates/compat/tests/bitmap.rs` | the codec seam: the load/save/probe round-trips and the missing-codec errors |
+| `crates/compat/tests/pending_save.rs` | the deferred save: the save returns before the write finished, a reader of the name waits for the write, a failed write is raised at the next read, and an unknown type is raised at the save |
 | `crates/compat/tests/layer_behaviour.rs::layer_draw_text_prerendered_pixels_match_the_coverage` | a pre-rendered font's pixels match the rasterizer's coverage |
 | `crates/compat/tests/storage_media_prefix.rs` | the `file://` prefix on the storage-backed members |
 | `crates/compat/src/storage.rs` (unit test) | the prefix stripping table |
@@ -295,4 +432,5 @@ sources.
 
 * [`visual/font.md`](visual/font.md) — the `Font` class that drives face resolution
 * [`visual/pixels.md`](visual/pixels.md) — the text and image paths that use the resolver
+* [`visual/bitmap.md`](visual/bitmap.md) — the `Bitmap` class and its deferred save
 * [`../../arch/l3.md`](../../arch/l3.md) §1 — the crate surface

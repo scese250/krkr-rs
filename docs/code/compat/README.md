@@ -35,7 +35,7 @@ you need the *why*, not the *what*.
 | [`ctx.md`](ctx.md) | `ctx.rs` | `CompatCtx` + `CompatServices` — the registration/dispatch context and the L2 service handles |
 | [`engine_api.md`](engine_api.md) | `engine_api.rs` | the single L3↔L2 seam; the only file allowed to name `engine::` |
 | [`native_util.md`](native_util.md) | `native_util.rs` | the shared marshalling helpers every raw callback uses |
-| [`resource.md`](resource.md) | `resource.rs`, `storage.rs` | per-engine face resolution, the host image codec, pre-rendered fonts, and the script-name → VFS-name boundary (the `file://` media prefix) |
+| [`resource.md`](resource.md) | `resource.rs`, `storage.rs` | per-engine face resolution, the host image codec, the deferred image save, pre-rendered fonts, and the script-name → VFS-name boundary (the `file://` media prefix) |
 | [`text.md`](text.md) | `text.rs` | script decoding: BOM, charset detection, the `FE FE` container |
 | [`event.md`](event.md) | `event.rs` | `EventAdapter` — platform events → TJS events → script handlers |
 | [`frame.md`](frame.md) | `frame.rs` | `FrameBody` and `run_frame_body` — the ordered per-frame poll body |

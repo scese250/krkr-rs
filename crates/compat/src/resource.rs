@@ -16,10 +16,14 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::collections::Map;
 use crate::engine_api::layer_ops::RectI;
-use crate::engine_api::{BitmapState, Location, Storage, StorageReadError};
+use crate::engine_api::{
+    BitmapState, DecodePool, JobOutcome, JobValue, JobWork, Location, PendingJob, Storage,
+    StorageReadError,
+};
 use crate::engine_api::{
     CoverageMask, DEFAULT_COVERAGE_CODEPOINT, FontId, TextCoverageCache, TextEngine, TextStyle,
     blit_coverage_into, blur_coverage, blurred_text_coverage, compose_text_into,
@@ -37,7 +41,36 @@ type DecodeFn = dyn Fn(&[u8], Option<&str>) -> Result<DecodedImage, String>;
 /// Host-supplied image header prober.
 type ProbeFn = dyn Fn(&[u8], Option<&str>) -> Result<ImageInfo, String>;
 /// Host-supplied image encoder/saver.
-type SaveFn = dyn Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String>;
+///
+/// The saver runs on a worker thread: the compatibility layer submits the
+/// write to the engine's job pool, so the closure is called off the frame
+/// thread and must be thread-safe.
+type SaveFn = dyn Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String> + Send + Sync;
+
+/// Host-supplied check of a save type.
+///
+/// The check does not need the pixels: the format is validated before the
+/// write starts, so an unknown format is raised at the save and not at a
+/// later read of the written name.
+type CheckSaveTypeFn = dyn Fn(&str) -> Result<(), String> + Send + Sync;
+
+/// A write of an image that is still in flight.
+///
+/// The handle is the engine's job handle: the write runs on the job pool's
+/// worker, and every reader of the name waits for it. The handle is
+/// cancellable, and the bytes the write encodes are released when the job
+/// that holds them ends, so a name that is never read again does not keep
+/// them alive.
+struct PendingSave {
+    /// The handle the write's result lands in.
+    job: PendingJob,
+    /// The failure of an earlier write of the same name.
+    ///
+    /// A write that follows a failed one waits for it and writes anyway; the
+    /// earlier failure is kept so that a reader of the name sees it instead
+    /// of losing it.
+    earlier_failure: Option<String>,
+}
 
 /// The per-engine L3 resource resolver.
 #[derive(Default)]
@@ -50,7 +83,14 @@ pub(crate) struct ResourceResolver {
     /// Host image header prober.
     probe: Option<Rc<ProbeFn>>,
     /// Host image encoder/saver.
-    save: Option<Rc<SaveFn>>,
+    save: Option<Arc<SaveFn>>,
+    /// Host check of a save type.
+    save_type_check: Option<Arc<CheckSaveTypeFn>>,
+    /// The image writes that are still in flight, keyed by the storage name.
+    ///
+    /// A save records its write here, and every reader of that name waits
+    /// for it, so the file is in place when the reader looks for it.
+    pending_saves: Map<String, PendingSave>,
     /// Loaded pre-rendered fonts, keyed by the resolved placed path.
     prerendered_storage: Map<String, Rc<PrerenderedFont>>,
     /// Font-value → pre-rendered font mappings, in registration order.
@@ -94,6 +134,49 @@ pub(crate) fn resource_state(ctx: &CompatCtx) -> std::cell::RefMut<'_, ResourceR
     unsafe { ctx.services() }.state::<ResourceResolver>()
 }
 
+/// Waits for the write of `name` that is still in flight.
+///
+/// The write is demanded first, so a worker takes it before a normal job.
+/// The failure of the write is raised here: the write was deferred, so its
+/// failure surfaces at the next read of the name.
+///
+/// # Errors
+///
+/// The failure of the write, or the failure of an earlier write of the same
+/// name.
+pub(crate) fn await_pending_write(ctx: &CompatCtx, name: &str) -> Result<(), String> {
+    resource_state(ctx).await_pending_save(name)
+}
+
+/// Waits for every image write that is still in flight.
+///
+/// The write of a name is deferred, so a run that ends while a write is in
+/// flight would leave the file unwritten, where the file is written
+/// before the save returns. The host calls this when the run ends.
+///
+/// # Errors
+///
+/// The failure of the first write that failed.
+pub fn flush_pending_writes(ctx: &CompatCtx) -> Result<(), String> {
+    let mut names: Vec<String> = resource_state(ctx)
+        .pending_save_names()
+        .into_iter()
+        .collect();
+    names.sort();
+    let mut failure = None;
+    for name in names {
+        if let Err(error) = await_pending_write(ctx, &name) {
+            if failure.is_none() {
+                failure = Some(error);
+            }
+        }
+    }
+    match failure {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
 impl ResourceResolver {
     /// Records a font file the script looked for.
     ///
@@ -125,11 +208,35 @@ impl ResourceResolver {
         &mut self,
         decode: impl Fn(&[u8], Option<&str>) -> Result<DecodedImage, String> + 'static,
         probe: impl Fn(&[u8], Option<&str>) -> Result<ImageInfo, String> + 'static,
-        save: impl Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String> + 'static,
+        save: impl Fn(&str, &str, u32, u32, &[u8]) -> Result<(), String> + Send + Sync + 'static,
     ) {
         self.decode = Some(Rc::new(decode));
         self.probe = Some(Rc::new(probe));
-        self.save = Some(Rc::new(save));
+        self.save = Some(Arc::new(save));
+    }
+
+    /// Install (or replace) the host's check of a save type.
+    ///
+    /// The check runs on the thread that asks for the write, because it does
+    /// not need the pixels: the format is validated before the write
+    /// starts, so an unknown format is raised at the save.
+    pub(crate) fn set_save_type_check(
+        &mut self,
+        check: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+    ) {
+        self.save_type_check = Some(Arc::new(check));
+    }
+
+    /// Checks that `type_name` names a format the host can write.
+    ///
+    /// A host that installed no check has no format table to consult: the
+    /// write then runs, and a format the host cannot encode is reported by
+    /// the write itself, at the next read of the name.
+    pub(crate) fn check_save_type(&self, type_name: &str) -> Result<(), String> {
+        let Some(check) = self.save_type_check.clone() else {
+            return Ok(());
+        };
+        check(type_name)
     }
 
     /// Decode image bytes through the host decoder.
@@ -150,22 +257,151 @@ impl ResourceResolver {
         prober(bytes, hint)
     }
 
-    /// Encode and write a bitmap through the host saver.
-    pub(crate) fn save_image(
-        &self,
+    /// Submits the write of an image and records it under its name.
+    ///
+    /// The write runs on the job pool's worker: the frame thread does not
+    /// encode the image and does not write the file. The write is recorded
+    /// under the bare storage name, and every reader of that name waits for
+    /// it, so the file is in place when the reader looks for it.
+    ///
+    /// A host that attached no pool has no worker to write on: the write then
+    /// happens on the calling thread, and its failure is raised at the save.
+    ///
+    /// The write of a name that is written twice is ordered: the second write
+    /// waits for the first one, so two writes of the same name do not race.
+    ///
+    /// # Errors
+    ///
+    /// The failure of the type check, and the failure of a write that
+    /// happened on the calling thread. A write that runs on a worker reports
+    /// its failure at the next read of the name.
+    pub(crate) fn submit_save(
+        &mut self,
+        pool: Option<&mut DecodePool>,
         name: &str,
         type_name: &str,
         width: u32,
         height: u32,
-        rgba: &[u8],
+        pixels: Arc<Vec<u8>>,
     ) -> Result<(), String> {
-        let saver = self
-            .save
-            .clone()
-            .ok_or_else(|| "no image encoder is installed".to_string())?;
+        let Some(saver) = self.save.clone() else {
+            return Err("no image encoder is installed".to_string());
+        };
+        // The type is checked here, on the thread that asked for the write:
+        // the format is validated before the write starts, so an unknown
+        // format is raised at the save.
+        self.check_save_type(type_name)?;
         // The media prefix is L3 syntax; the host writer takes the bare name,
         // exactly as `read_image_from_storage` does on the decode path.
-        saver(strip_file_media(name), type_name, width, height, rgba)
+        let bare = strip_file_media(name).to_string();
+        // The writes that are done are dropped: the file they wrote is in
+        // place, and a reader of that name does not have to wait for it. A
+        // write that failed is kept, so the reader of the name still sees
+        // the failure.
+        self.pending_saves.retain(|_, pending| {
+            if !pending.job.is_ready() {
+                // The write is still in flight.
+                return true;
+            }
+            // The write is done: the file is in place, unless the write
+            // failed.
+            matches!(pending.job.await_ready(), JobOutcome::Failed(_))
+        });
+        // The earlier write lands first: two writes of the same name do not
+        // race, and the failure of the earlier write is kept for the reader.
+        let earlier_failure = self.await_previous_save(&bare);
+        let Some(pool) = pool else {
+            // No worker to write on: the write happens here, and its failure
+            // is raised at the save.
+            return saver(&bare, type_name, width, height, pixels.as_slice());
+        };
+        let charge = u64::try_from(pixels.len())
+            .map_err(|_| "the image is too large to write".to_string())?;
+        let job_saver = Arc::clone(&saver);
+        let job_pixels = Arc::clone(&pixels);
+        let job_name = bare.clone();
+        let job_type = type_name.to_string();
+        let work: Arc<JobWork> = Arc::new(move || {
+            match job_saver(&job_name, &job_type, width, height, job_pixels.as_slice()) {
+                Ok(()) => Ok(JobValue::new(())),
+                Err(message) => {
+                    // The failure is recorded on the handle and raised at the
+                    // next read of the name; the line names it, so a name
+                    // that is never read again does not lose it.
+                    log::error!("compat.image: the write of {job_name:?} failed: {message}");
+                    Err(message)
+                }
+            }
+        });
+        match pool.submit_job(work, charge) {
+            Ok((_id, job)) => {
+                self.pending_saves.insert(
+                    bare,
+                    PendingSave {
+                        job,
+                        earlier_failure,
+                    },
+                );
+                Ok(())
+            }
+            Err(error) => {
+                // The pool refused the job: the write happens on this
+                // thread, and the refusal is reported rather than swallowed.
+                // The error names the limit the pool refused the job
+                // against.
+                log::warn!(
+                    "compat.image: the job pool refused the write of {bare:?} ({error}); the image \
+                     is written on the calling thread"
+                );
+                saver(&bare, type_name, width, height, pixels.as_slice())
+            }
+        }
+    }
+
+    /// The names of the writes that are still in flight.
+    pub(crate) fn pending_save_names(&self) -> Vec<String> {
+        self.pending_saves.keys().cloned().collect()
+    }
+    /// Waits for the write of `name` that is still in flight.
+    ///
+    /// The write is demanded first, so a worker takes it before a normal
+    /// job. The failure of the write is raised here: the write was deferred,
+    /// so its failure surfaces at the next read of the name.
+    ///
+    /// # Errors
+    ///
+    /// The failure of the write, or the failure of an earlier write of the
+    /// same name.
+    pub(crate) fn await_pending_save(&mut self, name: &str) -> Result<(), String> {
+        let Some(pending) = self.pending_saves.remove(name) else {
+            return Ok(());
+        };
+        pending.job.demand();
+        let failure = match pending.job.await_ready() {
+            JobOutcome::Failed(message) => Some(message),
+            JobOutcome::Ready(_) | JobOutcome::Cancelled => None,
+        };
+        match failure.or(pending.earlier_failure) {
+            Some(message) => Err(message),
+            None => Ok(()),
+        }
+    }
+
+    /// Waits for the write of `name` that is still in flight and returns the
+    /// failure of an earlier write of that name.
+    ///
+    /// The write is demanded first, so a worker takes it before a normal
+    /// job. The failure of the write that is waited for is returned, so a
+    /// reader of the name sees the first failure and not only the last one.
+    fn await_previous_save(&mut self, name: &str) -> Option<String> {
+        let Some(pending) = self.pending_saves.remove(name) else {
+            return None;
+        };
+        pending.job.demand();
+        match pending.job.await_ready() {
+            JobOutcome::Failed(message) => Some(message),
+            JobOutcome::Ready(_) | JobOutcome::Cancelled => pending.earlier_failure,
+        }
     }
 
     /// Maps the font value `key` to the pre-rendered font `storage`.

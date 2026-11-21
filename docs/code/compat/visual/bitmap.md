@@ -38,7 +38,7 @@ A second construction on the same payload raises
 | `independ()` | a no-op — every `Bitmap` already owns a private scene bitmap. |
 | `setSize(width, height)` | resizes, preserving the overlapping top-left region and filling the rest with `[0, 0, 0, 0]`. A zero dimension raises. A pending decode is resolved first, so the decoded overlap survives. |
 | `copyFrom(bitmap)` | copies the source bitmap's pixels and dimensions into this one. The source is resolved first, and a source whose pixel buffer is not the bytes its size declares **raises** — copying its empty buffer would give this bitmap the same inconsistent state. |
-| `save(name[, type[, meta]])` | encodes and writes through the host saver. An image whose pixel buffer is not the bytes its size declares **raises** instead of encoding an empty buffer. |
+| `save(name[, type[, meta]])` | **submits the write** to the engine's job pool and returns; the encode and the file write run on a worker, not on the frame thread — see §5. An image whose pixel buffer is not the bytes its size declares **raises** instead of encoding an empty buffer. |
 | `load(name[, colorkey])` | decodes the storage image and installs it; returns a `{width, height, bpp}` metainfo dictionary (`bpp` is always 32). The decode may be deferred to the L2 pool — see §4. |
 | `loadAsync(name)` | runs the load synchronously and dispatches `onLoaded(meta, async, error, message)` immediately with `async == 0`. It never defers: the result is reported to the script, so the decode must have run. |
 | `onLoaded(meta, async, error, message)` | the registered completion hook; returns void. |
@@ -106,7 +106,18 @@ host.set_image_codec(decode, probe, save);
 |---|---|
 | `decode` | the **synchronous** load path: `Bitmap.load`, `Bitmap.loadAsync` and every load that cannot be deferred (§4) |
 | `probe` | `Bitmap.loadHeader` and the header probe of a deferred load |
-| `save` | `Bitmap.save` |
+| `save` | `Bitmap.save` — the closure is `Send + Sync`, because the write runs on a pool worker (§5) |
+
+A fourth closure, installed on its own, checks the **format** of a save
+before the image is written:
+
+```rust
+host.set_image_save_type_check(check);
+```
+
+| Closure | Backs |
+|---|---|
+| `check` | `Bitmap.save` — the format check, so an unknown type is raised at the save (§5) |
 
 A member whose closure is missing raises a typed error — `"no image decoder
 is installed"`, `"no image header prober is installed"`, `"no image encoder is
@@ -231,6 +242,45 @@ so its decode must have run.
 
 The saver receives `(name, type, width, height, rgba)`.
 
+### The write is deferred
+
+`Bitmap.save` does not write the file on the frame thread: it **submits the
+write** to the engine's job pool — the pool the decode path uses — and
+returns as soon as the write is queued. The encode and the file write run on
+a pool worker; the type check, the pixel collection and the wait a reader
+does for the write stay on the frame thread. (Two cases keep the write on the
+calling thread — see below.) The design record is in
+[`../resource.md`](../resource.md) §3.
+
+The write is recorded under the bare storage name, and **every image read
+waits for it**: `Bitmap.load` and `Bitmap.loadHeader` resolve their name
+through `resolve_image`, which demands the pending write of the name before
+the name is looked up. So the file is in place when the reader looks for it
+— the behaviour the reference has, because it writes the file before the
+save returns
+(`reference/cpp/core/visual/LayerIntf.cpp:2699-2807`).
+
+### Where a failure surfaces
+
+| Failure | Where it surfaces |
+|---|---|
+| no encoder installed | **at the save** — `"Bitmap.save: no image encoder is installed"` |
+| an unknown format | **at the save** — the handler that accepts the mode is found before the image is written, so the format is rejected before any byte is encoded. The reference raises it there too (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:348-367`). |
+| a write failure — a full disk, a bad path | **at the next read of that name**, and logged when it happens |
+
+The write failure is a **divergence from the reference**: the reference
+raises it from the save itself
+(`reference/cpp/core/visual/LayerIntf.cpp:2699-2807`, and the native member
+at `reference/cpp/core/visual/LayerIntf.cpp:8408-8420`). Here the write was
+deferred, so the save has already returned: the failure surfaces at the next
+read of the name — and it is logged when it happens, so it is never
+swallowed.
+
+Two cases keep the write on the calling thread, and both raise the failure
+at the save: **no pool is attached**, and **the pool refused the job** (the
+queue was full or the memory limit would be exceeded — the refusal is
+logged, and the write runs on the calling thread).
+
 ---
 
 ## 6. The cache
@@ -257,6 +307,7 @@ The decoded-image cache lives in the L2 scene, keyed by
 | the pending decode of a bitmap whose pixels have not landed yet | L2 `Scene` / `BitmapState` (`pending`) |
 | the decoded-image cache | L2 `Scene` |
 | the decode pool, its workers and its queue | L2 `engine::imagedecode::DecodePool`, attached to the host by the composition root |
+| the pending image writes, and the handle each one's result lands in | the L3 `ResourceResolver` (`pending_saves`), with the handle itself being the engine's `PendingJob` |
 | the scene bitmap id, the async `loading` flag | the L3 `BitmapInst` payload |
 | the host codec closures | the L3 `ResourceResolver` |
 
@@ -290,6 +341,12 @@ The decoded-image cache lives in the L2 scene, keyed by
 * **A failed pending decode installs a blank, not an exception.** The bitmap
   keeps the probed size and every pixel becomes transparent; the failure is
   logged.
+* **A pending write is waited for by every reader of its name.** The save
+  returns before the file is written, so the read that follows demands the
+  write and waits for it; the file is in place when the read looks for it.
+* **A write failure is never swallowed.** It is logged when it happens and
+  raised at the next read of the name; a write that ran on the calling thread
+  raises it at the save.
 
 ---
 
@@ -307,6 +364,8 @@ The decoded-image cache lives in the L2 scene, keyed by
 | `"Bitmap.setSize: cannot create empty layer image"` | a zero dimension |
 | `"Bitmap.copyFrom requires a Bitmap argument"`, `"Bitmap.copyFrom: not a Bitmap object"`, `"Bitmap.copyFrom: the source bitmap does not exist"`, `"Bitmap.copyFrom: the source image does not hold its pixels"` | the source argument |
 | `"Bitmap.save requires a storage name"`, `"Bitmap.save: the storage name is empty"`, `"Bitmap.save: the meta argument is not an object"`, `"Bitmap.save: currently async load bitmap"`, `"Bitmap.save: this bitmap has no image"`, `"Bitmap.save: this bitmap no longer exists"`, `"Bitmap.save: this image does not hold its pixels"`, `"Bitmap.save: {error}"` | the save path |
+| `"Bitmap.save: no image encoder is installed"` | the host installed no encoder — raised at the save |
+| `"Bitmap.save: no image encoder for format {type:?}"` | the host's save-type check rejected the format — raised at the save, before the image is written |
 | `"Bitmap.load requires a storage name"`, `"Bitmap.load: the storage name is empty"`, `"Bitmap.load: currently async load bitmap"`, `"Bitmap.load: {error}"` | the load path |
 | `"Bitmap.loadAsync requires a storage name"`, `"Bitmap.loadAsync: the storage name is empty"`, `"Bitmap.loadAsync: currently async load bitmap"` | the async load path |
 | `"Bitmap.loadHeader requires a storage name"`, `"Bitmap.loadHeader: no storage attached"`, `"Bitmap.loadHeader: {error}"` | the header probe |
@@ -323,6 +382,9 @@ The decoded-image cache lives in the L2 scene, keyed by
 * A **deferred** decode that fails after the probe logs the failure and
   installs a transparent blank of the probed size. The load already returned,
   so nothing raises.
+* A **deferred write** that fails logs `"compat.image: the write of
+  {name:?} failed: {error}"` and raises the failure at the next read of the
+  name; the save itself has already returned.
 
 ---
 
@@ -335,12 +397,13 @@ The decoded-image cache lives in the L2 scene, keyed by
 | `crates/compat/tests/dispatch_visual.rs` | the receiver routing. |
 | `crates/compat/tests/layer_behaviour.rs` | the Layer-only members reject a bitmap source. |
 | `crates/compat/tests/pending_image.rs` | the deferred load through the real natives: a load without a pool decodes synchronously, a load with a pool leaves the bitmap pending with the probed size, the first pixel read waits for the decode, a probe failure raises at the load, and a refused submit falls back to the synchronous decode. |
+| `crates/compat/tests/pending_save.rs` | the deferred save through the real natives: the save returns before the write finished, a reader of the name waits for the write, a failed write is raised at the next read, and an unknown type is raised at the save. |
 
 ---
 
 ## See also
 
-* [`../resource.md`](../resource.md) — the codec seam and the face resolution
+* [`../resource.md`](../resource.md) — the codec seam, the deferred save and the face resolution
 * [`pixels.md`](pixels.md) — the layer-side image path that shares the codec
 * [`../engine_api.md`](../engine_api.md) — the L2 bitmap state
 * [`../../engine/scene.md`](../../engine/scene.md) — the pending bitmap and the image barrier

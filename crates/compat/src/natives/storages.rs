@@ -45,7 +45,7 @@ use tjs::{Engine, NativeClassBuilder, NativeMethodDef, VAL_OBJECT, VAL_STRING, V
 use crate::binding;
 use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
-use crate::resource::{is_font_file_name, resource_state};
+use crate::resource::{await_pending_write, is_font_file_name, resource_state};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -396,6 +396,11 @@ extern "C" fn native_is_existent_storage(
     let Some(storage) = attached_storage(services) else {
         return report_error(out_error, "Storages.isExistentStorage: no storage attached");
     };
+    // A write of this name may still be in flight: the file is written
+    // before the save returns, so the check waits for it.
+    if let Err(error) = await_pending_write(&ctx, name) {
+        return report_error(out_error, &format!("Storages.isExistentStorage: {error}"));
+    }
     // SAFETY: the host keeps the attached storage alive for the VM lifetime.
     match unsafe { &*storage }.exists(name) {
         Ok(exists) => {

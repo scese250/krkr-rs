@@ -64,7 +64,7 @@ pub use audio_ffmpeg::{
     FfmpegAudioState, decode_audio_ffmpeg, open_audio_ffmpeg, read_audio_ffmpeg, seek_audio_ffmpeg,
 };
 pub use image_decode::{decode_image, decode_index_plane, probe_image};
-pub use image_encode::encode_image;
+pub use image_encode::{check_encode_hint, encode_image};
 #[cfg(feature = "video-mediacodec")]
 pub use video::decode_audio_mediacodec;
 pub use video::{VideoDecoderState, open_video, present_video, video_audio};
