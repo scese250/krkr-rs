@@ -181,6 +181,27 @@ pub struct FrameTimings {
     pub fence_wait_ms: f64,
 }
 
+/// The costs of one texture-upload batch, measured on the thread that made it.
+///
+/// The four costs are the four steps of an upload: the GPU images the batch
+/// writes into are created, the pixels are written into the mapped staging
+/// memory, the copy command is recorded and submitted, and the batch waits
+/// for the GPU when it reuses a staging buffer the device may still read.
+///
+/// A caller that wants to know where an upload's time went reads the value
+/// right after the upload call: it describes that call and not the run.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct UploadTimings {
+    /// Milliseconds spent creating the GPU images the batch writes into.
+    pub create_ms: f64,
+    /// Milliseconds spent writing the pixels into the mapped staging memory.
+    pub stage_ms: f64,
+    /// Milliseconds spent recording and submitting the copy command.
+    pub submit_ms: f64,
+    /// Milliseconds blocked waiting for the GPU on a staging buffer.
+    pub wait_ms: f64,
+}
+
 /// Stateless render service.
 ///
 /// Created once through [`create_render_pipeline`] and shared by callers.
@@ -676,6 +697,21 @@ pub fn last_frame_timings(state: &RenderState) -> Option<FrameTimings> {
         // A state that renders offscreen presents no frame, so it has no
         // presentation timings.
         StateKind::Vulkan(vulkan) => vulkan.last_frame_timings(),
+    }
+}
+
+/// Returns the costs of the most recent texture-upload batch.
+///
+/// Returns `None` for a backend that has not uploaded a texture, so a caller
+/// can tell "no upload yet" from a measured all-zero batch. The null backend
+/// uploads into its own CPU storage and measures nothing, so the value is
+/// `None` there.
+pub fn last_upload_timings(state: &RenderState) -> Option<UploadTimings> {
+    match &state.kind {
+        // The null backend applies an upload to its CPU storage; there is no
+        // staging memory and no device call to measure.
+        StateKind::Null(_) => None,
+        StateKind::Vulkan(vulkan) => vulkan.last_upload_timings(),
     }
 }
 

@@ -38,9 +38,9 @@ use api::host::{PresentSkip, Presentation, SurfaceEvent};
 use render::{
     BackendKind, FrameStats, FrameTimings, RenderNode, RenderPipeline, RenderScene, RenderState,
     RenderTarget, RenderTargetDesc, Surface, Texture, TextureDesc, TextureUpload,
-    create_render_target, create_texture, destroy_render_target, drop_texture, last_frame_timings,
-    read_render_target, recover_surface, render, render_to_target, resize as resize_render,
-    supports_effect_pipelines, upload_textures,
+    UploadTimings, create_render_target, create_texture, destroy_render_target, drop_texture,
+    last_frame_timings, last_upload_timings, read_render_target, recover_surface, render,
+    render_to_target, resize as resize_render, supports_effect_pipelines, upload_textures,
 };
 
 use crate::clock::{FrameClock, FrameTimeSource, InjectedFrameTime};
@@ -446,6 +446,15 @@ pub struct FrameReport {
     pub project_ms: f64,
     /// Milliseconds spent in the pipeline's render call.
     pub render_ms: f64,
+    /// The costs of the frame's texture uploads, when the backend measured
+    /// them.
+    ///
+    /// The value names the four steps of an upload: the GPU images the
+    /// uploads write into are created, the pixels are written into the mapped
+    /// staging memory, the copy command is recorded and submitted, and the
+    /// upload waits for the GPU when it reuses a staging buffer. A backend
+    /// that measures nothing reports `None`.
+    pub upload_timings: Option<UploadTimings>,
 }
 
 /// The middle-layer engine: scene, projection, textures, timers, presentation
@@ -917,6 +926,7 @@ impl Engine {
                 prune_ms: 0.0,
                 project_ms: 0.0,
                 render_ms: 0.0,
+                upload_timings: None,
             });
         }
 
@@ -929,7 +939,7 @@ impl Engine {
 
         let sync_started = Instant::now();
         let upload_started = Instant::now();
-        self.sync_dirty_bitmaps();
+        let mut upload_timings = self.sync_dirty_bitmaps();
         let mut upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
         let prune_started = Instant::now();
         self.prune_stale_textures();
@@ -953,7 +963,7 @@ impl Engine {
         // changing the scene graph; upload those dirty bitmaps either way.
         let sync2_started = Instant::now();
         let upload2_started = Instant::now();
-        self.sync_dirty_bitmaps();
+        upload_timings = add_upload_timings(upload_timings, self.sync_dirty_bitmaps());
         upload_ms += upload2_started.elapsed().as_secs_f64() * 1000.0;
         let prune2_started = Instant::now();
         self.prune_stale_textures();
@@ -1058,6 +1068,7 @@ impl Engine {
             prune_ms,
             project_ms,
             render_ms,
+            upload_timings,
         })
     }
 
@@ -1581,7 +1592,10 @@ impl Engine {
     ///
     /// A bitmap that changed in a rectangle uploads that rectangle alone;
     /// one that changed wholly uploads every pixel.
-    fn sync_dirty_bitmaps(&mut self) {
+    ///
+    /// The costs of the upload are returned when the backend measured them,
+    /// so the frame's report can name where the upload's time went.
+    fn sync_dirty_bitmaps(&mut self) -> Option<UploadTimings> {
         let dirty: Vec<u32> = self.scene.dirty_bitmaps_for_upload();
 
         let mut ready: Vec<u32> = Vec::with_capacity(dirty.len());
@@ -1684,11 +1698,23 @@ impl Engine {
                     false
                 }
             };
+            // The costs of the batch that was just submitted, read right after
+            // the call: the value describes this batch and not an earlier one.
+            // A batch with no uploads submits nothing, so there is nothing to
+            // measure.
+            let timings = if uploads.is_empty() {
+                None
+            } else {
+                last_upload_timings(&self.render_state)
+            };
             drop(uploads);
             // The uploaded pixels are the ones the layers drawing the bitmap
             // show, so the picture changed.
             self.scene.mark_dirty();
             clear_uploaded_dirty(&mut self.scene, &ready, uploaded);
+            Some(timings)
+        } else {
+            None
         }
     }
 
@@ -1761,6 +1787,28 @@ fn region_pixels(bitmap: &BitmapState, region: PixelRegion) -> Option<Vec<u8>> {
     Some(pixels)
 }
 
+/// Adds two upload measurements into one.
+///
+/// A frame uploads its dirty bitmaps twice: once before the projection and
+/// once after the upward hook, so the frame's report holds the sum of the
+/// two batches. A backend that measured only one of them contributes that
+/// one.
+fn add_upload_timings(
+    left: Option<UploadTimings>,
+    right: Option<UploadTimings>,
+) -> Option<UploadTimings> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(UploadTimings {
+            create_ms: left.create_ms + right.create_ms,
+            stage_ms: left.stage_ms + right.stage_ms,
+            submit_ms: left.submit_ms + right.submit_ms,
+            wait_ms: left.wait_ms + right.wait_ms,
+        }),
+        (Some(left), None) => Some(left),
+        (None, right) => right,
+    }
+}
+
 /// Clears the dirty flag of every bitmap in `uploaded` after a batch upload.
 ///
 /// A failed batch did not reach the backend, so the bitmaps stay dirty and the
@@ -1779,12 +1827,15 @@ fn clear_uploaded_dirty(scene: &mut Scene, uploaded: &[u32], succeeded: bool) {
 mod tests {
     use super::{
         Engine, EngineParts, FrameTarget, GameFrame, PresentFault, PresentationStall, Scene,
-        StallAge, StallCause, StallSummary, clear_uploaded_dirty, describe_stall_causes,
-        present_outcome, reported_surface_size,
+        StallAge, StallCause, StallSummary, add_upload_timings, clear_uploaded_dirty,
+        describe_stall_causes, present_outcome, reported_surface_size,
     };
     use api::geometry::PixelRegion;
     use api::host::{PresentSkip, Presentation, SurfaceEvent};
-    use render::{NullRenderPipeline, PipelineConfig, begin_render_state, create_render_pipeline};
+    use render::{
+        NullRenderPipeline, PipelineConfig, UploadTimings, begin_render_state,
+        create_render_pipeline,
+    };
     use testkit::headless_window;
 
     /// A frame hook that changes nothing.
@@ -1886,6 +1937,34 @@ mod tests {
 
         clear_uploaded_dirty(&mut scene, &[id], true);
         assert!(!scene.bitmap(id).expect("bitmap").dirty);
+    }
+
+    /// The frame uploads its dirty bitmaps twice, so the frame's report holds
+    /// the sum of the two batches. A backend that measured only one of them
+    /// contributes that one.
+    #[test]
+    fn the_frame_reports_the_sum_of_its_two_uploads() {
+        let first = UploadTimings {
+            create_ms: 1.0,
+            stage_ms: 2.0,
+            submit_ms: 3.0,
+            wait_ms: 4.0,
+        };
+        let second = UploadTimings {
+            create_ms: 10.0,
+            stage_ms: 20.0,
+            submit_ms: 30.0,
+            wait_ms: 40.0,
+        };
+        let sum = add_upload_timings(Some(first), Some(second)).expect("both measured");
+        assert_eq!(sum.create_ms, 11.0);
+        assert_eq!(sum.stage_ms, 22.0);
+        assert_eq!(sum.submit_ms, 33.0);
+        assert_eq!(sum.wait_ms, 44.0);
+
+        assert!(add_upload_timings(None, None).is_none(), "no measurement");
+        let only = add_upload_timings(None, Some(second)).expect("one measured");
+        assert_eq!(only.stage_ms, 20.0);
     }
 
     #[test]

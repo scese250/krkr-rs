@@ -7,11 +7,14 @@
 //! sample.
 #![allow(unsafe_code)]
 
+use std::time::Instant;
+
 use ash::vk;
 
 use api::error::RenderError;
 use api::geometry::PixelRegion;
 
+use crate::UploadTimings;
 use crate::collections::{Map, Set, set_with_capacity};
 use crate::texture::{Texture, TextureDesc, TextureFormat};
 
@@ -175,9 +178,6 @@ struct UploadSlot {
     fence: vk::Fence,
     /// Whether [`Self::fence`] still guards unfinished GPU work.
     in_flight: bool,
-    /// Textures touched by the in-flight batch; they serialise two batches
-    /// that would otherwise transition the same image at the same time.
-    keys: Vec<u64>,
     /// Number of batches submitted from this slot; a diagnostic counter.
     #[cfg(test)]
     submits: u64,
@@ -191,6 +191,9 @@ struct UploadSlot {
 pub(crate) struct UploadRing {
     slots: Vec<UploadSlot>,
     next: usize,
+    /// The costs of the most recent batch, measured on the thread that made
+    /// it. `None` until the first batch.
+    pub(crate) last: Option<UploadTimings>,
 }
 
 impl UploadRing {
@@ -212,7 +215,11 @@ impl UploadRing {
                 }
             }
         }
-        Ok(Self { slots, next: 0 })
+        Ok(Self {
+            slots,
+            next: 0,
+            last: None,
+        })
     }
 
     /// Destroys every slot's staging buffer, command pool and fence.
@@ -234,6 +241,9 @@ impl UploadRing {
     }
 
     /// Waits for every in-flight upload to complete.
+    ///
+    /// The wait is the one the read path makes: a draw samples the textures
+    /// the batches wrote, so it waits for the batches before it draws.
     pub(crate) fn wait_all(&mut self, device: &ash::Device) -> Result<(), RenderError> {
         for slot in &mut self.slots {
             if !slot.in_flight {
@@ -246,42 +256,37 @@ impl UploadRing {
                 }
             })?;
             slot.in_flight = false;
-            slot.keys.clear();
         }
         Ok(())
     }
 
-    /// Waits the round-robin slot if its batch is still in flight and resets
-    /// its command pool.
+    /// Takes a slot for the next batch and resets its command pool.
     ///
-    /// When a slot still in flight touches a texture in `keys`, every in-flight
-    /// slot is waited first: two batches must not record layout transitions on
-    /// the same image concurrently.
-    fn acquire(
-        &mut self,
-        device: &ash::Device,
-        keys: &[u64],
-    ) -> Result<&mut UploadSlot, RenderError> {
-        let incoming: Set<u64> = keys.iter().copied().collect();
-        let overlaps = self
-            .slots
-            .iter()
-            .any(|slot| slot.in_flight && slot.keys.iter().any(|key| incoming.contains(key)));
-        if overlaps {
-            self.wait_all(device)?;
-        }
-        let index = self.next;
-        self.next = (self.next + 1) % self.slots.len();
+    /// The wait is the staging buffer's: the host writes the next batch's
+    /// pixels into the slot's buffer, and the device may still be reading it.
+    /// A slot that is not in flight holds a buffer the device has finished
+    /// with, so it is taken first; when every slot is busy the round-robin
+    /// one is taken and waited for.
+    ///
+    /// Two batches that write the same texture do not wait for each other
+    /// here: a queue runs its submissions in the order they were made, so the
+    /// second batch's layout transition runs after the first batch's, and the
+    /// read path waits for both before it samples the texture.
+    fn acquire(&mut self, device: &ash::Device) -> Result<(&mut UploadSlot, f64), RenderError> {
+        let index = self.free_slot().unwrap_or(self.next);
+        self.next = (index + 1) % self.slots.len();
         let slot = &mut self.slots[index];
+        let mut wait_ms = 0.0;
         if slot.in_flight {
+            let started = Instant::now();
             // SAFETY: the fence guards this slot's last submit.
             unsafe { device.wait_for_fences(&[slot.fence], true, u64::MAX) }.map_err(|error| {
                 RenderError::Upload {
                     message: format!("failed to wait for an upload slot: {error}"),
                 }
             })?;
+            wait_ms = started.elapsed().as_secs_f64() * 1000.0;
             slot.in_flight = false;
-            slot.keys.clear();
         }
         // SAFETY: the slot's fence has been waited, so its pool is idle.
         unsafe {
@@ -291,7 +296,19 @@ impl UploadRing {
                     message: format!("failed to reset an upload command pool: {error}"),
                 })?;
         }
-        Ok(slot)
+        Ok((slot, wait_ms))
+    }
+
+    /// The first slot that is not in flight, in round-robin order.
+    fn free_slot(&self) -> Option<usize> {
+        let count = self.slots.len();
+        for offset in 0..count {
+            let index = (self.next + offset) % count;
+            if !self.slots[index].in_flight {
+                return Some(index);
+            }
+        }
+        None
     }
 }
 
@@ -356,7 +373,6 @@ fn create_upload_slot(
         command,
         fence,
         in_flight: false,
-        keys: Vec::new(),
         #[cfg(test)]
         submits: 0,
     })
@@ -581,7 +597,7 @@ pub(crate) struct UploadContext<'a> {
 /// Copies a tightly packed sub-rectangle of `pixels` into `texture`.
 ///
 /// The batch is staged and submitted to a free slot of `ring` without waiting.
-/// `key` identifies `texture` so two uploads to the same image are serialised.
+/// `key` identifies `texture` in the state's texture table.
 pub(crate) fn upload(
     context: &UploadContext<'_>,
     ring: &mut UploadRing,
@@ -602,10 +618,8 @@ pub(crate) fn upload(
         pixels,
     }];
     let offsets = [0usize];
-    let keys = [key];
     let first_upload = !texture.uploaded;
     let batch = StageBatch {
-        keys: &keys,
         uploads: &uploads,
         offsets: &offsets,
         total,
@@ -661,13 +675,11 @@ pub(crate) fn upload_batch(
     }
 
     let (offsets, total) = staging_layout(uploads)?;
-    let keys: Vec<u64> = uploads.iter().map(|upload| upload.key).collect();
     // A texture repeated in one batch is only in `UNDEFINED` for its first
     // copy; every later copy starts from the sampled layout the previous
     // transition left behind.
     let mut seen: Set<u64> = set_with_capacity(uploads.len());
     let batch = StageBatch {
-        keys: &keys,
         uploads,
         offsets: &offsets,
         total,
@@ -707,12 +719,9 @@ pub(crate) fn upload_batch(
     result
 }
 
-/// One upload batch's staging plan: the images to serialise on, the uploads,
-/// their staging offsets and the total staged byte count.
+/// One upload batch's staging plan: the uploads, their staging offsets and the
+/// total staged byte count.
 struct StageBatch<'a> {
-    /// Destination texture keys, which keep an in-flight image from reusing a
-    /// slot.
-    keys: &'a [u64],
     /// Updates staged into the slot.
     uploads: &'a [TextureUpload<'a>],
     /// Staging offset of every entry in `uploads`.
@@ -741,12 +750,16 @@ where
         queue,
     } = *context;
     let StageBatch {
-        keys,
         uploads,
         offsets,
         total,
     } = batch;
-    let slot = ring.acquire(device, keys)?;
+    // The batch's costs are measured below. A batch that fails leaves no
+    // measurement behind, so a reader never sees the costs of an earlier
+    // batch in its place.
+    ring.last = None;
+    let (slot, wait_ms) = ring.acquire(device)?;
+    let stage_started = Instant::now();
     slot.staging.reserve(
         device,
         memory_properties,
@@ -754,6 +767,7 @@ where
         vk::BufferUsageFlags::TRANSFER_SRC,
     )?;
     slot.staging.write(device, total, uploads, offsets)?;
+    let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
     let staging_buffer = slot.staging.buffer;
 
     // SAFETY: the slot's pool was reset by `acquire` and the command buffer is
@@ -772,6 +786,7 @@ where
     // stays signalled and the slot is reusable.
     record(slot.command, staging_buffer)?;
 
+    let submit_started = Instant::now();
     // SAFETY: the command buffer is recording and was begun above. The fence
     // is reset only immediately before the submit so an earlier error leaves
     // it signalled and the slot reusable. A failed submit leaves the fence
@@ -795,14 +810,21 @@ where
                 message: format!("failed to submit an upload: {error}"),
             })?;
     }
+    let submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
 
     slot.in_flight = true;
-    slot.keys.clear();
-    slot.keys.extend_from_slice(keys);
     #[cfg(test)]
     {
         slot.submits = slot.submits.saturating_add(1);
     }
+    // The batch's costs: the wait for the staging buffer, the write of the
+    // pixels into it, and the device's copy command.
+    ring.last = Some(UploadTimings {
+        create_ms: 0.0,
+        stage_ms,
+        submit_ms,
+        wait_ms,
+    });
     Ok(())
 }
 
@@ -941,6 +963,7 @@ impl VulkanDevice {
         pixels: &[u8],
     ) -> Result<(), RenderError> {
         let key = tex.key();
+        let create_started = Instant::now();
         if !self.textures.contains_key(&key) {
             let gpu = create_texture(
                 &self.device,
@@ -952,6 +975,7 @@ impl VulkanDevice {
             )?;
             self.textures.insert(key, gpu);
         }
+        let create_ms = create_started.elapsed().as_secs_f64() * 1000.0;
 
         let gpu = self
             .textures
@@ -964,7 +988,11 @@ impl VulkanDevice {
             memory_properties,
             queue: self.graphics_queue,
         };
-        upload(&context, &mut self.upload, gpu, key, region, pixels)
+        let result = upload(&context, &mut self.upload, gpu, key, region, pixels);
+        if let Some(timings) = self.upload.last.as_mut() {
+            timings.create_ms = create_ms;
+        }
+        result
     }
 
     /// Copies every upload's sub-rectangle into its texture as one batch.
@@ -988,6 +1016,7 @@ impl VulkanDevice {
             super::validate_upload(upload.texture.desc(), upload.region, upload.pixels)?;
         }
 
+        let create_started = Instant::now();
         for upload in uploads {
             let key = upload.texture.key();
             if !self.textures.contains_key(&key) {
@@ -1002,6 +1031,7 @@ impl VulkanDevice {
                 self.textures.insert(key, gpu);
             }
         }
+        let create_ms = create_started.elapsed().as_secs_f64() * 1000.0;
 
         let batch: Vec<TextureUpload<'_>> = uploads
             .iter()
@@ -1017,7 +1047,13 @@ impl VulkanDevice {
             memory_properties,
             queue: self.graphics_queue,
         };
-        upload_batch(&context, &mut self.upload, &mut self.textures, &batch)
+        let result = upload_batch(&context, &mut self.upload, &mut self.textures, &batch);
+        // The batch's own costs are recorded by the batch; the images the
+        // batch writes into were created before it.
+        if let Some(timings) = self.upload.last.as_mut() {
+            timings.create_ms = create_ms;
+        }
+        result
     }
 }
 

@@ -74,7 +74,7 @@ use crate::render_target::{RenderTarget, RenderTargetDesc};
 use crate::scene::RenderScene;
 use crate::state::{RenderState, StateKind, Surface, SurfaceKind};
 use crate::texture::{Texture, TextureDesc};
-use crate::{FrameTimings, TextureFormat};
+use crate::{FrameTimings, TextureFormat, UploadTimings};
 
 /// Number of frames recorded concurrently.
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -1947,6 +1947,14 @@ impl VulkanState {
             Self::Presenting(presenting) => presenting.presentation.last_timings,
             Self::Offscreen(_) => None,
         }
+    }
+
+    /// The costs of the most recent texture-upload batch.
+    ///
+    /// The device owns the upload ring, so both kinds of state report the
+    /// same value.
+    pub(crate) fn last_upload_timings(&self) -> Option<UploadTimings> {
+        self.device().upload.last
     }
 }
 

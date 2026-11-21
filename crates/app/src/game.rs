@@ -677,6 +677,14 @@ impl FrameAttribution {
                 front_end.total_ms
             ));
         }
+        // The upload's steps are the breakdown of the one cost the host
+        // section holds for the frame's texture uploads.
+        if let Some(upload) = self.report.upload_timings {
+            out.push_str(&format!(
+                "  upload create_ms={:.1} stage_ms={:.1} submit_ms={:.1} wait_ms={:.1}\n",
+                upload.create_ms, upload.stage_ms, upload.submit_ms, upload.wait_ms
+            ));
+        }
         out.push_str(&format!(
             "  residual tick_residual_ms={:.1} host_residual_ms={:.1} \
              unaccounted_ms={:.1} pool_jobs={}\n",
@@ -1688,6 +1696,12 @@ mod tests {
                 prune_ms: 0.1,
                 project_ms: 0.2,
                 render_ms: host_render_ms,
+                upload_timings: Some(render::UploadTimings {
+                    create_ms: 1.5,
+                    stage_ms: 2.5,
+                    submit_ms: 0.5,
+                    wait_ms: 0.3,
+                }),
                 ..StepReport::default()
             },
             Some(render::FrameTimings {
@@ -1816,6 +1830,11 @@ mod tests {
                 "unaccounted_ms=3.5 pool_jobs=2"
             ),),
             "the report names the residuals and the pool's jobs: {report}"
+        );
+        // The upload's steps are the breakdown of the host's upload cost.
+        assert!(
+            report.contains("upload create_ms=1.5 stage_ms=2.5 submit_ms=0.5 wait_ms=0.3"),
+            "the report breaks the upload down: {report}"
         );
         assert!(
             report.contains(concat!(
