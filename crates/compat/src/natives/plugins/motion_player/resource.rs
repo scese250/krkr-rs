@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use tjs::{DetachedValue, RetainedValue, TjsValue, VAL_OBJECT, Value};
 
@@ -18,6 +19,7 @@ use super::StoredValue;
 use super::emote::ModuleSettings;
 use super::helpers::{eval_object, inst_mut, set_retained};
 use super::model::MotionSnapshot;
+use crate::engine_api::{JobOutcome, JobValue, JobWork, PendingStorage, StorageReadError};
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
 use crate::natives::plugins::psb_file::container::{PsbDocument, PsbValue, parse_stream};
 use crate::natives::plugins::psb_file::media::{
@@ -276,8 +278,130 @@ fn register_motion_media(media: &PsbMedia, document: Rc<PsbDocument>, container:
     }
 }
 
+/// The parsed container and the snapshot built from it: the pure-data part
+/// of a module load.
+struct ParsedModule {
+    /// The parsed container.
+    document: PsbDocument,
+    /// The snapshot the module object is built from.
+    snapshot: MotionSnapshot,
+}
+
+/// The container's bytes: the ones a scheduled read produces, or the ones an
+/// extraction filter already transformed.
+#[derive(Clone)]
+enum ContainerBytes {
+    /// The read is scheduled on the storage's read pool: the worker waits
+    /// for the bytes.
+    Scheduled(PendingStorage),
+    /// The bytes are final: an extraction filter transformed them on the
+    /// frame thread, because the filter is script code.
+    Ready(Arc<[u8]>),
+}
+
+/// Parse the container's bytes and build the snapshot.
+///
+/// The parse and the snapshot build are pure data: they run on a worker when
+/// the pool takes the job, and on the calling thread when it does not.
+fn parse_module(
+    source: &ContainerBytes,
+    name: &str,
+    seed: i64,
+    container: &str,
+) -> Result<ParsedModule, String> {
+    let document = match source {
+        ContainerBytes::Scheduled(pending) => {
+            let bytes = pending
+                .await_bytes(name)
+                .map_err(|error| error.to_string())?;
+            parse_stream(&bytes, seed).map_err(|error| error.to_string())?
+        }
+        ContainerBytes::Ready(bytes) => {
+            parse_stream(bytes, seed).map_err(|error| error.to_string())?
+        }
+    };
+    let snapshot = MotionSnapshot::from_psb(&document, container);
+    Ok(ParsedModule { document, snapshot })
+}
+
+/// Parse the container's bytes into a module on the engine's job pool.
+///
+/// The parse and the snapshot build are pure data, so they run on a worker:
+/// the frame thread's own work is the object tree the module object is built
+/// from. The frame thread waits for the module, because the object the
+/// native returns must carry the container's members.
+fn load_parsed_module(
+    ctx: &CompatCtx,
+    source: ContainerBytes,
+    name: &str,
+    seed: i64,
+    container: &str,
+) -> Result<ParsedModule, String> {
+    // SAFETY: the host keeps the attached pool alive for the binding.
+    let pool = unsafe { ctx.services() }.decode_pool();
+    // SAFETY: the host keeps the attached pool alive for the binding.
+    let Some(pool) = pool.map(|pool| unsafe { &mut *pool }) else {
+        // No pool is attached: the container is parsed on the calling thread.
+        return parse_module(&source, name, seed, container);
+    };
+    // The bytes the job holds: the container's own size.
+    let charge = match &source {
+        ContainerBytes::Scheduled(pending) => pending.size().unwrap_or(0),
+        ContainerBytes::Ready(bytes) => bytes.len() as u64,
+    };
+    // The parsed module travels to the frame thread through a channel: the
+    // pool hands its own value out through a shared pointer, and the parsed
+    // container must move to the frame thread.
+    let (sender, receiver) = mpsc::channel::<Result<ParsedModule, String>>();
+    let job_source = source.clone();
+    let job_name = name.to_string();
+    let job_container = container.to_string();
+    let work: Arc<JobWork> = Arc::new(move || {
+        let parsed = parse_module(&job_source, &job_name, seed, &job_container);
+        if sender.send(parsed).is_err() {
+            // The frame thread is gone: the module goes with it.
+            log::warn!("compat.psb: the parsed module could not reach the frame thread");
+        }
+        Ok(JobValue::new(()))
+    });
+    match pool.submit_job(work, charge) {
+        Ok((_id, job)) => {
+            // The frame thread waits for this module, so a worker takes the
+            // job before a prefetch job.
+            job.demand();
+            match receiver.recv() {
+                Ok(parsed) => parsed,
+                // The worker stopped before it published the module: the
+                // pool's own outcome names the cause.
+                Err(_) => match job.await_ready() {
+                    JobOutcome::Failed(message) => Err(message),
+                    JobOutcome::Cancelled => {
+                        Err("motionplayer: the module load was cancelled".to_string())
+                    }
+                    JobOutcome::Ready(_) => {
+                        Err("motionplayer: the module load published no module".to_string())
+                    }
+                },
+            }
+        }
+        Err(error) => {
+            // The pool refused the job: the container is parsed on the
+            // calling thread, and the refusal is reported.
+            log::warn!(
+                "compat.psb: the job pool refused the module load ({error}); the container is parsed on the calling thread"
+            );
+            parse_module(&source, name, seed, container)
+        }
+    }
+}
+
 /// Read and parse the PSB at `path`, register the snapshot and its module
 /// object in the engine store, and return both plus the module handle.
+///
+/// The container's bytes, its parse and the snapshot are pure data: the read
+/// runs on the storage's read pool and the parse on the engine's job pool,
+/// so the frame thread's own work is the object tree the module object is
+/// built from.
 ///
 /// `Ok(None)` means nothing is mounted at `path`; a mounted file that cannot
 /// be read or parsed is an error.
@@ -299,17 +423,30 @@ pub(crate) fn read_motion_module(
         Ok(None) => return Ok(None),
         Err(error) => return Err(error.to_string()),
     }
-    let bytes = storage.read(name).map_err(|error| error.to_string())?;
-    let document = Rc::new(parse_stream(&bytes, seed).map_err(|error| error.to_string())?);
     let container = normalize_psb_domain(path);
+    // The container's bytes. The read is scheduled on the storage's read
+    // pool, so the archive decode is not the frame thread's work. An
+    // extraction filter transforms the decoded bytes with script code, and
+    // script code runs on the frame thread: a filtered container is
+    // therefore read here, and only its parse runs on the pool.
+    let source = if storage.xp3_extraction_filter.is_some() {
+        let bytes = storage.read(name).map_err(|error| error.to_string())?;
+        ContainerBytes::Ready(Arc::from(bytes))
+    } else {
+        let Some(pending) = storage.lookup(name).map_err(|error| error.to_string())? else {
+            return Err(StorageReadError::NotFound(name.to_string()).to_string());
+        };
+        ContainerBytes::Scheduled(pending)
+    };
+    let parsed = load_parsed_module(ctx, source, name, seed, &container)?;
+    let document = Rc::new(parsed.document);
     register_motion_media(&psb_media(services), Rc::clone(&document), &container);
     // The player reads the container's pixel chunks through the `psb://`
     // media, so the media must be served: install its provider with the
     // storage the container was read from. The media is shared with the
     // `psbfile` plugin, and both install the provider that serves it.
     install_psb_provider(services).map_err(|error| error.to_string())?;
-    let snapshot = MotionSnapshot::from_psb(&document, &container);
-    let id = services.state::<MotionStore>().insert(snapshot);
+    let id = services.state::<MotionStore>().insert(parsed.snapshot);
     let registered = {
         let store = services.state::<MotionStore>();
         store.get(id)

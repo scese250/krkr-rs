@@ -1349,7 +1349,27 @@ impl PendingStorage {
         lock(&self.shared.state).clone()
     }
 
-    /// Waits until the read produced a result and returns it.
+    /// Waits for the read and returns the bytes it produced.
+    ///
+    /// The bytes are the result of the read before the extraction filter:
+    /// the decoded bytes of an archive entry, or the bytes of a file. A
+    /// caller that needs the filtered bytes filters them itself, on the
+    /// thread the filter may run on.
+    ///
+    /// # Errors
+    ///
+    /// The typed error of the read, or [`StorageReadError::NoResult`] when
+    /// the read was cancelled before it produced a result.
+    pub fn await_bytes(&self, name: &str) -> Result<Vec<u8>, StorageReadError> {
+        let outcome = self.await_outcome();
+        match take_payload(outcome, name) {
+            Ok(StorageBytes::File(bytes)) => Ok(bytes),
+            Ok(StorageBytes::Archive { decoded, .. }) => Ok(decoded.bytes),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Waits until the read produced its result and returns it.
     ///
     /// The wait releases the lock while it sleeps, and a result published
     /// between the check and the sleep is not missed.

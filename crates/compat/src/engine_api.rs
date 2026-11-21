@@ -44,6 +44,9 @@ pub(crate) use engine::{
 // The resolved entries the compatibility layer resolves a name into: the
 // entry holds the read, and the storage reads it.
 pub(crate) use engine::storage::StorageEntry;
+// The scheduled storage read: the handle the bytes of a read land in, and
+// the outcome a waiter reads.
+pub(crate) use engine::storage::PendingStorage;
 
 // The image decode pool and the pending-image future the visual natives
 // submit decodes through and wait for: the pool the workers decode on, the

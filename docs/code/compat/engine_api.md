@@ -29,6 +29,8 @@ or `FontSystem` — it reaches the platform only through L2.
 |---|---|---|
 | the logical scene | `Scene`, `LayerState`, `BitmapState`, `FontState`, `Rect`, `DecodedImageKey`, `DecodedImageMode`, `TransitionFrame`, `HitCandidate` | the layer tree, the bitmap store, the font store, the decoded-image cache, the frame a composited transition draws, and the pixels a layer's pose shows (`Scene::read_pixels`) |
 | the storage namespace | `Storage`, `StorageEntry`, `Location`, `StorageReadError`, `StorageMedia`, `normalize_in_archive_name` | mounting, resolving and reading a script storage name, and serving the names a storage media owns |
+| the image decode pool | `DecodePool`, `PendingImage`, `DecodePass` | the pool the image loads decode on, the future a pending decode carries, and the pass a worker runs over the decoded pixels |
+| the job pool | `PendingJob`, `JobWork`, `JobOutcome`, `JobValue` | the handle a submitted job's result lands in, the closure a job performs, the value it produces and the outcome a waiter reads — the motion player's pixel chunks, and the deferred image write |
 | input | `InputState` | the generic pointer, key, button and touch state |
 | timers | `TimerState`, `TimerId`, `TimerCallback` | the L2 timer registry L3 arms and disarms |
 | the frame clock | `FrameClock` | the engine's time base: the value the timers, the sound poll and the transitions read |
@@ -73,6 +75,12 @@ The `raster` and `layer_ops` groups are nested modules so a call site reads
   knowing what a scheme's domain is made of. A provider's message crosses the
   seam unchanged (`StorageReadError::Media`): the domain's own wording is
   what the script sees.
+* **A deferred write adds no protocol item.** The image save's handle is the
+  engine's existing `PendingJob`, and the write runs on the engine's existing
+  job pool — the pool the decode path uses — so the seam carries nothing new.
+  The table of in-flight writes is the compatibility layer's own dispatch
+  state, and the readers that wait for a write are its own image path. See
+  [`resource.md`](resource.md) §3.
 
 ---
 
