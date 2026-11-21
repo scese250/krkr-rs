@@ -55,6 +55,24 @@ fn primary_layer(engine: &mut Engine, window: u32) -> u32 {
     layer
 }
 
+/// A layer that shows `bitmap`.
+///
+/// The copies on the device follow the layers, so a bitmap is copied while a
+/// layer shows it.
+fn layer_showing(engine: &mut Engine, window: u32, bitmap: u32) -> u32 {
+    let layer = engine.scene_mut().add_layer(window, None);
+    engine
+        .scene_mut()
+        .update_layer(layer, |layer| {
+            layer.rect = Rect::new(0, 0, 4, 4);
+            layer.visible = true;
+            layer.bitmap = Some(bitmap);
+            true
+        })
+        .expect("layer");
+    layer
+}
+
 /// A frame with nothing to show does not draw, and leaves the scene clean.
 #[test]
 fn an_idle_frame_leaves_the_scene_clean() {
@@ -357,23 +375,26 @@ fn a_pixel_write_arms_the_upload() {
     );
 }
 
-/// A scene with a few hundred bitmaps uploads only the ones whose pixels
-/// changed.
+/// A scene with a few hundred bitmaps copies only the ones a layer shows.
 ///
 /// The reference re-uploads a bitmap's texture only when the bitmap changed:
 /// the layer keeps an `ImageModified` flag
 /// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:373`) and the draw walk
 /// touches only the drawn nodes
-/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7127`).
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7127`). The copy on the
+/// device follows the layers the same way: the pixels of a bitmap nobody
+/// shows stay on the host.
 #[test]
-fn only_the_changed_bitmaps_are_uploaded() {
+fn only_the_shown_bitmaps_are_copied() {
     let mut engine = headless_engine((64, 64));
     let mut hook = NoopFrame;
+    let window = engine.scene_mut().add_window("t", (64, 64));
     let ids: Vec<u32> = (0..300)
         .map(|_| engine.scene_mut().add_bitmap(4, 4, vec![0u8; 4 * 4 * 4]))
         .collect();
-    // A new bitmap is dirty, so it would be uploaded; the case under test is
-    // the frame that uploads only what changed, so the bitmaps start clean.
+    // A new bitmap is dirty, so it would be copied; the case under test is
+    // the frame that copies only what a layer shows, so the bitmaps start
+    // clean.
     for id in &ids {
         assert!(
             engine.scene_mut().set_bitmap_clean(*id),
@@ -383,48 +404,49 @@ fn only_the_changed_bitmaps_are_uploaded() {
     engine.frame(0, &mut hook).expect("first frame");
     assert!(
         engine.textures().is_empty(),
-        "a bitmap whose pixels did not change is not uploaded"
+        "a bitmap nobody shows is not copied"
     );
 
-    // Three of them change; the rest stay as they are.
-    let changed = [ids[3], ids[150], ids[299]];
-    for id in changed {
-        engine
-            .scene_mut()
-            .bitmap_mut(id)
-            .expect("bitmap")
-            .mark_dirty();
+    // A layer shows three of them: the picture needs them, so they are
+    // copied.
+    let shown = [ids[3], ids[150], ids[299]];
+    for id in shown {
+        layer_showing(&mut engine, window, id);
     }
     engine.frame(16, &mut hook).expect("second frame");
 
     assert_eq!(
         engine.textures().len(),
-        changed.len(),
-        "only the changed bitmaps are uploaded"
+        shown.len(),
+        "only the shown bitmaps are copied"
     );
-    for id in &changed {
+    for id in &shown {
         assert!(
             engine.textures().contains_key(id),
-            "the changed bitmap is uploaded"
+            "the shown bitmap is copied"
         );
     }
 }
 
-/// The textures of the bitmaps that are gone are dropped, and the textures
-/// of the bitmaps that stay are kept.
+/// The copies of the bitmaps that are gone are dropped, and the copies of
+/// the bitmaps that stay are kept.
 ///
 /// The reference releases the image of a destroyed object
 /// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:515` —
 /// `tTJSNI_BaseLayer::Invalidate` deallocates the image).
 #[test]
-fn the_textures_of_removed_bitmaps_are_dropped() {
+fn the_copies_of_removed_bitmaps_are_dropped() {
     let mut engine = headless_engine((64, 64));
     let mut hook = NoopFrame;
+    let window = engine.scene_mut().add_window("t", (64, 64));
     let ids: Vec<u32> = (0..300)
         .map(|_| engine.scene_mut().add_bitmap(4, 4, vec![0u8; 4 * 4 * 4]))
         .collect();
+    for id in &ids {
+        layer_showing(&mut engine, window, *id);
+    }
     engine.frame(0, &mut hook).expect("first frame");
-    assert_eq!(engine.textures().len(), 300, "every new bitmap is uploaded");
+    assert_eq!(engine.textures().len(), 300, "every shown bitmap is copied");
 
     let removed = [ids[0], ids[7], ids[150]];
     for id in removed {
@@ -438,13 +460,13 @@ fn the_textures_of_removed_bitmaps_are_dropped() {
     for id in removed {
         assert!(
             !engine.textures().contains_key(&id),
-            "the texture of a removed bitmap is dropped"
+            "the copy of a removed bitmap is dropped"
         );
     }
     assert_eq!(
         engine.textures().len(),
         300 - removed.len(),
-        "the textures of the bitmaps that stay are kept"
+        "the copies of the bitmaps that stay are kept"
     );
 }
 
@@ -457,11 +479,13 @@ fn the_textures_of_removed_bitmaps_are_dropped() {
 fn a_frame_that_changes_nothing_leaves_nothing_to_upload() {
     let mut engine = headless_engine((64, 64));
     let mut hook = NoopFrame;
+    let window = engine.scene_mut().add_window("t", (64, 64));
     for _ in 0..300 {
-        engine.scene_mut().add_bitmap(4, 4, vec![0u8; 4 * 4 * 4]);
+        let id = engine.scene_mut().add_bitmap(4, 4, vec![0u8; 4 * 4 * 4]);
+        layer_showing(&mut engine, window, id);
     }
     engine.frame(0, &mut hook).expect("first frame");
-    assert_eq!(engine.textures().len(), 300, "every new bitmap is uploaded");
+    assert_eq!(engine.textures().len(), 300, "every shown bitmap is copied");
 
     engine.frame(16, &mut hook).expect("second frame");
     assert!(

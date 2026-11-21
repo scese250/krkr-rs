@@ -319,6 +319,29 @@ impl LayerState {
     pub fn drawn_image(&self) -> Option<u32> {
         self.transition_self.or(self.bitmap)
     }
+
+    /// The bitmaps this layer holds.
+    ///
+    /// A layer holds its main image, the bitmap its subtree is cached in, the
+    /// content that subtree composites into, the self image a running
+    /// transition blends and the sources its effect draw samples. The list
+    /// is the layer's own: it is what the engine's copies of the bitmaps
+    /// follow.
+    pub fn held_bitmaps(&self) -> impl Iterator<Item = u32> + '_ {
+        // The effect's sources are collected first: the iterator they come
+        // from borrows the effect, so they are owned before the chain is
+        // built.
+        let effect: Option<Vec<u32>> = self
+            .effect
+            .as_ref()
+            .map(|effect| effect.bitmaps().collect());
+        self.bitmap
+            .into_iter()
+            .chain(self.cache_bitmap)
+            .chain(self.cache_content)
+            .chain(self.transition_self)
+            .chain(effect.into_iter().flatten())
+    }
 }
 
 /// One layer a hit test accepted, with the point in the layer's own
@@ -980,6 +1003,13 @@ pub struct Scene {
     /// A source is not a layer image, so the frame does not upload it: the
     /// backend that draws a list uploads the sources it draws from.
     draw_textures: Map<u32, Texture>,
+    /// The textures of the draw sources that were released.
+    ///
+    /// A source is per-frame content: the pose that registered it replaces
+    /// the one before it, and the source goes with it. The scene cannot free
+    /// a texture — the engine owns the device — so it hands the released
+    /// ones over and the engine drops them.
+    released_draw_textures: Vec<Texture>,
     /// The device work the compatibility layer asked for.
     ///
     /// The requests are the compatibility layer's device work: the composite
@@ -1139,6 +1169,7 @@ impl Default for Scene {
             pose_revisions: crate::hasher::map(),
             pose_pixels: crate::hasher::map(),
             draw_textures: crate::hasher::map(),
+            released_draw_textures: Vec::new(),
             device_requests: Vec::new(),
             device_present: false,
             host_draws_lists: false,
@@ -1951,8 +1982,8 @@ impl Scene {
         let before = self.layer(id).map(|layer| (layer.rect, layer.parent));
         let changed = f(self.layer_mut_untracked(id)?);
         if changed {
-            self.mark_layer_changed(id);
             let after = self.layer(id).map(|layer| (layer.rect, layer.parent));
+            self.mark_layer_changed(id);
             // A layer that moved leaves its old place and its new one to
             // redraw in the parent: the parent's region holds both, so the
             // parent is marked before and after the move.
@@ -3873,16 +3904,23 @@ impl Scene {
     /// Whether any live layer still references `id` as its MainImage, its
     /// subtree cache, its transition self image or a source of its effect draw.
     pub fn bitmap_referenced_by_layer(&self, id: u32) -> bool {
-        self.layers.iter().any(|layer| {
-            layer.bitmap == Some(id)
-                || layer.cache_bitmap == Some(id)
-                || layer.cache_content == Some(id)
-                || layer.transition_self == Some(id)
-                || layer
-                    .effect
-                    .as_ref()
-                    .is_some_and(|effect| effect.bitmaps().any(|bitmap| bitmap == id))
-        })
+        self.layers
+            .iter()
+            .any(|layer| layer.held_bitmaps().any(|held| held == id))
+    }
+
+    /// The bitmaps the live layers hold.
+    ///
+    /// The engine keeps a copy of these bitmaps on the device and gives the
+    /// copies of the others back, so the copies follow the layers and not
+    /// the assets the game has shown. The set is the scene's own answer to
+    /// "which bitmaps does the picture need".
+    pub(crate) fn held_bitmaps(&self) -> Set<u32> {
+        let mut held = set();
+        for layer in &self.layers {
+            held.extend(layer.held_bitmaps());
+        }
+        held
     }
 
     /// Register one consumer that needs this layer's subtree rendered into
@@ -4409,9 +4447,17 @@ impl Scene {
 
     /// Releases a source no draw list reads any more.
     ///
+    /// The source's texture goes with it: the copy of the pixels of a source
+    /// nobody draws any more is not needed, and the descriptor set it holds
+    /// is the device's scarcest resource.
+    ///
     /// Returns whether the source was there.
     pub fn release_draw_source(&mut self, id: u32) -> bool {
-        self.draw_sources.remove(&id).is_some()
+        let released = self.draw_sources.remove(&id).is_some();
+        if let Some(texture) = self.draw_textures.remove(&id) {
+            self.released_draw_textures.push(texture);
+        }
+        released
     }
 
     /// Releases every source the `keep` list does not name.
@@ -4419,8 +4465,33 @@ impl Scene {
     /// The sources a pose registers are per-frame content: the tinted icons
     /// the cache holds and the surfaces the pose composited. The caller
     /// passes the ids that are still live, and the rest of the table goes.
+    ///
+    /// The textures of the released sources go with them: a copy of pixels
+    /// no draw list reads any more is not needed, and the descriptor set it
+    /// holds is the device's scarcest resource. The scene cannot free a
+    /// texture — the engine owns the device — so the released ones are
+    /// handed over with [`Self::take_released_draw_textures`].
     pub fn prune_draw_sources(&mut self, keep: &[u32]) {
         self.draw_sources.retain(|id, _| keep.contains(id));
+        let released: Vec<u32> = self
+            .draw_textures
+            .keys()
+            .copied()
+            .filter(|id| !keep.contains(id))
+            .collect();
+        for id in released {
+            if let Some(texture) = self.draw_textures.remove(&id) {
+                self.released_draw_textures.push(texture);
+            }
+        }
+    }
+
+    /// The textures of the draw sources that were released.
+    ///
+    /// The engine takes them and drops them: the scene holds no device, so
+    /// it cannot free a texture itself.
+    pub fn take_released_draw_textures(&mut self) -> Vec<Texture> {
+        std::mem::take(&mut self.released_draw_textures)
     }
 
     /// Replaces the draw list the layer's image is composed from.
@@ -5000,10 +5071,15 @@ impl Scene {
     /// just created, because the rest of a new texture is undefined until
     /// its first copy. Marking the bitmap wholly keeps a retry of that
     /// upload whole as well.
+    ///
+    /// The bitmap is dirty afterwards, whether it was before or not: the
+    /// copy it has on the device holds nothing yet, and a bitmap that is not
+    /// dirty is not uploaded again.
     pub fn mark_bitmap_whole(&mut self, id: u32) -> bool {
         let Some(bitmap) = self.bitmap_record_mut(id) else {
             return false;
         };
+        bitmap.dirty = true;
         bitmap.dirty_region = None;
         self.dirty_bitmaps.insert(id);
         true

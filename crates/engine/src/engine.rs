@@ -37,18 +37,14 @@ use api::geometry::PixelRegion;
 use api::host::{PresentSkip, Presentation, SurfaceEvent};
 use render::{
     BackendKind, FrameStats, FrameTimings, RenderNode, RenderPipeline, RenderScene, RenderState,
-    RenderTarget, RenderTargetDesc, Surface, Texture, TextureDesc, TextureUpload,
+    RenderTarget, RenderTargetDesc, Surface, Texture, TextureDesc, TextureFilter, TextureUpload,
     UploadTimings, create_render_target, create_texture, destroy_render_target, drop_texture,
     last_frame_timings, last_upload_timings, read_render_target, recover_surface, render,
     render_to_target, resize as resize_render, supports_effect_pipelines, upload_textures,
-    RenderTarget, RenderTargetDesc, Surface, Texture, TextureDesc, TextureFilter, TextureUpload,
-    create_render_target, create_texture, destroy_render_target, drop_texture, last_frame_timings,
-    read_render_target, recover_surface, render, render_to_target, resize as resize_render,
-    supports_effect_pipelines, upload_textures,
 };
 
 use crate::clock::{FrameClock, FrameTimeSource, InjectedFrameTime};
-use crate::hasher::{Map, map};
+use crate::hasher::{Map, Set, map, set};
 use crate::imagedecode::{DecodePool, ImageDecoder};
 use crate::jobpool::{JobPoolConfig, JobPoolError, JobStats};
 use crate::projection::{ProjectionReport, project_scene_report};
@@ -1906,16 +1902,55 @@ impl Engine {
     /// A bitmap that changed in a rectangle uploads that rectangle alone;
     /// one that changed wholly uploads every pixel.
     ///
+    /// The copies the device holds follow the layers: a bitmap no layer
+    /// holds has no copy on the device, so its pixels stay on the host and
+    /// the copy is made when a layer shows it. The copies the device holds
+    /// are the ones the picture needs, and the descriptor set each of them
+    /// takes is the pool's scarcest resource.
+    ///
     /// The costs of the upload are returned when the backend measured them,
     /// so the frame's report can name where the upload's time went.
     fn sync_dirty_bitmaps(&mut self) -> Option<UploadTimings> {
-    fn sync_dirty_bitmaps(&mut self) {
-    ///
-    /// are the ones the picture needs, and the descriptor set each of them
-    ///
-    /// so the frame's report can name where the upload's time went.
         let dirty: Vec<u32> = self.scene.dirty_bitmaps_for_upload();
+        // The bitmaps the layers hold: the copies the picture needs.
+        let held = self.scene.held_bitmaps();
+        // The bitmaps a layer holds whose copy is gone: the copy is made
+        // again, and the whole bitmap is uploaded into it.
+        let missing: Vec<u32> = held
+            .iter()
+            .copied()
+            .filter(|id| !self.device.textures.contains_key(id))
+            .collect();
+
+        let mut candidates: Vec<u32> = Vec::with_capacity(dirty.len() + missing.len());
+        let mut seen: Set<u32> = set();
         for id in dirty {
+            if !held.contains(&id) {
+                // The bitmap is not shown: its pixels stay on the host, and
+                // the copy is made when a layer shows the bitmap.
+                self.scene.set_bitmap_clean(id);
+                continue;
+            }
+            if seen.insert(id) {
+                candidates.push(id);
+            }
+        }
+        for id in missing {
+            // A bitmap that is still decoding has no pixels to upload: the
+            // decode lands them and the upload sends them then.
+            if self
+                .scene
+                .bitmap(id)
+                .is_some_and(|bitmap| bitmap.pending.is_some())
+            {
+                continue;
+            }
+            if seen.insert(id) {
+                candidates.push(id);
+            }
+        }
+
+        let mut ready: Vec<u32> = Vec::with_capacity(candidates.len());
         for id in candidates {
             let Some((width, height, len)) = self
                 .scene
@@ -1966,7 +2001,9 @@ impl Engine {
                     }
                     Err(error) => {
                         log::warn!(
-                            "engine.scene: failed to create a texture for bitmap id={id}: {error}"
+                            "engine.scene: failed to create a texture for bitmap id={id}: \
+                             {error}; the device holds {} copies",
+                            self.device.textures.len()
                         );
                         continue;
                     }
@@ -1985,23 +2022,6 @@ impl Engine {
             let Some(bitmap) = self.scene.bitmap(*id) else {
                 continue;
             };
-            // The costs of the batch that was just submitted, read right after
-            // the call: the value describes this batch and not an earlier one.
-            // A batch with no uploads submits nothing, so there is nothing to
-            // measure.
-            let timings = if uploads.is_empty() {
-                None
-            } else {
-                last_upload_timings(&self.render_state)
-            };
-            drop(uploads);
-            // The uploaded pixels are the ones the layers drawing the bitmap
-            // show, so the picture changed.
-            self.scene.mark_dirty();
-            clear_uploaded_dirty(&mut self.scene, &ready, uploaded);
-            Some(timings)
-        } else {
-            None
             let (region, pixels) = dirty_upload(bitmap);
             planned.push((*id, region, pixels));
         }
@@ -2047,6 +2067,7 @@ impl Engine {
         let timings = if uploads.is_empty() {
             None
         } else {
+            last_upload_timings(&self.device.state)
         };
         drop(uploads);
         // The uploaded pixels are the ones the layers drawing the bitmap
@@ -2072,8 +2093,10 @@ impl Engine {
         }
         // The copies of the bitmaps no layer holds any more: a bitmap nobody
         // shows needs no copy on the device, and the descriptor set each
+        // copy holds is the pool's scarcest resource. The copy of a bitmap
         // that is shown again is made again, and the whole bitmap is
         // uploaded into it.
+        let held = self.scene.held_bitmaps();
         let stale: Vec<u32> = self
             .device
             .textures
@@ -2202,20 +2225,16 @@ fn clear_uploaded_dirty(scene: &mut Scene, uploaded: &[u32], succeeded: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Engine, EngineParts, FrameTarget, GameFrame, PresentFault, PresentationStall, Scene,
-        StallAge, StallCause, StallSummary, add_upload_timings, clear_uploaded_dirty,
-        describe_stall_causes, present_outcome, reported_surface_size,
         Engine, EngineParts, FrameTarget, GameFrame, PixelTranslation, PresentFault,
         PresentationStall, RenderPolicy, Scene, StallAge, StallCause, StallSummary,
         add_upload_timings, clear_uploaded_dirty, describe_stall_causes, present_outcome,
         reported_surface_size,
     };
+    use crate::Rect;
     use crate::hasher::{Map, map};
     use api::geometry::PixelRegion;
     use api::host::{PresentSkip, Presentation, SurfaceEvent};
     use render::{
-        NullRenderPipeline, PipelineConfig, UploadTimings, begin_render_state,
-        create_render_pipeline,
         NullRenderPipeline, PipelineConfig, RenderContent, RenderNode, RenderPipeline, Texture,
         TextureDesc, UploadTimings, begin_render_state, create_render_pipeline, create_texture,
     };
@@ -2538,32 +2557,6 @@ mod tests {
         assert!(!scene.bitmap(id).expect("bitmap").dirty);
     }
 
-    /// The frame uploads its dirty bitmaps twice, so the frame's report holds
-    /// the sum of the two batches. A backend that measured only one of them
-    /// contributes that one.
-    #[test]
-    fn the_frame_reports_the_sum_of_its_two_uploads() {
-        let first = UploadTimings {
-            create_ms: 1.0,
-            stage_ms: 2.0,
-            submit_ms: 3.0,
-            wait_ms: 4.0,
-        };
-        let second = UploadTimings {
-            create_ms: 10.0,
-            stage_ms: 20.0,
-            submit_ms: 30.0,
-            wait_ms: 40.0,
-        };
-        let sum = add_upload_timings(Some(first), Some(second)).expect("both measured");
-        assert_eq!(sum.create_ms, 11.0);
-        assert_eq!(sum.stage_ms, 22.0);
-        assert_eq!(sum.submit_ms, 33.0);
-        assert_eq!(sum.wait_ms, 44.0);
-
-        assert!(add_upload_timings(None, None).is_none(), "no measurement");
-        let only = add_upload_timings(None, Some(second)).expect("one measured");
-        assert_eq!(only.stage_ms, 20.0);
     /// The device composite of a layer's subtree: the tree is drawn on the
     /// device into a surface of the content's size, and the release drops
     /// that surface.
@@ -2718,6 +2711,34 @@ mod tests {
             pixels.chunks(4).any(|pixel| *pixel != [0, 0, 0, 0]),
             "the CPU composite drew the tree the device refused"
         );
+    }
+
+    /// The frame uploads its dirty bitmaps twice, so the frame's report holds
+    /// the sum of the two batches. A backend that measured only one of them
+    /// contributes that one.
+    #[test]
+    fn the_frame_reports_the_sum_of_its_two_uploads() {
+        let first = UploadTimings {
+            create_ms: 1.0,
+            stage_ms: 2.0,
+            submit_ms: 3.0,
+            wait_ms: 4.0,
+        };
+        let second = UploadTimings {
+            create_ms: 10.0,
+            stage_ms: 20.0,
+            submit_ms: 30.0,
+            wait_ms: 40.0,
+        };
+        let sum = add_upload_timings(Some(first), Some(second)).expect("both measured");
+        assert_eq!(sum.create_ms, 11.0);
+        assert_eq!(sum.stage_ms, 22.0);
+        assert_eq!(sum.submit_ms, 33.0);
+        assert_eq!(sum.wait_ms, 44.0);
+
+        assert!(add_upload_timings(None, None).is_none(), "no measurement");
+        let only = add_upload_timings(None, Some(second)).expect("one measured");
+        assert_eq!(only.stage_ms, 20.0);
     }
 
     #[test]
