@@ -96,8 +96,9 @@ pub enum TextError {
     },
     /// The host's font directories could not be read.
     ///
-    /// The scan that reads them failed, so the host's faces are unknown and
-    /// no face can be resolved from them.
+    /// The scan that reads them failed and the read that followed it failed
+    /// too, so the host's faces are unknown and no face can be resolved from
+    /// them.
     #[error("the host's font scan failed: {message}")]
     HostFontScan {
         /// Human-readable description of the failure.
@@ -924,8 +925,8 @@ impl TextEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`TextError::HostFontScan`] when the scan failed, so the
-    /// host's faces are unknown.
+    /// Returns [`TextError::HostFontScan`] when the scan failed and the
+    /// directories could not be read either.
     fn system_database(&mut self) -> Result<Arc<HostFontDatabase>, TextError> {
         if let Some(scanned) = self.system_fonts.as_ref() {
             return Ok(Arc::clone(scanned));
@@ -963,26 +964,52 @@ impl TextEngine {
     /// A text service whose host selected no roles has no scan: the
     /// directories are read here, on the thread that asked for a face.
     ///
+    /// A scan that failed does not leave the host's faces unknown: the scan
+    /// is an eager read of the directories, and a read that failed is read
+    /// again here, on the thread that asks. The failure is reported, and the
+    /// read is guarded, so a font database that fails twice is a typed error
+    /// and not a process that ends.
+    ///
     /// # Errors
     ///
-    /// Returns [`TextError::HostFontScan`] when the scan failed, so the
-    /// host's faces are unknown.
+    /// Returns [`TextError::HostFontScan`] when the scan failed and the
+    /// directories could not be read either.
     fn host_scan_database(&mut self) -> Result<Arc<HostFontDatabase>, TextError> {
         let Some(scan) = self.host_scan.as_ref() else {
-            return Ok(Arc::new(scan_host_faces(&self.system_font_dirs)));
+            return self.read_host_faces();
         };
         let mut state = lock_host_scan(&scan.shared);
         loop {
             if let HostScanState::Failed(message) = &*state {
-                return Err(TextError::HostFontScan {
-                    message: message.clone(),
-                });
+                let message = message.clone();
+                drop(state);
+                log::warn!(
+                    "engine.text: the host's system font scan failed: {message}; \
+                     the font directories are read again"
+                );
+                return self.read_host_faces();
             }
             if let HostScanState::Ready(database) = &*state {
                 return Ok(Arc::clone(database));
             }
             // The scan has not published its result: wait for it.
             state = wait_host_scan(&scan.ready, state);
+        }
+    }
+
+    /// Reads the host's font directories on the thread that asks for a face.
+    ///
+    /// The read is guarded: a font database that panics is reported as
+    /// [`TextError::HostFontScan`] instead of ending the process.
+    fn read_host_faces(&self) -> Result<Arc<HostFontDatabase>, TextError> {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scan_host_faces(&self.system_font_dirs)
+        }));
+        match result {
+            Ok(database) => Ok(Arc::new(database)),
+            Err(payload) => Err(TextError::HostFontScan {
+                message: panic_message(payload),
+            }),
         }
     }
 
@@ -1165,7 +1192,7 @@ impl TextEngine {
     }
 
     /// Registers the engine's default face: the first of `families` the host
-    /// provides.
+    /// provides, or one of the host's own faces when none of them resolves.
     ///
     /// The default face is the oldest registered face, so it is the face a
     /// face name that resolves to nothing takes its metrics from. The host's
@@ -1173,25 +1200,77 @@ impl TextEngine {
     /// own default font is the default face; a registry that already holds a
     /// face keeps it.
     ///
+    /// The families are a preference, not a requirement. A host whose fonts
+    /// are named differently still has a default face: the engine registers
+    /// one of the host's own faces rather than losing the faces the scan
+    /// found.
+    ///
     /// # Errors
     ///
-    /// Returns [`TextError::FontNotFound`] when the host provides none of the
-    /// families, and propagates the registration errors of
-    /// [`TextEngine::add_font`].
+    /// Returns [`TextError::FontNotFound`] when the host provides neither one
+    /// of the families nor any face at all, [`TextError::HostFontScan`] when
+    /// the host's font directories could not be read, and propagates the
+    /// registration errors of [`TextEngine::add_font`].
     fn install_default_face(&mut self, families: &[String]) -> Result<FontId, TextError> {
         if let Some(default) = self.default_face_id() {
             return Ok(default);
         }
+        let mut failure: Option<TextError> = None;
         for family in families {
             match self.load_system_font(family) {
                 Ok(id) => return Ok(id),
+                // The host does not provide the family: the next one is tried.
                 Err(TextError::FontNotFound { .. }) => continue,
-                Err(error) => return Err(error),
+                // The host's faces could not be read: the failure is kept and
+                // the families that follow are still tried.
+                Err(error) => {
+                    failure = Some(error);
+                    continue;
+                }
             }
         }
-        Err(TextError::FontNotFound {
-            family: families.join(", "),
-        })
+        // The preferred families did not resolve: the host's own face is the
+        // default face.
+        match self.install_host_face() {
+            Ok(Some(id)) => Ok(id),
+            Ok(None) => Err(failure.unwrap_or(TextError::FontNotFound {
+                family: families.join(", "),
+            })),
+            Err(error) => Err(failure.unwrap_or(error)),
+        }
+    }
+
+    /// Registers one of the host's own faces, as the engine's default face.
+    ///
+    /// The host's preferred families are a preference; the host's own faces
+    /// are the fallback. A host whose fonts are named differently than the
+    /// families the engine asked for therefore still has a default face.
+    ///
+    /// A face the rasterizer cannot load is passed over, so a host that
+    /// carries one unusable face still gets a default face from the next face
+    /// it carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TextError::HostFontScan`] when the host's font directories
+    /// could not be read.
+    fn install_host_face(&mut self) -> Result<Option<FontId>, TextError> {
+        let scanned = self.system_database()?;
+        let system = &scanned.database;
+        for face in system.faces() {
+            let Some((bytes, index)) =
+                system.with_face_data(face.id, |data, index| (data.to_vec(), index))
+            else {
+                continue;
+            };
+            let Ok(face) = render::load_font(&self.render_system, &bytes, index) else {
+                continue;
+            };
+            if let Ok(id) = self.register_face(&bytes, index, face) {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 
     /// Registers the face the per-character fallback reaches for: the first
@@ -3301,6 +3380,108 @@ mod tests {
             scan_thread,
             std::thread::current().id(),
             "the host font scan must not run on the thread that asks for a face"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A host whose fonts are not named like the families the engine asked
+    /// for still has a default face: the engine registers one of the host's
+    /// own faces instead of losing the faces the scan found.
+    ///
+    /// The reference's default font is one of the fonts its enumeration found
+    /// (`reference/krkr2/cpp/core/visual/FontImpl.cpp:227-229`), so the name
+    /// a host gives its fonts is a preference, not a requirement: a host that
+    /// names its fonts differently still draws text.
+    #[test]
+    fn a_host_face_the_preferred_families_miss_is_still_the_default_face() {
+        let Some((dir, family)) = explicit_font_dir_fixture() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        engine.set_system_font_dirs(vec![dir.clone()]);
+        // The host's fonts are named something the engine did not ask for.
+        engine.set_host_faces(vec!["a-family-the-host-does-not-have".to_owned()], 'A');
+        let default = engine
+            .default_face()
+            .expect("the host's own face is the default face");
+        assert!(
+            engine.registry().face(default).is_some(),
+            "the default face must be registered"
+        );
+        // The face is usable: it measures a text.
+        assert!(
+            engine
+                .measure_text(default, "A", &TextStyle::new(24.0))
+                .is_ok(),
+            "the default face must measure a text"
+        );
+        // The exact query stays exact: a family the host does not provide is
+        // still reported as absent.
+        let missing = engine.load_system_font("a-family-the-host-does-not-have");
+        assert!(
+            matches!(missing, Err(TextError::FontNotFound { .. })),
+            "an absent family must report its absence: {missing:?}"
+        );
+        // The host's own faces are reachable under their own names.
+        assert!(
+            engine.load_system_font(&family).is_ok(),
+            "the host's own family must resolve"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The family the host was asked for is the default face when the host
+    /// has it: the host's own face is the fallback, not the rule.
+    #[test]
+    fn the_preferred_family_is_the_default_face_when_the_host_has_it() {
+        let Some((dir, family)) = explicit_font_dir_fixture() else {
+            return;
+        };
+        if family.is_empty() {
+            return;
+        }
+        let mut engine = TextEngine::new();
+        engine.set_system_font_dirs(vec![dir.clone()]);
+        engine.set_host_faces(vec![family.clone()], 'A');
+        let default = engine.default_face().expect("the host's default face");
+        assert_eq!(
+            engine.family_name(default),
+            Some(family.as_str()),
+            "the preferred family must be the default face"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scan that failed does not take the host's faces away: the font
+    /// directories are read again on the thread that asks, the way a text
+    /// service without a scan reads them.
+    ///
+    /// The scan is an eager read of the host's font directories; a read that
+    /// failed in the background must not leave the engine without the host's
+    /// faces, or a failure in the background read ends the game over a font
+    /// the host does have.
+    #[test]
+    fn a_failed_scan_reads_the_font_directories_again() {
+        let Some((dir, family)) = explicit_font_dir_fixture() else {
+            return;
+        };
+        let mut engine = TextEngine::new();
+        engine.set_system_font_dirs(vec![dir.clone()]);
+        engine.set_host_faces(vec![family.clone()], 'A');
+        // The scan publishes its result, and the state is then marked as
+        // failed: that is what a failed scan leaves behind.
+        let scan = engine.host_scan.as_ref().expect("the scan is running");
+        let mut state = lock_host_scan(&scan.shared);
+        while !matches!(&*state, HostScanState::Ready(_)) {
+            state = wait_host_scan(&scan.ready, state);
+        }
+        *state = HostScanState::Failed("the scan panicked".to_owned());
+        drop(state);
+        // The failed scan does not take the host's faces away.
+        let resolved = engine.load_system_font(&family);
+        assert!(
+            resolved.is_ok(),
+            "the host's face must resolve after a failed scan: {resolved:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
