@@ -602,6 +602,20 @@ impl AutoPathTable {
     }
 }
 
+/// The listing of one directory: its entries and the moment it was read.
+struct DirectoryListing {
+    /// The directory's entries: the name and whether the entry is a
+    /// directory.
+    entries: Vec<(String, bool)>,
+    /// The directory's modification time when the listing was read.
+    ///
+    /// A directory's modification time moves when an entry is added or
+    /// removed, so it says whether the listing still describes the
+    /// directory. `None` when the directory has no readable modification
+    /// time: such a listing is read again on every probe.
+    modified_ms: Option<u64>,
+}
+
 /// The per-storage resolver cache.
 struct ResolutionCache {
     /// Candidate tables keyed by the auto-path entry string.
@@ -609,6 +623,14 @@ struct ResolutionCache {
     /// Resolved hits keyed by the requested storage name: a hit is cached, a
     /// miss is not.
     placed: crate::hasher::Map<String, Location>,
+    /// The listing of each directory the resolver has read, keyed by the
+    /// directory's path.
+    ///
+    /// The listing is the storage's own view of the directory, and one
+    /// listing serves every probe that needs the directory's contents: a
+    /// name looked up under twenty-two extensions reads the directory once,
+    /// not twenty-two times.
+    listings: crate::hasher::Map<PathBuf, Rc<DirectoryListing>>,
     /// Bottom file-system probes issued while resolving.
     probes: ProbeCounts,
     /// Entry bytes decoded and returned by `read`/`read_prefix`.
@@ -620,6 +642,7 @@ impl Default for ResolutionCache {
         Self {
             auto_paths: crate::hasher::map(),
             placed: crate::hasher::map(),
+            listings: crate::hasher::map(),
             probes: ProbeCounts::default(),
             read_bytes: 0,
         }
@@ -2307,7 +2330,7 @@ impl Storage {
         self.resolution_cache.borrow().read_bytes
     }
 
-    /// Drops the cached auto-path tables.
+    /// Drops the cached auto-path tables and the directory listings.
     ///
     /// Call when the auto-path list or the mounted archives change; the probe
     /// counters are kept so the diagnostic survives an invalidation.
@@ -2315,9 +2338,20 @@ impl Storage {
         let cache = self.resolution_cache.get_mut();
         cache.auto_paths.clear();
         cache.placed.clear();
+        cache.listings.clear();
         // The resolution changed, so a read that was scheduled against the
         // old one must not be served to a caller that resolves now.
         self.generation = self.generation.saturating_add(1);
+    }
+
+    /// Drops the listings of the directories the resolver has read.
+    ///
+    /// The listing of a directory is the storage's own view of it, and it
+    /// is kept until the directory changes. A host that writes a file into
+    /// the disk namespace drops the listings, so the next probe of that
+    /// name finds the file.
+    pub fn invalidate_disk_listings(&self) {
+        self.resolution_cache.borrow_mut().listings.clear();
     }
 
     /// Resolves a storage name into the entry it names, without reading it.
@@ -2940,16 +2974,59 @@ impl Storage {
         }
     }
 
-    /// The live listing of `dir`, enumerating it on every call.
+    /// The listing of `dir`: the directory's entries.
     ///
-    /// The case-insensitive lookup and the case-corrected host path both
-    /// walk the real directory with a live `opendir`/`readdir` on every call,
-    /// so the listing is never cached: a script that creates a directory and
-    /// then resolves it case-insensitively must see it. The auto-path
-    /// candidate
-    /// table is cached separately, so a repeat auto-path lookup still lists
-    /// nothing.
-    fn directory_listing(&self, dir: &Path) -> Result<Vec<(String, bool)>, StorageReadError> {
+    /// The listing is the storage's own view of the directory, and one
+    /// listing serves every probe that needs the directory's contents: a
+    /// name looked up under twenty-two extensions reads the directory once,
+    /// not twenty-two times.
+    ///
+    /// The listing is kept until the directory changes. The directory's
+    /// modification time moves when an entry is added or removed, so a
+    /// listing whose time differs from the directory's is stale and the
+    /// directory is read again; a directory with no readable modification
+    /// time is read again on every probe. A host that writes into the
+    /// namespace drops the listings itself
+    /// ([`Self::invalidate_disk_listings`]), so a file the game wrote is
+    /// found by the next probe.
+    fn directory_listing(&self, dir: &Path) -> Result<Rc<DirectoryListing>, StorageReadError> {
+        let modified = self.directory_modified_ms(dir)?;
+        let cached = self.resolution_cache.borrow().listings.get(dir).cloned();
+        if let Some(listing) = cached
+            && let Some(modified) = modified
+            && listing.modified_ms == Some(modified)
+        {
+            return Ok(listing);
+        }
+        let entries = self.read_directory_listing(dir)?;
+        let listing = Rc::new(DirectoryListing {
+            entries,
+            modified_ms: modified,
+        });
+        self.resolution_cache
+            .borrow_mut()
+            .listings
+            .insert(dir.to_path_buf(), Rc::clone(&listing));
+        Ok(listing)
+    }
+
+    /// The directory's modification time, or `None` when it has none.
+    ///
+    /// A directory's modification time moves when an entry is added or
+    /// removed, so it says whether a listing still describes the directory.
+    /// A directory that does not exist has no time, and neither has one
+    /// whose modification time the file system does not report.
+    fn directory_modified_ms(&self, dir: &Path) -> Result<Option<u64>, StorageReadError> {
+        self.resolution_cache.borrow_mut().probes.stat += 1;
+        match fs::stat(&self.fs, &FsPath::host(dir)) {
+            Ok(meta) => Ok(meta.modified_ms),
+            Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => Ok(None),
+            Err(error) => Err(StorageReadError::Fs(error)),
+        }
+    }
+
+    /// Reads the directory's entries from the bottom file system.
+    fn read_directory_listing(&self, dir: &Path) -> Result<Vec<(String, bool)>, StorageReadError> {
         self.resolution_cache.borrow_mut().probes.list += 1;
         let entries = match fs::list(&self.fs, &FsPath::host(dir)) {
             Ok(entries) => entries,
@@ -3011,7 +3088,7 @@ impl Storage {
         let listing = self.directory_listing(&root)?;
         let mut exact = crate::hasher::map();
         let mut first_file = crate::hasher::map();
-        for (name, is_dir) in listing.iter() {
+        for (name, is_dir) in listing.entries.iter() {
             let key = name.to_ascii_lowercase();
             // The lower-cased spelling wins when both a lower-cased and a
             // mixed-case entry exist.
@@ -3308,13 +3385,13 @@ impl Storage {
             parts: &[&str],
         ) -> Result<Option<(PathBuf, bool)>, StorageReadError> {
             let want = parts[0];
-            let entries = storage.directory_listing(dir)?;
+            let listing = storage.directory_listing(dir)?;
             // Directories matching this component are collected and only
             // entered after every file at this level has been checked, so a
             // file directly at this level wins.
             let mut subdirs = Vec::new();
             let mut dir_match = None;
-            for (name, is_dir) in entries.iter() {
+            for (name, is_dir) in listing.entries.iter() {
                 if !name.eq_ignore_ascii_case(want) {
                     continue;
                 }
@@ -4668,5 +4745,84 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(loaded, "the archive image is read in the background");
+    }
+
+    /// A unique temporary directory, removed by the caller.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let mut base = std::env::temp_dir();
+        base.push(format!(
+            "krkr-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        base
+    }
+
+    /// The resolver reads a directory once: the probes of many names share
+    /// the listing of it, instead of opening the directory again for every
+    /// name.
+    ///
+    /// The reference walks the real directory for every name it resolves
+    /// (`reference/cpp/core/base/impl/StorageImpl.cpp:339-407`); the storage
+    /// keeps the listing of the directory and reads it again when the
+    /// directory changed.
+    #[test]
+    fn the_listing_of_a_directory_is_read_once_for_many_probes() {
+        let dir = unique_temp_dir("storage-listing");
+        std::fs::create_dir_all(&dir).expect("create the game directory");
+        let storage = Storage::mount_archives(
+            FileSystem::host(&dir),
+            dir.clone(),
+            std::iter::empty::<&str>(),
+        )
+        .expect("mount");
+
+        for index in 0..8 {
+            let name = format!("missing{index}.png");
+            assert!(
+                storage.find(&name).expect("find").is_none(),
+                "{name} must not resolve"
+            );
+        }
+        assert_eq!(
+            storage.probe_counts().list,
+            1,
+            "the eight probes share one listing of the directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file the host wrote into the namespace is found by the next probe:
+    /// the host drops the listings of the directories when it writes, so the
+    /// walk reads the directory again.
+    #[test]
+    fn a_file_the_host_wrote_is_found_after_the_listings_are_dropped() {
+        let dir = unique_temp_dir("storage-write");
+        std::fs::create_dir_all(&dir).expect("create the game directory");
+        let storage = Storage::mount_archives(
+            FileSystem::host(&dir),
+            dir.clone(),
+            std::iter::empty::<&str>(),
+        )
+        .expect("mount");
+
+        // The listing is warmed while the directory holds no file.
+        assert!(storage.find("out.png").expect("find").is_none());
+
+        // The host writes a file whose spelling differs from the name the
+        // script reads, so only the case-insensitive walk finds it.
+        std::fs::write(dir.join("Out.PNG"), b"image").expect("write the file");
+        storage.invalidate_disk_listings();
+
+        assert!(
+            storage.find("out.png").expect("find").is_some(),
+            "the file the host wrote is found"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
