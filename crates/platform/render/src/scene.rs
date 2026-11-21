@@ -192,6 +192,17 @@ pub struct RenderScene {
     pub nodes: Vec<RenderNode>,
     /// Optional background clear colour `[r, g, b, a]`.
     pub background: Option<[f32; 4]>,
+    /// The part of the target the scene writes.
+    ///
+    /// `None` writes the whole target: the render clears it and draws over
+    /// it. `Some(region)` writes that rectangle alone: the target keeps the
+    /// content it holds outside it, and the render's clear and its draws are
+    /// confined to the rectangle.
+    ///
+    /// The rectangle is the unit of reconstruction: a render that
+    /// reconstructs one part of a target writes that part alone, so the
+    /// target's other pixels cost nothing and stay as they are.
+    pub coverage: Option<PixelRegion>,
 }
 
 impl Default for RenderScene {
@@ -200,6 +211,7 @@ impl Default for RenderScene {
             root: RenderNodeId(0),
             nodes: Vec::new(),
             background: None,
+            coverage: None,
         }
     }
 }
@@ -211,6 +223,7 @@ impl RenderScene {
             root,
             nodes: Vec::new(),
             background: None,
+            coverage: None,
         }
     }
 
@@ -220,6 +233,7 @@ impl RenderScene {
             root: RenderNodeId(0),
             nodes: vec![RenderNode::default()],
             background: None,
+            coverage: None,
         }
     }
 

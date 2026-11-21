@@ -1436,6 +1436,7 @@ impl Engine {
         self.render_scene.nodes.clear();
         self.render_scene.root = projected.root;
         self.render_scene.background = projected.background;
+        self.render_scene.coverage = projected.coverage;
         self.render_scene.nodes.extend(projected.nodes);
 
         let root = self.render_scene.root;

@@ -21,7 +21,7 @@
 use ash::vk;
 
 use api::error::RenderError;
-use api::geometry::{Affine2, RectF};
+use api::geometry::{Affine2, PixelRegion, RectF};
 
 use super::pipelines::{PipelineResources, PipelineSet, Program, dst_blend_mode};
 use super::shaders::{DESTINATION_DESCRIPTOR, SOURCE_DESCRIPTOR, TABLES_DESCRIPTOR};
@@ -163,6 +163,7 @@ pub(crate) fn record_scene(
         snapshot,
         extent,
         scene,
+        coverage: coverage_scissor(scene.coverage, extent),
         cache: BindCache::default(),
     };
 
@@ -177,10 +178,7 @@ pub(crate) fn record_scene(
         );
     }
 
-    let full_scissor = vk::Rect2D {
-        offset: vk::Offset2D { x: 0, y: 0 },
-        extent,
-    };
+    let full_scissor = recorder.coverage;
     recorder.pass.begin();
     let result = match recorder.clear_target() {
         Ok(()) => recorder.visit(scene.root, root, 1.0, full_scissor, 0),
@@ -188,6 +186,32 @@ pub(crate) fn record_scene(
     };
     recorder.pass.end();
     result
+}
+
+/// The scissor a scene's coverage names, clipped to the target.
+///
+/// The whole target when the scene names no part of it.
+fn coverage_scissor(coverage: Option<PixelRegion>, extent: vk::Extent2D) -> vk::Rect2D {
+    let Some(coverage) = coverage else {
+        return vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+    };
+    let x1 = coverage.right().min(extent.width);
+    let y1 = coverage.bottom().min(extent.height);
+    let x0 = coverage.x.min(x1);
+    let y0 = coverage.y.min(y1);
+    vk::Rect2D {
+        offset: vk::Offset2D {
+            x: x0 as i32,
+            y: y0 as i32,
+        },
+        extent: vk::Extent2D {
+            width: x1.saturating_sub(x0),
+            height: y1.saturating_sub(y0),
+        },
+    }
 }
 
 /// Records the draw that presents a composed target over the surface.
@@ -336,6 +360,10 @@ struct Recorder<'a> {
     scene: &'a RenderScene,
     /// Target extent in device pixels.
     extent: vk::Extent2D,
+    /// The part of the target the scene writes, as a scissor.
+    ///
+    /// The whole target unless the scene names a part of it.
+    coverage: vk::Rect2D,
     /// The pipeline and descriptor set the command buffer has bound.
     cache: BindCache,
 }
@@ -346,11 +374,12 @@ impl Recorder<'_> {
     /// The render pass loads the attachment, so a render that follows another
     /// one keeps the earlier content; the target is cleared with a full-screen
     /// draw that replaces the colour instead.
+    ///
+    /// The clear covers the part of the target the scene writes: a scene that
+    /// writes one rectangle of the target leaves the target's other pixels as
+    /// they are.
     fn clear_target(&mut self) -> Result<(), RenderError> {
-        let scissor = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent: self.extent,
-        };
+        let scissor = self.coverage;
         self.draw_quad(QuadDraw {
             program: Program::Solid,
             blend: api::blend::BlendMode::Replace,
