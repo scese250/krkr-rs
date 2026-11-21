@@ -38,7 +38,8 @@ use crate::natives::system::{frame_clock_ms, tjs_string_to_real, value_as_bool};
 use crate::natives::tjsnum::tjs_string_to_integer;
 
 /// Per-transition state that is not part of the parent's `LayerTransition`:
-/// the script-driven update mode and the retained tick callback.
+/// the script-driven update mode, the retained tick callback and what the
+/// transition has already reported.
 #[derive(Default)]
 struct TransitionRuntimeState {
     entries: Map<u32, TransitionRuntime>,
@@ -47,6 +48,11 @@ struct TransitionRuntimeState {
 struct TransitionRuntime {
     self_update: bool,
     callback: Option<DetachedValue>,
+    /// Whether the cross-fade that stands in for a kind that cannot draw has
+    /// been reported.
+    cross_fade_reported: bool,
+    /// Whether a frame that was not drawn has been reported.
+    skipped_reported: bool,
 }
 
 /// `beginTransition(name [, withchildren [, transwith [, options]]])`.
@@ -229,6 +235,8 @@ extern "C" fn layer_begin_transition(
             TransitionRuntime {
                 self_update,
                 callback,
+                cross_fade_reported: false,
+                skipped_reported: false,
             },
         );
         Ok(())
@@ -320,7 +328,7 @@ fn bitmap_size(scene: &Scene, id: u32) -> Option<(u32, u32)> {
 /// `ttstr` hash key with no silent fallback in this port
 /// (`TVPFindTransHandlerProvider`, `reference/cpp/core/visual/TransIntf.cpp:296-299,331-341`
 /// — the reference falls back to `crossfade` with a message box on a miss;
-/// a typed error here).
+/// a reported fallback to the cross-fade here).
 ///
 /// An empty method name is the KAG default: a transition whose `method` is
 /// `""` (the `normal`/`500sec`/`300secNosync` entries in the game's
@@ -498,11 +506,17 @@ fn build_transition(
             }
             Ok(trans)
         }
-        other => Err(format!(
-            "Layer.beginTransition: unsupported transition {other:?} (supported: crossfade, \
-             scroll, universal, mask, wave, mosaic, turn, rotatezoom, rotatevanish, \
-             rotateswap, ripple)"
-        )),
+        other => {
+            // A name no provider answers is drawn as the cross-fade, the way
+            // the provider lookup falls back, and the fallback is reported.
+            log::warn!(
+                "compat.layer: an unknown transition is drawn as a cross-fade \
+                 transition={other} fallback=crossfade"
+            );
+            Ok(Trans::cross_fade(time()?)
+                .map_err(|error| error.to_string())?
+                .with_fallback())
+        }
     }
 }
 
@@ -1431,6 +1445,11 @@ fn dispatch_transition_completed(ctx: &crate::CompatCtx, dest: u32, src: u32) {
 /// A backend that can run effect pipelines takes neither route: the
 /// transition records the custom-shader draw the projection draws, and no
 /// bitmap is written at all.
+///
+/// A kind that cannot draw its frame is drawn as the cross-fade, and the
+/// fallback is reported. A frame whose sources are gone is not drawn, and
+/// that is reported as well: the transition keeps its place, and the layer
+/// shows the content it showed before.
 fn composite_transition(
     ctx: &crate::CompatCtx,
     id: u32,
@@ -1442,19 +1461,16 @@ fn composite_transition(
     let (src1, src2, w, h) = if with_children {
         transition_sources_subtree(scene, id, source)?
     } else {
-        transition_sources_self(scene, id, source)?
-    };
-    // Both paths composite the two sources at one size; the blend rejects a
-    // mismatch before it draws, so the frame does the same.
-    let (src2_w, src2_h) = bitmap_size(scene, src2)
-        .ok_or_else(|| "Layer.beginTransition: the transition source is missing".to_string())?;
-    if (src2_w, src2_h) != (w, h) {
-        return Err(TransError::SizeMismatch {
-            src1: (w, h),
-            src2: (src2_w, src2_h),
+        // The endpoints' own images are gone: there is nothing to blend, so
+        // the frame is not drawn and the transition keeps its place.
+        match transition_sources_self(scene, id, source) {
+            Ok(sources) => sources,
+            Err(reason) => {
+                report_skipped_frame(ctx, id, trans, &reason);
+                return Ok(());
+            }
         }
-        .to_string());
-    }
+    };
     // The generic effect path: the projection draws the transition with a
     // shader, so nothing is written into a bitmap.
     let effect: Option<EffectDraw> =
@@ -1520,9 +1536,50 @@ fn composite_transition(
         return Err("Layer.beginTransition: the transition bitmaps are not distinct".to_string());
     };
     let region = Trans::full_region(target);
-    trans
-        .apply(target, src1_bitmap, src2_bitmap, region)
-        .map_err(|error| error.to_string())
+    // The kind that cannot draw its frame is drawn as the cross-fade, and the
+    // fallback is reported: a fallback nobody reports is a silent one.
+    if let Some(reason) = trans.apply_with_fallback(target, src1_bitmap, src2_bitmap, region) {
+        report_cross_fade(ctx, id, trans, &reason);
+    }
+    Ok(())
+}
+
+/// Report the cross-fade that stands in for a kind that cannot draw.
+///
+/// The kind fails on every tick of the transition, and the reader needs one
+/// record per transition, not one per frame.
+fn report_cross_fade(ctx: &crate::CompatCtx, id: u32, trans: &Trans, reason: &TransError) {
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let mut runtime = unsafe { ctx.services() }.state::<TransitionRuntimeState>();
+    let Some(entry) = runtime.entries.get_mut(&id) else {
+        return;
+    };
+    if entry.cross_fade_reported {
+        return;
+    }
+    entry.cross_fade_reported = true;
+    let kind = trans.kind().name();
+    log::warn!(
+        "compat.layer: the transition is drawn as a cross-fade transition={kind} reason={reason}"
+    );
+}
+
+/// Report a transition frame that was not drawn.
+///
+/// The endpoints' images are gone, so there is nothing to blend. The report
+/// is made once per transition.
+fn report_skipped_frame(ctx: &crate::CompatCtx, id: u32, trans: &Trans, reason: &str) {
+    // SAFETY: the caller resolved `ctx` from the installed binding.
+    let mut runtime = unsafe { ctx.services() }.state::<TransitionRuntimeState>();
+    let Some(entry) = runtime.entries.get_mut(&id) else {
+        return;
+    };
+    if entry.skipped_reported {
+        return;
+    }
+    entry.skipped_reported = true;
+    let kind = trans.kind().name();
+    log::warn!("compat.layer: the transition frame is not drawn transition={kind} reason={reason}");
 }
 
 /// The two sources of a whole-subtree transition and their shared size: the
@@ -1578,7 +1635,8 @@ fn transition_sources_composite(scene: &mut Scene, dest: u32, source: u32) -> Re
 /// destination's and the source layer's own main images.
 ///
 /// Neither main image is written; the frame blends them, so its children keep
-/// drawing live.
+/// drawing live. The endpoints' images can be gone while the transition runs:
+/// the caller then does not draw the frame and reports why.
 fn transition_sources_self(
     scene: &mut Scene,
     dest: u32,
@@ -1586,18 +1644,15 @@ fn transition_sources_self(
 ) -> Result<(u32, u32, u32, u32), String> {
     let dest_bitmap = scene
         .layer(dest)
-        .ok_or_else(|| "Layer.beginTransition: the transition destination is gone".to_string())?
+        .ok_or_else(|| "the transition destination is gone".to_string())?
         .bitmap
-        .ok_or_else(|| {
-            "Layer.beginTransition: the transition destination has no image".to_string()
-        })?;
-    let (w, h) = bitmap_size(scene, dest_bitmap).ok_or_else(|| {
-        "Layer.beginTransition: the transition destination image is missing".to_string()
-    })?;
+        .ok_or_else(|| "the transition destination has no image".to_string())?;
+    let (w, h) = bitmap_size(scene, dest_bitmap)
+        .ok_or_else(|| "the transition destination image is missing".to_string())?;
     let source_bitmap = scene
         .layer(source)
         .and_then(|layer| layer.bitmap)
-        .ok_or_else(|| "Layer.beginTransition: the transition source has no image".to_string())?;
+        .ok_or_else(|| "the transition source has no image".to_string())?;
     Ok((dest_bitmap, source_bitmap, w, h))
 }
 

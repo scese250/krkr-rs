@@ -323,3 +323,203 @@ fn a_clock_before_the_start_is_no_elapsed_time() {
     assert!(trans.is_complete());
     assert_eq!(trans.phase(), PHASE_MAX);
 }
+
+/// A kind that cannot draw its frame is drawn as the cross-fade.
+///
+/// The ripple provider rejects a centre outside the source image
+/// (`reference/cpp/plugins/ripple.cpp:1598-1627`), so the frame has no
+/// provider to draw it with. The cross-fade stands in: the frame holds the
+/// cross-fade's own blend, and the reason the kind could not draw comes
+/// back with it.
+#[test]
+fn a_kind_that_cannot_draw_is_drawn_as_the_cross_fade() {
+    let src1 = black(64, 64);
+    let src2 = white(64, 64);
+    let mut dst = bitmap(64, 64, [0, 0, 0, 0]);
+
+    let mut trans = Trans::new(
+        TransKind::Ripple {
+            center: Some((100, 100)),
+            map_width: 128,
+            roundness: 1.0,
+            speed: 6.0,
+            max_drift: 24,
+        },
+        100.0,
+    )
+    .unwrap();
+    trans.step(50.0);
+
+    let reason = trans
+        .apply_with_fallback(&mut dst, &src1, &src2, region(64, 64))
+        .expect("the kind cannot draw the frame");
+    assert!(
+        matches!(
+            reason,
+            TransError::InvalidOption {
+                option: "centerx",
+                ..
+            }
+        ),
+        "the reason names the option the kind rejected: {reason:?}"
+    );
+
+    // The frame holds the cross-fade's own blend, at the same phase.
+    let mut cross = Trans::cross_fade(100.0).unwrap();
+    cross.step(50.0);
+    let mut expected = bitmap(64, 64, [0, 0, 0, 0]);
+    cross
+        .apply(&mut expected, &src1, &src2, region(64, 64))
+        .unwrap();
+    assert_eq!(
+        dst.rgba, expected.rgba,
+        "the fallback is the cross-fade's own blend"
+    );
+}
+
+/// The two sources may differ in size when the transition runs: the
+/// cross-fade draws the part of the source that is there, and the rest of
+/// the destination keeps the first source.
+#[test]
+fn a_size_mismatch_is_drawn_as_the_cross_fade() {
+    let src1 = black(4, 1);
+    let src2 = white(2, 1);
+    let mut dst = bitmap(4, 1, [0, 0, 0, 0]);
+
+    let mut trans = Trans::cross_fade(100.0).unwrap();
+    trans.step(50.0);
+    let reason = trans
+        .apply_with_fallback(&mut dst, &src1, &src2, region(4, 1))
+        .expect("the sources differ in size");
+    assert!(
+        matches!(reason, TransError::SizeMismatch { .. }),
+        "the reason names the mismatch: {reason:?}"
+    );
+
+    // The two columns the second source covers carry the blend.
+    assert_ne!(
+        &dst.rgba[0..8],
+        &src1.rgba[0..8],
+        "the covered columns carry the blend"
+    );
+    // The two columns the second source does not reach keep the first
+    // source: the blend covers the part both sources share.
+    assert_eq!(
+        &dst.rgba[8..12],
+        &src1.rgba[8..12],
+        "the columns the source does not cover keep the first source"
+    );
+}
+
+/// The second source may be the wider one: the frame the fallback draws
+/// holds the blend where both sources reach, and the destination's own
+/// pixels where the first source does not reach.
+///
+/// There is no first source to keep there, so the frame keeps what the
+/// destination held.
+#[test]
+fn a_size_mismatch_keeps_the_destination_where_the_first_source_ends() {
+    let src1 = black(2, 1);
+    let src2 = white(4, 1);
+    let mut dst = bitmap(4, 1, [0, 0, 0, 0]);
+    let untouched = dst.clone();
+
+    let mut trans = Trans::cross_fade(100.0).unwrap();
+    trans.step(50.0);
+    let reason = trans
+        .apply_with_fallback(&mut dst, &src1, &src2, region(4, 1))
+        .expect("the sources differ in size");
+    assert!(
+        matches!(reason, TransError::SizeMismatch { .. }),
+        "the reason names the mismatch: {reason:?}"
+    );
+
+    // The two columns both sources cover carry the blend.
+    assert_ne!(
+        &dst.rgba[0..8],
+        &src1.rgba[0..8],
+        "the covered columns carry the blend"
+    );
+    // The columns the first source does not reach keep the destination's
+    // own pixels.
+    assert_eq!(
+        &dst.rgba[8..12],
+        &untouched.rgba[8..12],
+        "the columns the first source does not reach keep the destination"
+    );
+}
+
+/// The fallback's normal case: the sources match the region, so the blend
+/// covers the whole frame and the fallback draws exactly what the
+/// cross-fade's own blend draws.
+///
+/// The ripple provider rejects a centre outside the source image
+/// (`reference/cpp/plugins/ripple.cpp:1598-1627`), so the frame has no
+/// provider to draw it with and the cross-fade stands in. The sources are
+/// the size of the region, so the frame the fallback draws is the
+/// cross-fade's blend over the whole region.
+#[test]
+fn a_fallback_over_matching_sources_draws_the_cross_fades_blend() {
+    let src1 = black(4, 1);
+    let src2 = white(4, 1);
+    let mut dst = bitmap(4, 1, [0, 0, 0, 0]);
+
+    let mut trans = Trans::new(
+        TransKind::Ripple {
+            center: Some((100, 100)),
+            map_width: 128,
+            roundness: 1.0,
+            speed: 6.0,
+            max_drift: 24,
+        },
+        100.0,
+    )
+    .unwrap();
+    trans.step(50.0);
+    let reason = trans
+        .apply_with_fallback(&mut dst, &src1, &src2, region(4, 1))
+        .expect("the kind cannot draw the frame");
+    assert!(
+        matches!(
+            reason,
+            TransError::InvalidOption {
+                option: "centerx",
+                ..
+            }
+        ),
+        "the reason names the option the kind rejected: {reason:?}"
+    );
+
+    // The frame holds the cross-fade's own blend, at the same phase.
+    let mut cross = Trans::cross_fade(100.0).unwrap();
+    cross.step(50.0);
+    let mut expected = bitmap(4, 1, [0, 0, 0, 0]);
+    cross
+        .apply(&mut expected, &src1, &src2, region(4, 1))
+        .unwrap();
+    assert_eq!(
+        dst.rgba, expected.rgba,
+        "the fallback over matching sources is the cross-fade's own blend"
+    );
+    assert_ne!(
+        dst.rgba, src1.rgba,
+        "the first source the fallback draws is overwritten by the blend"
+    );
+}
+
+/// The fallback is drawn with the CPU blend: the device path is for the
+/// kinds the device can draw.
+#[test]
+fn a_fallback_transition_is_not_drawn_on_the_device() {
+    let cross = Trans::cross_fade(100.0).unwrap();
+    assert!(
+        cross.effect_draw(1, 2, (4, 4), false).is_some(),
+        "the cross-fade has a device program"
+    );
+
+    let fallback = Trans::cross_fade(100.0).unwrap().with_fallback();
+    assert!(
+        fallback.effect_draw(1, 2, (4, 4), false).is_none(),
+        "the fallback is drawn with the CPU blend"
+    );
+}

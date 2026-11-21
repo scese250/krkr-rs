@@ -64,7 +64,12 @@ fn blend_method(dest_alpha: DestAlpha) -> f32 {
 /// The layout is the one every shipped program declares: two source
 /// rectangles, a parameters `vec4` and the spare `vec4` whose `w` the
 /// renderer overwrites with the composed draw opacity.
+///
+/// A block that is not usable means the pass cannot be drawn, so the caller
+/// blends the frame on the CPU instead. The record names the transition and
+/// the reason: the reader should know that the device path was not taken.
 fn pass_uniforms(
+    kind: &str,
     first: [f32; 4],
     second: [f32; 4],
     weight: f32,
@@ -80,8 +85,9 @@ fn pass_uniforms(
     match EffectUniforms::from_words(&words) {
         Ok(uniforms) => Some(uniforms),
         Err(error) => {
-            log::error!(
-                "engine.scene: the transition effect's uniform block is not usable: {error}"
+            log::warn!(
+                "engine.scene: the transition effect's uniform block is not usable \
+                 transition={kind} reason={error}"
             );
             None
         }
@@ -100,6 +106,10 @@ impl Trans {
     /// blends the frame on the CPU, which is the engine's own per-pixel
     /// blend. A draw whose program the scene has no pipeline for is not drawn
     /// either, and the caller blends the frame on the CPU as well.
+    ///
+    /// A transition that stands in for a name no provider answers is never
+    /// drawn here: the fallback is the engine's own blend of the two
+    /// sources, so the caller blends it on the CPU.
     pub fn effect_draw(
         &self,
         src1: u32,
@@ -108,6 +118,9 @@ impl Trans {
         covers_layer: bool,
     ) -> Option<EffectDraw> {
         if size.0 == 0 || size.1 == 0 {
+            return None;
+        }
+        if self.fallback {
             return None;
         }
         match self.kind {
@@ -124,6 +137,7 @@ impl Trans {
                 };
                 let full = [0.0, 0.0, 1.0, 1.0];
                 let uniforms = pass_uniforms(
+                    self.kind.name(),
                     full,
                     full,
                     phase_weight(self.phase),
@@ -151,7 +165,13 @@ impl Trans {
                     let Some((dst, src)) = super::scroll_source_rects(frame, placement) else {
                         continue;
                     };
-                    let uniforms = pass_uniforms(normalized_uv(src, size), [0.0; 4], 0.0, 0.0)?;
+                    let uniforms = pass_uniforms(
+                        self.kind.name(),
+                        normalized_uv(src, size),
+                        [0.0; 4],
+                        0.0,
+                        0.0,
+                    )?;
                     passes.push(EffectPass::new(
                         Program::Scroll,
                         vec![EffectTexture::new(bitmap)],

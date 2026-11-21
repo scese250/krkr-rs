@@ -47,6 +47,21 @@
 //! A non-positive/NaN duration, a negative `vague`, a missing or unexpected
 //! rule, an inconsistent rule and mismatched source sizes are typed
 //! [`TransError`]s; nothing is silently clamped to a fallback.
+//!
+//! # The fallback
+//!
+//! A kind that cannot draw its frame is drawn as a cross-fade: the engine's
+//! own blend of the two sources at the transition's phase, so the frame that
+//! is drawn is that arithmetic and not an approximation of the kind that
+//! failed. [`Trans::apply_with_fallback`] returns the reason the
+//! kind could not draw the frame, so the caller can report the fallback: a
+//! fallback nobody reports is a silent one.
+//!
+//! The frame the fallback draws is the first source with the second source
+//! cross-faded over the part of the frame both sources reach: the sources
+//! are read at the region's own columns, so the blend covers the region's
+//! intersection with both sources' extents. Where the second source does not
+//! reach, the frame keeps the first source.
 
 use std::sync::OnceLock;
 
@@ -230,6 +245,28 @@ pub enum TransKind {
     },
 }
 
+impl TransKind {
+    /// The kind's name, as the script spells it.
+    ///
+    /// The name is the provider's own name, so a record that names the
+    /// transition names what the script asked for.
+    pub fn name(&self) -> &'static str {
+        match self {
+            TransKind::CrossFade => "crossfade",
+            TransKind::Universal { .. } => "universal",
+            TransKind::Mask => "mask",
+            TransKind::Scroll { .. } => "scroll",
+            TransKind::Wave { .. } => "wave",
+            TransKind::Mosaic { .. } => "mosaic",
+            TransKind::Turn { .. } => "turn",
+            TransKind::RotateZoom { .. } => "rotatezoom",
+            TransKind::RotateVanish { .. } => "rotatevanish",
+            TransKind::RotateSwap { .. } => "rotateswap",
+            TransKind::Ripple { .. } => "ripple",
+        }
+    }
+}
+
 /// A grayscale rule image for [`TransKind::Universal`] / [`TransKind::Mask`].
 ///
 /// The rule is decoded to 8bpp and tiled when it is smaller than the
@@ -409,6 +446,12 @@ pub struct Trans {
     phase: i32,
     rule: Option<RuleMask>,
     completed: bool,
+    /// Whether the transition stands in for a name no provider answers.
+    ///
+    /// A fallback is drawn with the CPU blend: the device path draws the
+    /// kinds the device can draw, and the fallback is the engine's own
+    /// arithmetic.
+    fallback: bool,
     /// The tick the transition started at, when the caller drives it from a
     /// clock.
     start_tick: Option<u64>,
@@ -466,8 +509,19 @@ impl Trans {
             phase: 0,
             rule,
             completed: false,
+            fallback: false,
             start_tick: None,
         })
+    }
+
+    /// Marks the transition as the fallback for a name no provider answers.
+    ///
+    /// The fallback is drawn with the CPU blend, so the device path is not
+    /// taken for it: the device path is for the kinds the device can draw,
+    /// and the fallback is the engine's own blend of the two sources.
+    pub fn with_fallback(mut self) -> Self {
+        self.fallback = true;
+        self
     }
 
     /// A `crossfade` transition.
@@ -805,6 +859,48 @@ impl Trans {
         Ok(())
     }
 
+    /// Composite `src1`/`src2` into `dst` at the current phase, and let the
+    /// cross-fade stand in for a kind that cannot draw the frame.
+    ///
+    /// The cross-fade is the engine's own blend of the two sources at the
+    /// transition's phase, so the frame that is drawn is the arithmetic the
+    /// cross-fade kind uses and not an approximation of the kind that
+    /// failed. The reason the kind could not draw the frame comes back with
+    /// the frame, so the caller can report the fallback: a fallback nobody
+    /// reports is a silent one.
+    ///
+    /// The frame the fallback draws is the first source with the second
+    /// source cross-faded over the part of the frame both sources reach: the
+    /// sources are read at the region's own columns, so the blend covers the
+    /// region's intersection with both sources' extents. Where the second
+    /// source does not reach, the frame keeps the first source.
+    ///
+    /// `None` when the transition's own kind drew the frame.
+    pub fn apply_with_fallback(
+        &self,
+        dst: &mut BitmapState,
+        src1: &BitmapState,
+        src2: &BitmapState,
+        region: RectI,
+    ) -> Option<TransError> {
+        match self.apply(dst, src1, src2, region) {
+            Ok(()) => None,
+            Err(reason) => {
+                // The weight of the cross-fade runs to the phase; a phase
+                // beyond the cross-fade's own range is the cross-fade's
+                // last one.
+                self.blend_cross_fade_fallback(
+                    self.phase.clamp(0, PHASE_MAX),
+                    dst,
+                    src1,
+                    src2,
+                    region,
+                );
+                Some(reason)
+            }
+        }
+    }
+
     /// A full-image processing region for `bitmap`.
     pub fn full_region(bitmap: &BitmapState) -> RectI {
         (0, 0, dimension(bitmap.width), dimension(bitmap.height))
@@ -825,16 +921,91 @@ impl Trans {
             blit_copy(dst, region.0, region.1, src2, region);
             return;
         }
-        let Some((x0, y0, x1, y1)) = intersect(dst, region) else {
+        self.blend_cross_fade(self.phase, dst, src1, src2, region);
+    }
+
+    /// The cross-fade's blend at `phase`, over `region`.
+    ///
+    /// The endpoints are the caller's: this is the blend between them, so
+    /// the kind that owns the endpoints does not run it twice. A source that
+    /// does not cover the destination's columns is read as transparent there,
+    /// so the blend draws the part of the source that is there.
+    fn blend_cross_fade(
+        &self,
+        phase: i32,
+        dst: &mut BitmapState,
+        src1: &BitmapState,
+        src2: &BitmapState,
+        region: RectI,
+    ) {
+        let Some(frame) = intersect(dst, region) else {
             return;
         };
-        // One weight for the whole rectangle: the phase. The mix itself is
-        // the one the destination's alpha handling selects.
-        for y in y0..y1 {
-            let row = BlendRow { x0, x1, y };
-            blend_row(dst, src1, src2, row, self.phase, self.dest_alpha);
+        self.blend_rows(phase, dst, src1, src2, frame);
+        dst.mark_dirty();
+    }
+
+    /// The fallback's cross-fade: the first source over the region, and the
+    /// blend over the part of the frame both sources reach.
+    ///
+    /// The frame a transition shows before it begins is the first source, so
+    /// the fallback draws it and cross-fades the second source over the part
+    /// of the frame it covers. Where the second source does not reach, the
+    /// frame keeps the first source.
+    ///
+    /// The blend is the cross-fade's own: the fallback changes the area the
+    /// blend covers, not the arithmetic it uses.
+    fn blend_cross_fade_fallback(
+        &self,
+        phase: i32,
+        dst: &mut BitmapState,
+        src1: &BitmapState,
+        src2: &BitmapState,
+        region: RectI,
+    ) {
+        let Some(frame) = intersect(dst, region) else {
+            return;
+        };
+        // The part of the frame both sources reach. The blend reads the
+        // sources at the region's own columns, so a source covers the
+        // columns of the region that lie inside its own extent.
+        let covered = match intersect_rect(source_extent(src1), source_extent(src2)) {
+            Some(both) => intersect_rect(frame, both),
+            None => None,
+        };
+        // The frame the transition showed before it began: the first source,
+        // copied the way the cross-fade's own first endpoint is. The blend
+        // overwrites the part it covers, so the copy is needed only where
+        // the two sources do not cover the whole frame.
+        if covered != Some(frame) {
+            blit_copy(dst, region.0, region.1, src1, region);
+        }
+        if let Some(covered) = covered {
+            self.blend_rows(phase, dst, src1, src2, covered);
         }
         dst.mark_dirty();
+    }
+
+    /// The blend over the rectangle `rect`.
+    ///
+    /// One weight for the whole rectangle: the phase. The mix itself is the
+    /// one the destination's alpha handling selects.
+    fn blend_rows(
+        &self,
+        phase: i32,
+        dst: &mut BitmapState,
+        src1: &BitmapState,
+        src2: &BitmapState,
+        rect: RectI,
+    ) {
+        for y in rect.1..rect.3 {
+            let row = BlendRow {
+                x0: rect.0,
+                x1: rect.2,
+                y,
+            };
+            blend_row(dst, src1, src2, row, phase, self.dest_alpha);
+        }
     }
     fn apply_rule_blend(
         &self,
@@ -1239,6 +1410,14 @@ fn blend_channel(s1: u8, s2: u8, opa: i32) -> u8 {
 /// A bitmap dimension as the `i32` the pixel coordinates use.
 fn dimension(value: u32) -> i32 {
     value.min(i32::MAX as u32) as i32
+}
+
+/// The rectangle a source covers in the destination's space.
+///
+/// The blend reads the sources at the destination's columns, so a source
+/// covers the columns and the rows its own pixels span.
+fn source_extent(source: &BitmapState) -> RectI {
+    (0, 0, dimension(source.width), dimension(source.height))
 }
 
 /// One row of a blend: the columns `[x0, x1)` and the row `y`.

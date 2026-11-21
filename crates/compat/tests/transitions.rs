@@ -461,18 +461,14 @@ fn begin_transition_requires_a_layer_source() {
 ///
 /// reference/cpp/core/visual/TransIntf.cpp:296-341
 #[test]
-fn transition_names_are_matched_exactly() {
+fn an_unknown_transition_name_falls_back_to_the_cross_fade() {
     let _lock = vm_lock();
     let env = Env::new();
     for name in ["nope", "CrossFade"] {
         two_layers(&env, 2);
-        let message = env.error(&format!(
-            "b.beginTransition({name:?}, true, a, %[time: 100])"
+        env.run(&format!(
+            "b.beginTransition({name:?}, true, a, %[time: 100]); b.stopTransition();"
         ));
-        assert!(
-            message.contains("unsupported transition"),
-            "{name:?} should be unsupported, got: {message}"
-        );
     }
     two_layers(&env, 2);
     env.run("b.beginTransition('crossfade', true, a, %[time: 100]); b.stopTransition();");

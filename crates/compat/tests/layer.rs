@@ -566,9 +566,7 @@ fn unsupported_transitions_and_media_helpers_raise_typed_errors() {
     let cases = [
         // `withchildren=true` skips the source/destination image check
         // (`LayerIntf.cpp:9819-9821,7860-7868`), so these raise for the
-        // transition name or options instead.
-        "(function(){ var w = new Window(); var a = new Layer(w,null); a.setImageSize(2,2); \
-          var b = new Layer(w,null); b.setImageSize(2,2); b.beginTransition('nope', true, a, null); })()",
+        // transition's options instead.
         "(function(){ var w = new Window(); var a = new Layer(w,null); a.setImageSize(2,2); \
           var b = new Layer(w,null); b.setImageSize(2,2); b.beginTransition('universal', true, a, %[time: 300]); })()",
         // The extrans providers are implemented; their option validation is
@@ -1287,4 +1285,19 @@ fn invalidating_a_parent_layer_leaves_the_child_script_object_valid() {
         0,
         "the child must be released with its own script object"
     );
+}
+
+/// A name no provider answers is drawn as the cross-fade.
+///
+/// The provider lookup falls back to the cross-fade for a name it does not
+/// know (`reference/cpp/core/visual/TransIntf.cpp:332-341`), so the script
+/// sees a transition and not an error.
+#[test]
+fn an_unknown_transition_is_drawn_as_the_cross_fade() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    env.run(
+        "var w = new Window();          var a = new Layer(w, null); a.setImageSize(64, 64); a.setSize(64, 64);          var b = new Layer(w, null); b.setImageSize(64, 64); b.setSize(64, 64);          b.beginTransition('nope', true, a, %[time: 300]);",
+    );
+    env.run("b.stopTransition();");
 }
