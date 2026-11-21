@@ -155,6 +155,7 @@ fn the_headless_script_clock_tracks_the_wall_clock() {
             archives: Vec::new(),
         }),
         mode: RunMode::Headless { frames: FRAMES },
+        resolution: app::Resolution::Default,
         dump_frame: None,
         slow_report_budget: None,
         slow_frame_threshold_ms: None,

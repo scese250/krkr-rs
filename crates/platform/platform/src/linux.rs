@@ -17,12 +17,12 @@ use winit::event::{
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode as WinitKeyCode, NativeKeyCode, PhysicalKey as WinitPhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::clock::Ticker;
 use crate::event::PlatformEvent;
 use crate::input::{InputEvent, MouseButton, PhysicalKey};
-use crate::{EventHandler, Flow, FramePacing, PlatformConfig, PlatformError};
+use crate::{EventHandler, Flow, FramePacing, PlatformConfig, PlatformError, Resolution};
 
 pub use crate::software::SoftwareSurface;
 
@@ -220,6 +220,35 @@ impl PlatformWindow {
     }
 }
 
+/// The attributes the window is created with.
+///
+/// The default window takes the configured logical size and is resizable, so
+/// the framebuffer follows the window. A declared resolution and a fullscreen
+/// window are a startup choice: the window is created at that resolution, in
+/// device pixels, and is not resizable, so the framebuffer keeps it.
+fn window_attributes(config: &PlatformConfig) -> WindowAttributes {
+    let mut attributes = Window::default_attributes().with_title(config.title.as_str());
+    match config.resolution {
+        Resolution::Default => {
+            attributes = attributes.with_inner_size(LogicalSize::new(
+                f64::from(config.size.0),
+                f64::from(config.size.1),
+            ));
+        }
+        Resolution::Size(width, height) => {
+            attributes = attributes
+                .with_inner_size(PhysicalSize::new(width.max(1), height.max(1)))
+                .with_resizable(false);
+        }
+        Resolution::Fullscreen => {
+            attributes = attributes
+                .with_fullscreen(Some(Fullscreen::Borderless(None)))
+                .with_resizable(false);
+        }
+    }
+    attributes
+}
+
 /// Creates the event loop and runs `handler` until it asks to exit.
 ///
 /// # Errors
@@ -341,12 +370,7 @@ impl<H: EventHandler> ApplicationHandler for AppLoop<H> {
         // notified so a higher layer can recreate its surface. Only the
         // window creation itself is guarded.
         if self.window.is_none() {
-            let attributes = Window::default_attributes()
-                .with_title(self.config.title.as_str())
-                .with_inner_size(LogicalSize::new(
-                    f64::from(self.config.size.0),
-                    f64::from(self.config.size.1),
-                ));
+            let attributes = window_attributes(&self.config);
             let window = match event_loop.create_window(attributes) {
                 Ok(window) => window,
                 Err(error) => {
@@ -1262,7 +1286,66 @@ pub(crate) mod audio {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{REDRAW_STALL_TIMEOUT, RedrawWatchdog};
+    use winit::dpi::Size;
+
+    use super::{REDRAW_STALL_TIMEOUT, RedrawWatchdog, window_attributes};
+    use crate::{PlatformConfig, Resolution};
+
+    /// The default window is the platform's own: a logical size, and it is
+    /// resizable, so the framebuffer follows the window.
+    #[test]
+    fn the_default_window_is_a_resizable_logical_size() {
+        let config = PlatformConfig::default();
+        let attributes = window_attributes(&config);
+        assert!(
+            attributes.resizable,
+            "the default window is resizable: the framebuffer follows it"
+        );
+        let Some(Size::Logical(size)) = attributes.inner_size else {
+            panic!("the default window takes a logical size");
+        };
+        assert_eq!(size.width, f64::from(config.size.0));
+        assert_eq!(size.height, f64::from(config.size.1));
+    }
+
+    /// A declared resolution is created in device pixels and keeps that
+    /// size: the window is not resizable.
+    #[test]
+    fn a_declared_resolution_is_a_fixed_physical_size() {
+        let config = PlatformConfig {
+            resolution: Resolution::Size(1920, 1080),
+            ..PlatformConfig::default()
+        };
+        let attributes = window_attributes(&config);
+        assert!(
+            !attributes.resizable,
+            "a declared resolution keeps the size it was created at"
+        );
+        let Some(Size::Physical(size)) = attributes.inner_size else {
+            panic!("a declared resolution is a physical size");
+        };
+        assert_eq!(size.width, 1920);
+        assert_eq!(size.height, 1080);
+    }
+
+    /// A fullscreen window covers the display and keeps its size: the
+    /// display's own resolution is the window's.
+    #[test]
+    fn a_fullscreen_window_covers_the_display() {
+        let config = PlatformConfig {
+            resolution: Resolution::Fullscreen,
+            ..PlatformConfig::default()
+        };
+        let attributes = window_attributes(&config);
+        assert!(
+            !attributes.resizable,
+            "a fullscreen window keeps the resolution it was created at"
+        );
+        assert!(
+            attributes.fullscreen.is_some(),
+            "the window covers the display"
+        );
+    }
 
     #[test]
     fn a_stall_is_reported_once_after_the_timeout() {

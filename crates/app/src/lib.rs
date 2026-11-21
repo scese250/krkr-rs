@@ -103,6 +103,9 @@ pub use game::{GameError, GameHost, vm_report};
 pub use image_codec::install_image_codec;
 pub(crate) use image_codec::{install_image_codec_metered, install_image_decoder};
 pub use render::BackendKind;
+// The resolution a run is created at: the platform owns the window, so it
+// owns the choice of the resolution the window is created at.
+pub use platform::Resolution;
 // The emulator entry point. A launcher resolves `Launch` (including the
 // `RuntimeConfig` it loaded its own way) and calls `run`; see the `runner`
 // module for the entry point contract.

@@ -122,6 +122,25 @@ pub enum PlatformError {
     NotImplemented(String),
 }
 
+/// The resolution a window is created at.
+///
+/// The default is the platform's own window: the logical size
+/// [`PlatformConfig::size`] names, and it is resizable, so the framebuffer
+/// follows the window. The other two are a startup choice the launcher makes:
+/// the window is created at that resolution and keeps it, so the framebuffer
+/// does not follow a later resize.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Resolution {
+    /// The platform's default window: a logical size, and it is resizable.
+    #[default]
+    Default,
+    /// A declared resolution in device pixels: the window is created at it
+    /// and is not resizable.
+    Size(u32, u32),
+    /// The display's own resolution, in a window that covers it.
+    Fullscreen,
+}
+
 /// Immutable configuration for [`run`].
 ///
 /// The type is `#[non_exhaustive]`: construct it through [`Default`] and
@@ -134,9 +153,19 @@ pub struct PlatformConfig {
     pub title: String,
     /// Initial window size in logical pixels (DPI-scaled by the backend).
     ///
-    /// The surface size actually created is reported physically through
-    /// [`PlatformEvent::Resized`] and `PlatformWindow::size`.
+    /// The size is the default window's: the one a [`Resolution::Default`]
+    /// run creates. A window created at a declared resolution takes that
+    /// resolution instead. The surface size actually created is reported
+    /// physically through [`PlatformEvent::Resized`] and
+    /// `PlatformWindow::size`.
     pub size: (u32, u32),
+    /// The resolution the window is created at.
+    ///
+    /// The default window is resizable, and its framebuffer follows it. A
+    /// declared resolution and a fullscreen window keep the resolution they
+    /// were created at: the window is not resizable, and a later resize
+    /// changes neither the framebuffer nor the sizes derived from it.
+    pub resolution: Resolution,
     /// Target interval between frames.
     ///
     /// A zero interval is normalized up by [`Ticker::new`] so the loop cannot
@@ -149,6 +178,7 @@ impl Default for PlatformConfig {
         Self {
             title: "krkr-rs".to_owned(),
             size: (1280, 720),
+            resolution: Resolution::Default,
             frame_interval: Duration::from_millis(16),
         }
     }

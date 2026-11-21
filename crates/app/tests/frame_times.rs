@@ -30,6 +30,7 @@ fn launch(frame_report: bool) -> Launch {
         backend: BackendKind::Null,
         game: None,
         mode: RunMode::Headless { frames: FRAMES },
+        resolution: app::Resolution::Default,
         dump_frame: None,
         slow_report_budget: None,
         slow_frame_threshold_ms: None,

@@ -143,6 +143,57 @@ fn a_target_of_another_size_is_refused() {
     );
 }
 
+/// The picture's target and the click's mapping are one size.
+///
+/// The picture is drawn into the target, and the click is mapped with the
+/// mapping the target's size gives: the presentation maps the VM surface
+/// into the framebuffer, and the composition root takes the click back
+/// through the same mapping. When the two sizes differ, the click is mapped
+/// for a frame the picture is not drawn at, and the button the script draws
+/// is somewhere the picture is not.
+///
+/// A resize moves the target and the mapping together, so the two keep
+/// agreeing.
+#[test]
+fn the_target_and_the_mapping_are_one_size() {
+    let mut engine = offscreen_engine(SIZE);
+    fill_scene(&mut engine);
+    let mut hooks = NoFrame;
+    engine.frame(0, &mut hooks).expect("the frame runs");
+
+    // The mapping the click is taken back through describes the target the
+    // picture is drawn into.
+    let translation = engine.translation().expect("a mapping");
+    assert_eq!(translation.device_size, engine.surface_size());
+    let pixels = engine
+        .read_offscreen_frame()
+        .expect("the read-back succeeds")
+        .expect("the engine draws into a target");
+    assert_eq!(
+        pixels.len(),
+        (engine.surface_size().0 * engine.surface_size().1 * 4) as usize,
+        "the target is the size the mapping describes"
+    );
+
+    // A resize moves the target and the mapping together.
+    engine.resize((48, 36)).expect("resize");
+    engine
+        .frame(16, &mut hooks)
+        .expect("the frame after the resize");
+    let translation = engine.translation().expect("a mapping");
+    assert_eq!(translation.device_size, (48, 36));
+    assert_eq!(translation.device_size, engine.surface_size());
+    let pixels = engine
+        .read_offscreen_frame()
+        .expect("the read-back succeeds")
+        .expect("the engine draws into a target");
+    assert_eq!(
+        pixels.len(),
+        (48 * 36 * 4) as usize,
+        "the target follows the resize, and so does the mapping"
+    );
+}
+
 /// The GPU path is reachable without a window.
 ///
 /// A Vulkan state created offscreen owns a logical device and no surface, so

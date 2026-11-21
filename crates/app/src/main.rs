@@ -46,6 +46,16 @@
 //!   passes both the window and display handle so a surface can be created. A
 //!   headless run has no display and draws into an offscreen target instead,
 //!   which the host reads back with [`app::Host::read_offscreen_frame`].
+//! * `--resolution WxH` sets the resolution the run is created at, in device
+//!   pixels: the window is created at that size, is not resizable, and keeps
+//!   it for the whole run, and the framebuffer the run draws into has that
+//!   size too. The logical screen the script sees is the VM's own and does
+//!   not follow it. Without the option the window is the platform's own: it
+//!   is resizable, and the framebuffer follows it.
+//! * `--fullscreen` creates the window on the primary monitor at the
+//!   display's own resolution, and keeps it there for the whole run. It
+//!   needs a window, so it cannot be combined with `--headless`, and it
+//!   cannot be combined with `--resolution`: the resolution is chosen once.
 //! * `--slow-report-ms N` bounds the wall-clock time the run may spend
 //!   reporting slow frames. The option is absent by default, which leaves the
 //!   reports unbounded, and `0` reports no slow frame at all. The budget is
@@ -78,7 +88,7 @@ use std::time::Duration;
 use api::config::{
     CacheLimit, ConfigError, FrameRateLimit, RuntimeConfig, RuntimeConfigOverrides, parse_overrides,
 };
-use app::{BackendKind, GameInput, Launch, RunMode};
+use app::{BackendKind, GameInput, Launch, Resolution, RunMode};
 
 /// One documented launch option.
 struct OptionDoc {
@@ -134,6 +144,16 @@ const OPTIONS: &[OptionDoc] = &[
         flag: "--dump-frame",
         value: "PATH",
         help: "Write the presented frame to PATH as a PNG (the most recent frame; the null backend).",
+    },
+    OptionDoc {
+        flag: "--resolution",
+        value: "WxH",
+        help: "The resolution in device pixels the run is created at; the window keeps it (default: the platform's resizable window).",
+    },
+    OptionDoc {
+        flag: "--fullscreen",
+        value: "",
+        help: "Create the window on the primary monitor at the display's own resolution, and keep it.",
     },
     OptionDoc {
         flag: "--slow-report-ms",
@@ -212,6 +232,10 @@ struct Cli {
     graphic_cache_limit: Option<CacheLimit>,
     /// Where the presented frame is written as a PNG, if given.
     dump_frame: Option<PathBuf>,
+    /// The resolution declared with `--resolution`, in device pixels.
+    declared_resolution: Option<(u32, u32)>,
+    /// Whether `--fullscreen` was given.
+    fullscreen: bool,
     /// The whole-run budget for the slow-frame reports, in milliseconds, or
     /// `None` when the option was absent.
     slow_report_ms: Option<u64>,
@@ -246,6 +270,28 @@ enum CliError {
 }
 
 impl Cli {
+    /// The resolution the run is created at.
+    ///
+    /// The resolution is chosen once: a declared size or the display's own
+    /// resolution in a fullscreen window. The two cannot be combined, and a
+    /// fullscreen window needs a display, so it cannot be combined with the
+    /// headless run either.
+    fn resolution(&self) -> Result<Resolution, CliError> {
+        if self.fullscreen && self.headless {
+            return Err(CliError::Usage(
+                "--fullscreen needs a window; --headless has no display".to_owned(),
+            ));
+        }
+        match (self.declared_resolution, self.fullscreen) {
+            (Some(_), true) => Err(CliError::Usage(
+                "--fullscreen and --resolution cannot both be given".to_owned(),
+            )),
+            (Some((width, height)), false) => Ok(Resolution::Size(width, height)),
+            (None, true) => Ok(Resolution::Fullscreen),
+            (None, false) => Ok(Resolution::Default),
+        }
+    }
+
     /// Parses `args` (without the program name).
     ///
     /// Every value is parsed and validated here, so a malformed command line
@@ -260,6 +306,8 @@ impl Cli {
             debug_overlay: None,
             graphic_cache_limit: None,
             dump_frame: None,
+            declared_resolution: None,
+            fullscreen: false,
             slow_report_ms: None,
             slow_frame_ms: None,
             frame_report: true,
@@ -308,6 +356,13 @@ impl Cli {
                     })?;
                     cli.dump_frame = Some(PathBuf::from(value));
                 }
+                "--resolution" => {
+                    let value = args.next().ok_or_else(|| {
+                        CliError::Usage("--resolution requires a value".to_owned())
+                    })?;
+                    cli.declared_resolution = Some(parse_resolution_value(&value)?);
+                }
+                "--fullscreen" => cli.fullscreen = true,
                 "--slow-report-ms" => {
                     let value = args.next().ok_or_else(|| {
                         CliError::Usage("--slow-report-ms requires a value".to_owned())
@@ -371,6 +426,30 @@ fn parse_backend(value: &str) -> Result<BackendKind, String> {
             "unknown backend '{other}' (expected 'null' or 'vulkan')"
         )),
     }
+}
+
+/// Parses a `WIDTHxHEIGHT` resolution.
+///
+/// The value is a size in device pixels: the resolution the window is created
+/// at. Both dimensions must be above zero, because a window of that size has
+/// no picture.
+fn parse_resolution_value(value: &str) -> Result<(u32, u32), ConfigError> {
+    let invalid = || {
+        ConfigError::invalid(
+            "--resolution",
+            value.to_owned(),
+            "WIDTHxHEIGHT in device pixels, both dimensions above zero",
+        )
+    };
+    let Some((width, height)) = value.split_once(['x', 'X']) else {
+        return Err(invalid());
+    };
+    let width: u32 = width.parse().map_err(|_| invalid())?;
+    let height: u32 = height.parse().map_err(|_| invalid())?;
+    if width == 0 || height == 0 {
+        return Err(invalid());
+    }
+    Ok((width, height))
 }
 
 /// Checks that the requested frame dump has a backend that can produce one.
@@ -478,6 +557,16 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // The resolution is chosen once, at startup, and the run keeps it.
+    let resolution = match cli.resolution() {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            eprintln!("krkr: {error}");
+            eprint!("{}", usage());
+            return ExitCode::from(2);
+        }
+    };
+
     let file = match load_desktop_config() {
         Ok(file) => file,
         Err(error) => {
@@ -518,6 +607,7 @@ fn main() -> ExitCode {
         } else {
             RunMode::Windowed
         },
+        resolution,
         dump_frame: cli.dump_frame,
         slow_report_budget,
         slow_frame_threshold_ms: cli.slow_frame_ms.map(|ms| ms as f64),
@@ -689,6 +779,74 @@ mod tests {
         // presents to a swapchain cannot produce one.
         let cli = parse(&["--backend", "vulkan", "--dump-frame", "frame.png"]).expect("parse");
         assert!(check_dump_backend(&cli).is_err());
+    }
+
+    /// The resolution is a size in device pixels, and both dimensions must be
+    /// above zero.
+    #[test]
+    fn parse_resolution() {
+        assert_eq!(
+            parse_resolution_value("1920x1080").expect("valid"),
+            (1920, 1080)
+        );
+        assert_eq!(
+            parse_resolution_value("1920X1080").expect("valid"),
+            (1920, 1080)
+        );
+
+        for value in [
+            "1920",
+            "1920x",
+            "x1080",
+            "0x1080",
+            "1920x0",
+            "1920x1080x60",
+            "wide",
+            "1920xwide",
+        ] {
+            assert!(parse_resolution_value(value).is_err(), "accepted {value:?}");
+        }
+        // The message names the option and the accepted form.
+        let error = parse_resolution_value("1920")
+            .expect_err("must fail")
+            .to_string();
+        assert!(error.contains("--resolution"), "{error}");
+        assert!(error.contains("WIDTHxHEIGHT"), "{error}");
+    }
+
+    /// The run's resolution is the declared size, the display's own resolution
+    /// in a fullscreen window, or the platform's default.
+    #[test]
+    fn the_resolution_follows_the_options() {
+        let cli = parse(&["--headless"]).expect("parse");
+        assert_eq!(cli.resolution().expect("resolution"), Resolution::Default);
+
+        let cli = parse(&["--resolution", "1280x720"]).expect("parse");
+        assert_eq!(
+            cli.resolution().expect("resolution"),
+            Resolution::Size(1280, 720)
+        );
+
+        let cli = parse(&["--fullscreen"]).expect("parse");
+        assert_eq!(
+            cli.resolution().expect("resolution"),
+            Resolution::Fullscreen
+        );
+    }
+
+    /// The resolution is chosen once: the two ways of asking for one cannot
+    /// be combined, and a fullscreen window needs a display.
+    #[test]
+    fn the_resolution_is_chosen_once() {
+        let cli = parse(&["--fullscreen", "--resolution", "1280x720"]).expect("parse");
+        let error = cli.resolution().expect_err("must fail").to_string();
+        assert!(error.contains("--fullscreen"), "{error}");
+        assert!(error.contains("--resolution"), "{error}");
+
+        let cli = parse(&["--headless", "--fullscreen"]).expect("parse");
+        let error = cli.resolution().expect_err("must fail").to_string();
+        assert!(error.contains("--fullscreen"), "{error}");
+        assert!(error.contains("--headless"), "{error}");
     }
 
     #[test]

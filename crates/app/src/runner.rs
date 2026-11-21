@@ -16,7 +16,7 @@ use engine::FrameTimeSource;
 use media::Media;
 use platform::{
     EventHandler, Flow, FramePacing, PlatformConfig, PlatformError, PlatformEvent, PlatformWindow,
-    SoftwareSurface, Ticker,
+    Resolution, SoftwareSurface, Ticker,
 };
 use render::{FrameStats, PresentedFrame};
 
@@ -69,6 +69,16 @@ pub struct Launch {
     pub game: Option<GameInput>,
     /// Whether to run offscreen or in a window.
     pub mode: RunMode,
+    /// The resolution the run is created at.
+    ///
+    /// The default is the platform's own window: it is resizable, and the
+    /// framebuffer follows it. A declared resolution and a fullscreen window
+    /// are the launcher's explicit choice: the window is created at that
+    /// resolution and is not resizable, and the script's own window resize is
+    /// not applied to it. The framebuffer follows the window in every mode —
+    /// the swapchain's extent is the window's extent — so the window the
+    /// compositor grants is the framebuffer the picture is drawn into.
+    pub resolution: Resolution,
     /// Where the presented frame is written as a PNG, or `None` to write
     /// nothing.
     ///
@@ -129,6 +139,9 @@ pub enum RunError {
     /// The presented frame could not be written to a file.
     #[error("frame dump: {0}")]
     Dump(String),
+    /// The requested resolution cannot be used by this run.
+    #[error("resolution: {0}")]
+    Resolution(String),
 }
 
 /// Runs the emulator with a launcher-resolved [`Launch`].
@@ -270,25 +283,52 @@ impl FrameTimeSource for HeadlessClock {
     }
 }
 
+/// The size of the offscreen target a headless run draws into.
+///
+/// A declared resolution is the target's size. The default resolution leaves
+/// the host's own default size, and the fullscreen resolution has no display
+/// to take it from: the headless run has no window, so the request is
+/// reported rather than silently replaced.
+fn headless_surface_size(resolution: Resolution) -> Result<Option<(u32, u32)>, RunError> {
+    match resolution {
+        Resolution::Size(width, height) => Ok(Some((width, height))),
+        Resolution::Default => Ok(None),
+        Resolution::Fullscreen => Err(RunError::Resolution(
+            "the headless run has no display to take the fullscreen resolution from".to_owned(),
+        )),
+    }
+}
+
 /// Runs offscreen and prints the final frame stats (or the game's scene size).
 fn run_headless(launch: &Launch, frames: u32) -> Result<RunReport, RunError> {
     let started = Instant::now();
     // Boxed: the script's tick count reads this source, so its address is
     // handed to the game and must stay stable for the whole run.
     let mut clock = Box::new(HeadlessClock::new(started));
-    let config = HostConfig::headless()
+    let mut config = HostConfig::headless()
         .with_backend(launch.backend)
         .with_debug_overlay(launch.runtime.debug_overlay)
         .with_graphic_cache_limit(launch.runtime.graphic_cache_limit)
         // The dump reads the frame the CPU rasterizer composited, so the
         // host has to composite it.
         .with_cpu_presentation(launch.dump_frame.is_some());
+    // The resolution is a startup choice: the offscreen target is created at
+    // it and keeps that size for the whole run.
+    if let Some(size) = headless_surface_size(launch.resolution)? {
+        config = config.with_surface_size(size);
+    }
     let media = Media::new();
     // The source is boxed before the host, so the address the game attaches is
     // stable for the whole run; the host is stepped with the same source.
     let source: &(dyn FrameTimeSource + 'static) = clock.as_ref();
     let source = source as *const (dyn FrameTimeSource + 'static);
     let mut host = Host::new(config)?.with_frame_time_source(source);
+    log::info!(
+        "app.runner: the offscreen target is created resolution={}x{} native_resolution={}",
+        host.surface_size().0,
+        host.surface_size().1,
+        host.policy() == RenderPolicy::NativeResolution,
+    );
     // The headless step is paced by the frame-rate limit, like the windowed
     // loop, and the engine's clock advances by the time the loop measured
     // since the previous frame: the script's tick count is the wall clock, so
@@ -449,12 +489,25 @@ fn dump_presented_frame(media: &Media, path: &Path, host: &Host) -> Result<(), R
     }
 }
 
-/// Opens a window through the L1 platform and drives [`Host::step`].
-fn run_windowed(launch: &Launch) -> Result<RunReport, RunError> {
-    let frame_interval = Duration::from_secs_f64(launch.runtime.frame_rate_limit.period_secs());
+/// The platform configuration a launch asks for.
+///
+/// The resolution is the launcher's choice: the default is the platform's own
+/// resizable window, whose framebuffer follows the window, and a declared
+/// resolution or a fullscreen window is created at that resolution and keeps
+/// it: the player cannot resize it, and the script's window resize is not
+/// applied to it.
+fn platform_config(launch: &Launch, frame_interval: Duration) -> PlatformConfig {
     let mut config = PlatformConfig::default();
     config.title = "krkr-rs".to_owned();
     config.frame_interval = frame_interval;
+    config.resolution = launch.resolution;
+    config
+}
+
+/// Opens a window through the L1 platform and drives [`Host::step`].
+fn run_windowed(launch: &Launch) -> Result<RunReport, RunError> {
+    let frame_interval = Duration::from_secs_f64(launch.runtime.frame_rate_limit.period_secs());
+    let config = platform_config(launch, frame_interval);
     // The platform's ticker paces the loop, so every gap the loop measures
     // includes that wait: the gaps are the presentation cadence, and not the
     // engine's cost alone.
@@ -502,6 +555,15 @@ struct DesktopApp {
     graphic_cache_limit: Option<CacheLimit>,
     /// Frame period the loop paces at, which bounds the presentation wait.
     frame_interval: Duration,
+    /// The resolution the run is created at.
+    ///
+    /// The default is the platform's own window: it is resizable, and the
+    /// framebuffer follows it. A declared resolution and a fullscreen window
+    /// keep the resolution they were created at: the window is not resizable,
+    /// and the script's window resize is not applied to it. The framebuffer
+    /// follows the window either way, because the swapchain's extent is the
+    /// window's extent.
+    resolution: Resolution,
     /// The frame's clock source: the real time the platform measured, and the
     /// reading the script's tick count takes on demand.
     ///
@@ -665,6 +727,7 @@ impl DesktopApp {
             debug_overlay: launch.runtime.debug_overlay,
             graphic_cache_limit: launch.runtime.graphic_cache_limit,
             frame_interval,
+            resolution: launch.resolution,
             running: None,
             pending_events: Vec::new(),
             pending_surface_size: None,
@@ -680,6 +743,36 @@ impl DesktopApp {
             frame_times,
             media: Media::new(),
         }
+    }
+
+    /// The resolution the run was created at, as the startup record names it.
+    ///
+    /// A declared resolution is the one the launcher asked for. The default
+    /// and the fullscreen resolutions are the window's own size: the platform
+    /// picks the default window size, and a fullscreen window takes the
+    /// display's resolution.
+    fn chosen_resolution(&self, window_size: (u32, u32)) -> (u32, u32) {
+        match self.resolution {
+            Resolution::Size(width, height) => (width, height),
+            Resolution::Default | Resolution::Fullscreen => window_size,
+        }
+    }
+
+    /// Whether the window keeps the resolution it was created at.
+    ///
+    /// The default window is resizable, and the player may resize it. A
+    /// declared resolution and a fullscreen window keep theirs: the window is
+    /// not resizable, and the script's own window resize is not applied to
+    /// it.
+    ///
+    /// The *framebuffer* follows the window in every mode: the Vulkan
+    /// swapchain's extent is the window's extent, so the compositor owns it
+    /// whatever this run asked for. A mode that froze the framebuffer would
+    /// leave the engine's presentation mapping describing a framebuffer the
+    /// picture is not drawn at, and the click the script receives would be
+    /// mapped for a size the window does not have.
+    fn is_fixed(&self) -> bool {
+        !matches!(self.resolution, Resolution::Default)
     }
 
     /// Logs one heartbeat line per second of delivered frames.
@@ -729,6 +822,9 @@ impl EventHandler for DesktopApp {
         };
         // Create the host at the window's real physical size rather than at
         // the requested logical default, so the initial swapchain matches.
+        // The window keeps that size for the whole run: the framebuffer is
+        // the resolution the run was created at, and the compositor's report
+        // of the window's size keeps it in step with the window.
         let config = HostConfig {
             backend: self.backend,
             surface_size: window.size(),
@@ -762,6 +858,21 @@ impl EventHandler for DesktopApp {
                 // is stepped with.
                 let source = source as *const (dyn FrameTimeSource + 'static);
                 let host = host.with_frame_time_source(source);
+                // The window's size is the resolution the run was created at:
+                // the framebuffer follows the window in every mode, because
+                // the swapchain's extent is the window's extent.
+                let framebuffer = window.size();
+                let chosen = self.chosen_resolution(framebuffer);
+                log::info!(
+                    "app.runner: the window is created resolution={}x{} fixed={} \
+                     framebuffer={}x{} native_resolution={}",
+                    chosen.0,
+                    chosen.1,
+                    self.is_fixed(),
+                    framebuffer.0,
+                    framebuffer.1,
+                    native_resolution,
+                );
                 let running = match &self.game {
                     Some(input) => {
                         match GameHost::open_with_preload(
@@ -786,9 +897,6 @@ impl EventHandler for DesktopApp {
                     }
                     None => Running::Empty(Box::new(host)),
                 };
-                // A window size the startup scripts declared
-                // (`Window.setInnerSize`) is surfaced by the first frame and
-                // applied there; the resulting `Resized` sizes the surface.
                 self.running = Some(running);
                 Flow::Continue
             }
@@ -802,13 +910,18 @@ impl EventHandler for DesktopApp {
     fn event(&mut self, event: PlatformEvent) -> Flow {
         match event {
             PlatformEvent::Resized(width, height) => {
-                if self.running.is_none() {
-                    return Flow::Continue;
-                }
                 // The surface follows the newest size at the next frame
                 // boundary. A compositor can report several sizes for one
                 // layout change; rebuilding between them would build a
                 // swapchain nothing is presented from.
+                //
+                // The size reaches the surface in every mode. The Vulkan
+                // swapchain's extent *is* the window's extent, so the
+                // compositor owns it: a run that kept a resolution of its own
+                // and ignored the report would leave the engine's surface
+                // size — and with it the presentation mapping the click is
+                // taken back through — describing a framebuffer the picture is
+                // not drawn at.
                 self.pending_surface_size = Some((width, height));
                 // The VM learns about the new size as a script event: the
                 // window posts `onResize` to script, and the frame body
@@ -850,6 +963,10 @@ impl EventHandler for DesktopApp {
         if let Some(times) = &self.frame_times {
             times.borrow_mut().push(f64::from(dt_ms));
         }
+        // A window that keeps the resolution it was created at adopts no
+        // client size from the script: the request is taken and reported. The
+        // surface still follows the window the compositor owns.
+        let fixed = self.is_fixed();
         let (report, revisions) = {
             let Some(running) = self.running.as_mut() else {
                 return Flow::Continue;
@@ -877,16 +994,26 @@ impl EventHandler for DesktopApp {
             // A backend that applies it synchronously emits no `Resized`, so
             // the surface is resized here from the size the backend reports;
             // when the compositor keeps the final size it reports it as a
-            // `Resized` event instead, which the next frame applies.
-            if let Some(size) = running.take_window_resize()
-                && size.0 != 0
-                && size.1 != 0
-                && size != window.size()
-                && let Some(applied) = window.set_size(size)
-                && let Err(error) = running.resize(applied)
-            {
-                eprintln!("krkr: frame resize failed: {error}");
-                return Flow::Exit;
+            // `Resized` event instead, which the next frame applies. A
+            // window that keeps the resolution it was created at adopts no
+            // client size: the request is taken and reported.
+            if let Some(size) = running.take_window_resize() {
+                if fixed {
+                    log::debug!(
+                        "app.runner: the window keeps the resolution it was created at; the \
+                         client size {}x{} was not applied to it",
+                        size.0,
+                        size.1,
+                    );
+                } else if size.0 != 0
+                    && size.1 != 0
+                    && size != window.size()
+                    && let Some(applied) = window.set_size(size)
+                    && let Err(error) = running.resize(applied)
+                {
+                    eprintln!("krkr: frame resize failed: {error}");
+                    return Flow::Exit;
+                }
             }
             // The CPU-presented frame is the picture the window shows: the
             // null backend composited it, and the presenter copies it into
@@ -948,6 +1075,7 @@ mod tests {
             backend: BackendKind::Null,
             game: None,
             mode: RunMode::Headless { frames: 2 },
+            resolution: Resolution::Default,
             dump_frame: None,
             slow_report_budget: None,
             slow_frame_threshold_ms: None,
@@ -990,6 +1118,7 @@ mod tests {
             backend: BackendKind::Null,
             game: None,
             mode: RunMode::Headless { frames: 5 },
+            resolution: Resolution::Default,
             dump_frame: None,
             slow_report_budget: None,
             slow_frame_threshold_ms: None,
@@ -1003,6 +1132,123 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(8),
             "five paced frames took {elapsed:?}"
+        );
+    }
+
+    /// A launch that asks for the given resolution.
+    fn launch_with(resolution: Resolution) -> Launch {
+        Launch {
+            runtime: RuntimeConfig::default(),
+            backend: BackendKind::Null,
+            game: None,
+            mode: RunMode::Windowed,
+            resolution,
+            dump_frame: None,
+            slow_report_budget: None,
+            slow_frame_threshold_ms: None,
+            frame_report: false,
+        }
+    }
+
+    /// The default launch asks the platform for the platform's own window:
+    /// its default size, and a window that is resizable, so the framebuffer
+    /// follows it.
+    #[test]
+    fn the_default_launch_asks_for_the_platform_window() {
+        let launch = launch_with(Resolution::Default);
+        let config = platform_config(&launch, Duration::from_millis(16));
+        assert_eq!(
+            config.resolution,
+            Resolution::Default,
+            "the default run keeps the platform's own window"
+        );
+        assert_eq!(
+            config.size,
+            (1280, 720),
+            "the default window takes the platform's default size"
+        );
+    }
+
+    /// A declared resolution reaches the platform, which creates the window
+    /// at it and keeps it.
+    #[test]
+    fn a_declared_resolution_reaches_the_platform() {
+        let launch = launch_with(Resolution::Size(1920, 1080));
+        let config = platform_config(&launch, Duration::from_millis(16));
+        assert_eq!(
+            config.resolution,
+            Resolution::Size(1920, 1080),
+            "the declared resolution is the window's"
+        );
+    }
+
+    /// The framebuffer follows the window in every mode: a declared
+    /// resolution and a fullscreen window keep the *window* at the resolution
+    /// they were created at, but the surface the picture is drawn into is the
+    /// window's extent either way.
+    ///
+    /// The Vulkan swapchain's extent *is* the window's extent: the compositor
+    /// owns it. So a run that ignored the compositor's report of the window's
+    /// size would leave the engine's surface size — and with it the
+    /// presentation mapping the click is taken back through — describing a
+    /// framebuffer the picture is not drawn at. The click would then land in
+    /// a place the window does not show, and the button the script draws
+    /// would be somewhere the picture is not.
+    #[test]
+    fn the_window_size_reaches_the_surface_in_every_mode() {
+        let interval = Duration::from_millis(16);
+        for resolution in [
+            Resolution::Default,
+            Resolution::Size(2880, 1620),
+            Resolution::Fullscreen,
+        ] {
+            let mut app = DesktopApp::new(&launch_with(resolution), interval, None);
+            app.event(PlatformEvent::Resized(2880, 1620));
+            assert_eq!(
+                app.pending_surface_size,
+                Some((2880, 1620)),
+                "the surface follows the window in every mode: {resolution:?}"
+            );
+        }
+    }
+
+    /// A window size that arrives before the host exists is not lost: the
+    /// host is created at the window's current size, and the size the
+    /// compositor reported is applied at the first frame.
+    #[test]
+    fn a_window_size_that_arrives_before_the_host_exists_is_kept() {
+        let interval = Duration::from_millis(16);
+        let mut app = DesktopApp::new(&launch_with(Resolution::Default), interval, None);
+        app.event(PlatformEvent::Resized(2560, 1440));
+        assert_eq!(
+            app.pending_surface_size,
+            Some((2560, 1440)),
+            "the size the compositor reported is kept for the surface"
+        );
+    }
+
+    /// A declared resolution and a fullscreen window keep the window at the
+    /// resolution they were created at: the player cannot resize it, and the
+    /// script's own window resize is not applied to it.
+    #[test]
+    fn a_fixed_window_keeps_the_resolution_it_was_created_at() {
+        let interval = Duration::from_millis(16);
+        let default = DesktopApp::new(&launch_with(Resolution::Default), interval, None);
+        assert!(
+            !default.is_fixed(),
+            "the default window is resizable and the player may resize it"
+        );
+
+        let declared = DesktopApp::new(&launch_with(Resolution::Size(2880, 1620)), interval, None);
+        assert!(
+            declared.is_fixed(),
+            "a declared resolution keeps the size it was created at"
+        );
+
+        let fullscreen = DesktopApp::new(&launch_with(Resolution::Fullscreen), interval, None);
+        assert!(
+            fullscreen.is_fixed(),
+            "a fullscreen window keeps the resolution it was created at"
         );
     }
 }

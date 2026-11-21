@@ -9,6 +9,7 @@ use api::config::CacheLimit;
 use api::host::SurfaceEvent;
 use app::InjectedFrameTime;
 use common::{build_solid_and_bitmap_scene, headless_host};
+use engine::Rect;
 use testkit::vm_lock;
 use tjs::TjsValue;
 use vm::VmHost;
@@ -71,12 +72,34 @@ fn headless_frame_draws_texture_nodes() {
     assert_eq!(report.frame_index, 1);
 }
 
+/// A bitmap a layer shows is copied to the device once.
+///
+/// The copies follow the layers: a bitmap nobody shows keeps its pixels on
+/// the host, and the copy is made when a layer shows it.
 #[test]
 fn dirty_bitmaps_create_and_upload_one_texture() {
     let mut host = headless_host();
     let bitmap = host.scene_mut().add_bitmap(2, 1, vec![9; 8]);
     assert!(host.textures().is_empty());
 
+    // Nobody shows the bitmap: its pixels stay on the host.
+    host.step(&InjectedFrameTime::new(16.0)).expect("step");
+    assert!(
+        host.textures().is_empty(),
+        "a bitmap nobody shows is not copied to the device"
+    );
+
+    // A layer shows it: the copy is made, and the bitmap is clean.
+    let window = host.scene_mut().add_window("shown", (2, 1));
+    let layer = host.scene_mut().add_layer(window, None);
+    host.scene_mut()
+        .update_layer(layer, |layer| {
+            layer.rect = Rect::new(0, 0, 2, 1);
+            layer.visible = true;
+            layer.bitmap = Some(bitmap);
+            true
+        })
+        .expect("the layer is updated");
     host.step(&InjectedFrameTime::new(16.0)).expect("step");
     assert_eq!(host.textures().len(), 1);
     assert!(!host.scene().bitmap(bitmap).expect("bitmap").dirty);
@@ -92,6 +115,43 @@ fn resize_updates_surface_size() {
     let event = host.resize((640, 360)).expect("resize");
     assert_eq!(event, SurfaceEvent::Resized(640, 360));
     assert_eq!(host.surface_size(), (640, 360));
+}
+
+/// The picture's surface and the click's mapping are one size.
+///
+/// The picture is drawn into the host's surface, and the composition root
+/// takes the click back through the host's mapping — the mapping the
+/// presentation fits the VM surface into the framebuffer with. The two must
+/// be one size: when they differ, the click lands in a place the picture was
+/// not drawn at, and the button the script draws is somewhere the picture is
+/// not.
+#[test]
+fn the_surface_and_the_mapping_are_one_size() {
+    let mut host = headless_host();
+    build_solid_and_bitmap_scene(host.scene_mut());
+    host.resize((800, 600)).expect("resize");
+
+    let translation = host.translation().expect("fittable sizes");
+    assert_eq!(
+        translation.device_size,
+        host.surface_size(),
+        "the mapping describes the surface the picture is drawn into"
+    );
+    assert_eq!(translation.device_size, (800, 600));
+    // The logical screen is the primary layer, so 320x240 is fitted into
+    // 800x600: the scale is 2.5 and the margin is empty.
+    assert_eq!(translation.vm_size, (320, 240));
+    assert_eq!(translation.scale, 2.5);
+
+    // The click is taken back through that mapping: a point in the frame's
+    // own pixels is the VM point the picture drew it at.
+    let point = translation.to_device_point((320.0, 240.0));
+    assert_eq!(point, (800.0, 600.0));
+    assert_eq!(
+        translation.to_vm_point(point),
+        (320.0, 240.0),
+        "the click lands where the picture drew the point"
+    );
 }
 
 #[test]
