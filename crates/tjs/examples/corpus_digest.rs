@@ -45,15 +45,24 @@
 //! * `--canonical <script>` — writes the canonical form of one script to
 //!   the standard output, so that two front ends can be compared by
 //!   hand.
+//! * `--time <rounds>` — times the compile of every script of the corpus
+//!   and reports the wall clock of the best round and the phases of one
+//!   measured round. The phases are the front end's own
+//!   ([`tjs::vm::compile_stats`]): the analyser, the parser, the
+//!   generator and the image build.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 use tjs::vm::codegen::context::ContextType;
 use tjs::vm::codegen::value::Value;
-use tjs::vm::{Generator, Lexer, Parser};
+use tjs::vm::{
+    Generator, Lexer, Parser, compile_stats, set_compile_stats_enabled, tjs2_script_compile,
+    tjs2_script_free,
+};
 
 /// The fixture the check reads when no other one is named.
 const FIXTURE: &str = "tests/fixtures/corpus_digest.txt";
@@ -80,6 +89,8 @@ struct Options {
     record: Option<PathBuf>,
     /// The script whose canonical form is written out.
     canonical: Option<PathBuf>,
+    /// The number of compile rounds the timing runs.
+    time: Option<usize>,
 }
 
 /// The fixture's records: the digest of every script, and the scripts
@@ -217,6 +228,16 @@ fn main() -> ExitCode {
         println!("the digests are in {}", path.display());
     }
 
+    if let Some(rounds) = options.time {
+        match time_corpus(&scripts, rounds) {
+            Ok(report) => println!("{report}"),
+            Err(message) => {
+                eprintln!("{message}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     println!(
         "the corpus: {} scripts, {} compared, {} skipped, {} not recorded yet",
         scripts.len(),
@@ -272,6 +293,7 @@ fn read_options() -> Result<Options, String> {
     let mut fixture = None;
     let mut record = None;
     let mut canonical = None;
+    let mut time = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         let mut value = || {
@@ -284,10 +306,17 @@ fn read_options() -> Result<Options, String> {
             "--fixture" => fixture = Some(PathBuf::from(value()?)),
             "--record" => record = Some(PathBuf::from(value()?)),
             "--canonical" => canonical = Some(PathBuf::from(value()?)),
+            "--time" => {
+                let rounds = value()?;
+                let rounds = rounds
+                    .parse::<usize>()
+                    .map_err(|_| format!("{rounds} is not a number of rounds"))?;
+                time = Some(rounds);
+            }
             "--help" | "-h" => {
                 println!(
                     "usage: corpus_digest --corpus <directory> [--fixture <file>] \
-                     [--record <file>] [--canonical <script>]"
+                     [--record <file>] [--canonical <script>] [--time <rounds>]"
                 );
                 std::process::exit(0);
             }
@@ -299,6 +328,7 @@ fn read_options() -> Result<Options, String> {
         fixture: fixture.unwrap_or_else(default_fixture),
         record,
         canonical,
+        time,
     })
 }
 
@@ -417,6 +447,66 @@ fn corpus_scripts(corpus: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     }
     scripts.sort();
     Ok(scripts)
+}
+
+/// The compile of every script of the corpus, timed.
+///
+/// The timing uses the shipped compile entry, so the number is the one
+/// the engine pays: the analyser, the parser, the generator and the
+/// image build. The measurement is off for the timed rounds, so the wall
+/// clock is the compile's own; one round is measured at the end, so the
+/// report names the phases the front end measured for itself.
+fn time_corpus(scripts: &[(String, PathBuf)], rounds: usize) -> Result<String, String> {
+    let mut sources = Vec::with_capacity(scripts.len());
+    for (_, path) in scripts {
+        sources.push(read_units(path)?);
+    }
+    let units: usize = sources.iter().map(|units| units.len()).sum();
+
+    let mut best = f64::INFINITY;
+    for _ in 0..rounds {
+        let started = Instant::now();
+        for source in &sources {
+            compile_one(source);
+        }
+        best = best.min(started.elapsed().as_secs_f64());
+    }
+
+    // the phases of one measured round
+    let before = compile_stats();
+    set_compile_stats_enabled(true);
+    for source in &sources {
+        compile_one(source);
+    }
+    set_compile_stats_enabled(false);
+    let after = compile_stats();
+
+    Ok(format!(
+        "the corpus compile: scripts={} code_units={} rounds={} best={best:.6} s\n\
+         the phases of one measured round: total_ms={:.1} lexer_ms={:.1} \
+         parser_ms={:.1} generator_ms={:.1} image_ms={:.1}",
+        sources.len(),
+        units,
+        rounds,
+        after.total_ms - before.total_ms,
+        after.lexer_ms - before.lexer_ms,
+        after.parser_ms - before.parser_ms,
+        after.generator_ms - before.generator_ms,
+        after.image_ms - before.image_ms,
+    ))
+}
+
+/// Compiles one script through the shipped entry and frees the handle.
+fn compile_one(units: &[u16]) {
+    // SAFETY: the code units are readable for the length the call takes,
+    // and the null values pointer means "no conditional-compilation
+    // values".
+    let handle =
+        unsafe { tjs2_script_compile(units.as_ptr(), units.len() as u32, 0, 0, std::ptr::null()) };
+    // SAFETY: the handle is live and not freed.
+    unsafe {
+        tjs2_script_free(handle);
+    }
 }
 
 /// The canonical form of one script file.

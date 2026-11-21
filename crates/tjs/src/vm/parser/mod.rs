@@ -39,7 +39,6 @@ mod nodes;
 pub use error::ParseError;
 pub use nodes::Nodes;
 
-use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::vm::codegen::context::ContextType;
@@ -47,6 +46,14 @@ use crate::vm::codegen::node::Node;
 use crate::vm::codegen::token;
 use crate::vm::codegen::value::{ObjectId, Value};
 use crate::vm::lexer::{Lexer, Token, TokenKind, ValueRef};
+
+/// The number of tokens the parser reads ahead.
+///
+/// The parser reads one token ahead, a second one to tell a cast from a
+/// parenthesized expression, and a third one for the cast's own closing
+/// parenthesis. The buffer holds one more than the parser reads, so a
+/// token is never read into a full buffer.
+const LOOKAHEAD: usize = 4;
 
 /// The commands the grammar drives.
 ///
@@ -241,9 +248,9 @@ enum CallArg {
     ExpandStar,
     /// The argument expands the arguments of the call, and holds the
     /// expression that ends with the star.
-    Expand(Rc<Node>),
+    Expand(usize),
     /// The argument is an expression.
-    Node(Rc<Node>),
+    Node(usize),
 }
 
 /// A priority expression the parser made.
@@ -286,7 +293,13 @@ pub struct Parser<'a, C: Commands> {
     /// tell a cast from a parenthesized expression, and the token it
     /// reads then is the first token of an expression — so a regular
     /// expression that starts there is read as one.
-    lookahead: VecDeque<Token>,
+    ///
+    /// The buffer is a fixed array: the parser reads at most three
+    /// tokens ahead, and the array holds the token the parser looks at
+    /// and the two after it.
+    lookahead: [Option<Token>; LOOKAHEAD],
+    /// The number of tokens the buffer holds.
+    lookahead_len: usize,
     /// The analyser reached the end of the script.
     at_end: bool,
     /// The nodes the parser made.
@@ -313,7 +326,8 @@ impl<'a, C: Commands> Parser<'a, C> {
         Self {
             lexer,
             commands,
-            lookahead: VecDeque::new(),
+            lookahead: [None; LOOKAHEAD],
+            lookahead_len: 0,
             at_end: false,
             nodes: Nodes::default(),
             current_nodes: Vec::new(),
@@ -340,9 +354,9 @@ impl<'a, C: Commands> Parser<'a, C> {
             }
         }
         Parsed {
-            nodes: self.nodes.all().to_vec(),
+            nodes: self.nodes.into_vec(),
             error_count: self.error_count,
-            first_error: self.first_error.clone(),
+            first_error: self.first_error,
         }
     }
 
@@ -354,10 +368,25 @@ impl<'a, C: Commands> Parser<'a, C> {
     // -- the token stream --------------------------------------------------
 
     /// Reads tokens until the buffer holds the given number of them.
+    ///
+    /// The buffer holds the token the parser looks at most of the time,
+    /// so the check is the whole of the work: the tokens are read by
+    /// [`Self::fill_more`].
     fn fill(&mut self, count: usize) {
-        while !self.at_end && self.lookahead.len() < count {
+        if self.lookahead_len >= count || self.at_end {
+            return;
+        }
+        self.fill_more(count);
+    }
+
+    /// Reads the tokens the buffer is short of.
+    fn fill_more(&mut self, count: usize) {
+        while !self.at_end && self.lookahead_len < count {
             match self.lexer.next_token() {
-                Ok(Some(token)) => self.lookahead.push_back(token),
+                Ok(Some(token)) => {
+                    self.lookahead[self.lookahead_len] = Some(token);
+                    self.lookahead_len += 1;
+                }
                 Ok(None) => self.at_end = true,
                 Err(error) => {
                     self.at_end = true;
@@ -376,7 +405,7 @@ impl<'a, C: Commands> Parser<'a, C> {
     /// The token the parser looks at.
     fn peek(&mut self) -> Option<Token> {
         self.fill(1);
-        self.lookahead.front().copied()
+        self.lookahead[0]
     }
 
     /// The kind of the token the parser looks at.
@@ -387,13 +416,13 @@ impl<'a, C: Commands> Parser<'a, C> {
     /// The token after the one the parser looks at.
     fn peek_second(&mut self) -> Option<Token> {
         self.fill(2);
-        self.lookahead.get(1).copied()
+        self.lookahead.get(1).copied().flatten()
     }
 
     /// The token after the one the parser looks at, and the one after it.
     fn peek_third(&mut self) -> Option<Token> {
         self.fill(3);
-        self.lookahead.get(2).copied()
+        self.lookahead.get(2).copied().flatten()
     }
 
     /// Reads the token at the given place again, as a regular expression.
@@ -403,14 +432,31 @@ impl<'a, C: Commands> Parser<'a, C> {
     /// (`crates/tjs/rust/script/src/lexer/mod.rs:520-528`).
     fn read_regexp_again(&mut self, index: usize) {
         self.lexer.expect_regexp();
-        self.lookahead.remove(index);
+        // the token at `index` leaves the buffer, and the ones after it
+        // move down
+        let last = self.lookahead_len;
+        if index < last {
+            for place in index..last - 1 {
+                self.lookahead[place] = self.lookahead[place + 1];
+            }
+            self.lookahead_len = last - 1;
+            self.lookahead[last - 1] = None;
+        }
         self.fill(index + 1);
     }
 
     /// Consumes the token the parser looks at.
     fn advance(&mut self) -> Option<Token> {
         self.fill(1);
-        self.lookahead.pop_front()
+        let Some(token) = self.lookahead[0].take() else {
+            return None;
+        };
+        for place in 1..self.lookahead_len {
+            self.lookahead[place - 1] = self.lookahead[place];
+        }
+        self.lookahead_len -= 1;
+        self.lookahead[self.lookahead_len] = None;
+        Some(token)
     }
 
     /// The place in the script the analyser is at.
@@ -760,6 +806,7 @@ impl<'a, C: Commands> Parser<'a, C> {
         self.fill(2);
         self.lookahead
             .get(1)
+            .and_then(|token| token.as_ref())
             .is_some_and(|token| token.kind == TokenKind::Symbol)
     }
 
@@ -767,7 +814,7 @@ impl<'a, C: Commands> Parser<'a, C> {
     fn expression_statement(&mut self) -> Result<(), ParseError> {
         let node = self.expr()?;
         self.expect(TokenKind::Semicolon)?;
-        Ok(self.commands.create_expr_code(&node)?)
+        Ok(self.commands.create_expr_code(self.nodes.node_ref(node))?)
     }
 
     /// An `if` statement, with the `else` that belongs to it.
@@ -776,7 +823,8 @@ impl<'a, C: Commands> Parser<'a, C> {
         self.commands.enter_if_code();
         self.expect(TokenKind::LeftParenthesis)?;
         let condition = self.expr()?;
-        self.commands.create_if_expr_code(Some(&condition))?;
+        self.commands
+            .create_if_expr_code(Some(self.nodes.node_ref(condition)))?;
         self.expect(TokenKind::RightParenthesis)?;
         self.block_or_statement()?;
         self.commands.exit_if_code()?;
@@ -796,7 +844,7 @@ impl<'a, C: Commands> Parser<'a, C> {
         self.expect(TokenKind::LeftParenthesis)?;
         let condition = self.expr()?;
         self.commands
-            .create_while_expr_code(Some(&condition), false)?;
+            .create_while_expr_code(Some(self.nodes.node_ref(condition)), false)?;
         self.expect(TokenKind::RightParenthesis)?;
         self.block_or_statement()?;
         Ok(self.commands.exit_while_code(false)?)
@@ -811,7 +859,7 @@ impl<'a, C: Commands> Parser<'a, C> {
         self.expect(TokenKind::LeftParenthesis)?;
         let condition = self.expr()?;
         self.commands
-            .create_while_expr_code(Some(&condition), true)?;
+            .create_while_expr_code(Some(self.nodes.node_ref(condition)), true)?;
         self.expect(TokenKind::RightParenthesis)?;
         self.expect(TokenKind::Semicolon)?;
         Ok(self.commands.exit_while_code(true)?)
@@ -834,7 +882,7 @@ impl<'a, C: Commands> Parser<'a, C> {
             _ => {
                 let node = self.expr()?;
                 self.commands.enter_for_code();
-                self.commands.create_expr_code(&node)?;
+                self.commands.create_expr_code(self.nodes.node_ref(node))?;
             }
         }
         self.expect(TokenKind::Semicolon)?;
@@ -846,7 +894,8 @@ impl<'a, C: Commands> Parser<'a, C> {
             }
             _ => {
                 let node = self.expr()?;
-                self.commands.create_for_expr_code(Some(&node))?;
+                self.commands
+                    .create_for_expr_code(Some(self.nodes.node_ref(node)))?;
             }
         }
         self.expect(TokenKind::Semicolon)?;
@@ -858,7 +907,8 @@ impl<'a, C: Commands> Parser<'a, C> {
             }
             _ => {
                 let node = self.expr()?;
-                self.commands.set_for_third_expr_code(Some(&node))?;
+                self.commands
+                    .set_for_third_expr_code(Some(self.nodes.node_ref(node)))?;
             }
         }
         self.expect(TokenKind::RightParenthesis)?;
@@ -895,7 +945,9 @@ impl<'a, C: Commands> Parser<'a, C> {
         if self.peek_kind() == Some(TokenKind::Equal) {
             self.advance();
             let node = self.expr_no_comma()?;
-            Ok(self.commands.init_local_variable(&name, &node)?)
+            Ok(self
+                .commands
+                .init_local_variable(&name, self.nodes.node_ref(node))?)
         } else {
             self.commands.add_local_variable(&name, 0);
             Ok(())
@@ -964,7 +1016,8 @@ impl<'a, C: Commands> Parser<'a, C> {
                     if self.peek_kind() == Some(TokenKind::Equal) {
                         self.advance();
                         let node = self.expr_no_comma()?;
-                        self.commands.add_function_decl_arg(&name, Some(&node))?;
+                        self.commands
+                            .add_function_decl_arg(&name, Some(self.nodes.node_ref(node)))?;
                     } else {
                         self.commands.add_function_decl_arg(&name, None)?;
                     }
@@ -1068,10 +1121,13 @@ impl<'a, C: Commands> Parser<'a, C> {
         let node = self.expr_no_comma()?;
         if self.peek_kind() == Some(TokenKind::Comma) {
             self.advance();
-            self.commands.create_extends_expr_code(Some(&node), false)?;
+            self.commands
+                .create_extends_expr_code(Some(self.nodes.node_ref(node)), false)?;
             self.extends_list()
         } else {
-            Ok(self.commands.create_extends_expr_code(Some(&node), true)?)
+            Ok(self
+                .commands
+                .create_extends_expr_code(Some(self.nodes.node_ref(node)), true)?)
         }
     }
 
@@ -1079,7 +1135,8 @@ impl<'a, C: Commands> Parser<'a, C> {
     fn extends_list(&mut self) -> Result<(), ParseError> {
         loop {
             let node = self.expr_no_comma()?;
-            self.commands.create_extends_expr_code(Some(&node), false)?;
+            self.commands
+                .create_extends_expr_code(Some(self.nodes.node_ref(node)), false)?;
             if self.peek_kind() == Some(TokenKind::Comma) {
                 self.advance();
             } else {
@@ -1098,7 +1155,9 @@ impl<'a, C: Commands> Parser<'a, C> {
         } else {
             let node = self.expr()?;
             self.expect(TokenKind::Semicolon)?;
-            Ok(self.commands.return_from_func(Some(&node))?)
+            Ok(self
+                .commands
+                .return_from_func(Some(self.nodes.node_ref(node)))?)
         }
     }
 
@@ -1108,7 +1167,8 @@ impl<'a, C: Commands> Parser<'a, C> {
         self.expect(TokenKind::LeftParenthesis)?;
         let node = self.expr()?;
         self.expect(TokenKind::RightParenthesis)?;
-        self.commands.enter_switch_code(Some(&node))?;
+        self.commands
+            .enter_switch_code(Some(self.nodes.node_ref(node)))?;
         let result = self.block();
         self.commands.exit_switch_code()?;
         result
@@ -1120,7 +1180,8 @@ impl<'a, C: Commands> Parser<'a, C> {
         self.expect(TokenKind::LeftParenthesis)?;
         let node = self.expr()?;
         self.expect(TokenKind::RightParenthesis)?;
-        self.commands.enter_with_code(Some(&node))?;
+        self.commands
+            .enter_with_code(Some(self.nodes.node_ref(node)))?;
         let result = self.block_or_statement();
         self.commands.exit_with_code()?;
         result
@@ -1132,7 +1193,9 @@ impl<'a, C: Commands> Parser<'a, C> {
             self.advance();
             let node = self.expr()?;
             self.expect(TokenKind::Colon)?;
-            Ok(self.commands.process_case_code(Some(&node))?)
+            Ok(self
+                .commands
+                .process_case_code(Some(self.nodes.node_ref(node)))?)
         } else {
             self.advance();
             self.expect(TokenKind::Colon)?;
@@ -1172,48 +1235,48 @@ impl<'a, C: Commands> Parser<'a, C> {
         self.advance();
         let node = self.expr()?;
         self.expect(TokenKind::Semicolon)?;
-        Ok(self.commands.process_throw_code(Some(&node))?)
+        Ok(self
+            .commands
+            .process_throw_code(Some(self.nodes.node_ref(node)))?)
     }
 
     // -- the expressions ----------------------------------------------------
 
     /// An expression that holds no comma.
-    fn expr_no_comma(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn expr_no_comma(&mut self) -> Result<usize, ParseError> {
         self.assign_expr()
     }
 
     /// An expression.
-    fn expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn expr(&mut self) -> Result<usize, ParseError> {
         let node = self.comma_expr()?;
         if self.peek_kind() == Some(TokenKind::If) {
             self.advance();
             let condition = self.expr()?;
             let position = self.position();
-            let index = self
+            return Ok(self
                 .nodes
-                .make_np2(token::T_IF, position, Some(&node), Some(&condition));
-            return Ok(self.nodes.node(index));
+                .make_np2(token::T_IF, position, Some(node), Some(condition)));
         }
         Ok(node)
     }
 
     /// A comma expression.
-    fn comma_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn comma_expr(&mut self) -> Result<usize, ParseError> {
         let mut node = self.assign_expr()?;
         while self.peek_kind() == Some(TokenKind::Comma) {
             self.advance();
             let right = self.assign_expr()?;
             let position = self.position();
-            let index = self
+            node = self
                 .nodes
-                .make_np2(token::T_COMMA, position, Some(&node), Some(&right));
-            node = self.nodes.node(index);
+                .make_np2(token::T_COMMA, position, Some(node), Some(right));
         }
         Ok(node)
     }
 
     /// An assignment.
-    fn assign_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn assign_expr(&mut self) -> Result<usize, ParseError> {
         let node = self.cond_expr()?;
         let opcode = match self.peek_kind() {
             Some(TokenKind::Swap) => token::T_SWAP,
@@ -1239,12 +1302,12 @@ impl<'a, C: Commands> Parser<'a, C> {
         let position = self.position();
         let index = self
             .nodes
-            .make_np2(opcode, position, Some(&node), Some(&right));
-        Ok(self.nodes.node(index))
+            .make_np2(opcode, position, Some(node), Some(right));
+        Ok(index)
     }
 
     /// A conditional expression.
-    fn cond_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn cond_expr(&mut self) -> Result<usize, ParseError> {
         let node = self.logical_or_expr()?;
         if self.peek_kind() != Some(TokenKind::Question) {
             return Ok(node);
@@ -1257,90 +1320,85 @@ impl<'a, C: Commands> Parser<'a, C> {
         let index = self.nodes.make_np3(
             token::T_QUESTION,
             position,
-            Some(&node),
-            Some(&then_branch),
-            Some(&else_branch),
+            Some(node),
+            Some(then_branch),
+            Some(else_branch),
         );
-        Ok(self.nodes.node(index))
+        Ok(index)
     }
 
     /// A logical or.
-    fn logical_or_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn logical_or_expr(&mut self) -> Result<usize, ParseError> {
         let mut node = self.logical_and_expr()?;
         while self.peek_kind() == Some(TokenKind::LogicalOr) {
             self.advance();
             let right = self.logical_and_expr()?;
             let position = self.position();
-            let index =
-                self.nodes
-                    .make_np2(token::T_LOGICALOR, position, Some(&node), Some(&right));
-            node = self.nodes.node(index);
+            node = self
+                .nodes
+                .make_np2(token::T_LOGICALOR, position, Some(node), Some(right));
         }
         Ok(node)
     }
 
     /// A logical and.
-    fn logical_and_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn logical_and_expr(&mut self) -> Result<usize, ParseError> {
         let mut node = self.inclusive_or_expr()?;
         while self.peek_kind() == Some(TokenKind::LogicalAnd) {
             self.advance();
             let right = self.inclusive_or_expr()?;
             let position = self.position();
-            let index =
-                self.nodes
-                    .make_np2(token::T_LOGICALAND, position, Some(&node), Some(&right));
-            node = self.nodes.node(index);
+            node = self
+                .nodes
+                .make_np2(token::T_LOGICALAND, position, Some(node), Some(right));
         }
         Ok(node)
     }
 
     /// An inclusive or.
-    fn inclusive_or_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn inclusive_or_expr(&mut self) -> Result<usize, ParseError> {
         let mut node = self.exclusive_or_expr()?;
         while self.peek_kind() == Some(TokenKind::VerticalBar) {
             self.advance();
             let right = self.exclusive_or_expr()?;
             let position = self.position();
-            let index = self
+            node = self
                 .nodes
-                .make_np2(token::T_VERTLINE, position, Some(&node), Some(&right));
-            node = self.nodes.node(index);
+                .make_np2(token::T_VERTLINE, position, Some(node), Some(right));
         }
         Ok(node)
     }
 
     /// An exclusive or.
-    fn exclusive_or_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn exclusive_or_expr(&mut self) -> Result<usize, ParseError> {
         let mut node = self.and_expr()?;
         while self.peek_kind() == Some(TokenKind::Chevron) {
             self.advance();
             let right = self.and_expr()?;
             let position = self.position();
-            let index = self
+            node = self
                 .nodes
-                .make_np2(token::T_CHEVRON, position, Some(&node), Some(&right));
-            node = self.nodes.node(index);
+                .make_np2(token::T_CHEVRON, position, Some(node), Some(right));
         }
         Ok(node)
     }
 
     /// An and.
-    fn and_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn and_expr(&mut self) -> Result<usize, ParseError> {
         let mut node = self.identical_expr()?;
         while self.peek_kind() == Some(TokenKind::Ampersand) {
             self.advance();
             let right = self.identical_expr()?;
             let position = self.position();
-            let index =
-                self.nodes
-                    .make_np2(token::T_AMPERSAND, position, Some(&node), Some(&right));
-            node = self.nodes.node(index);
+            node = self
+                .nodes
+                .make_np2(token::T_AMPERSAND, position, Some(node), Some(right));
         }
         Ok(node)
     }
 
     /// An identity test.
-    fn identical_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn identical_expr(&mut self) -> Result<usize, ParseError> {
         let mut node = self.compare_expr()?;
         loop {
             let opcode = match self.peek_kind() {
@@ -1353,16 +1411,15 @@ impl<'a, C: Commands> Parser<'a, C> {
             self.advance();
             let right = self.compare_expr()?;
             let position = self.position();
-            let index = self
+            node = self
                 .nodes
-                .make_np2(opcode, position, Some(&node), Some(&right));
-            node = self.nodes.node(index);
+                .make_np2(opcode, position, Some(node), Some(right));
         }
         Ok(node)
     }
 
     /// A comparison.
-    fn compare_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn compare_expr(&mut self) -> Result<usize, ParseError> {
         let mut node = self.shift_expr()?;
         loop {
             let opcode = match self.peek_kind() {
@@ -1375,16 +1432,15 @@ impl<'a, C: Commands> Parser<'a, C> {
             self.advance();
             let right = self.shift_expr()?;
             let position = self.position();
-            let index = self
+            node = self
                 .nodes
-                .make_np2(opcode, position, Some(&node), Some(&right));
-            node = self.nodes.node(index);
+                .make_np2(opcode, position, Some(node), Some(right));
         }
         Ok(node)
     }
 
     /// A shift.
-    fn shift_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn shift_expr(&mut self) -> Result<usize, ParseError> {
         let mut node = self.add_sub_expr()?;
         loop {
             let opcode = match self.peek_kind() {
@@ -1396,16 +1452,15 @@ impl<'a, C: Commands> Parser<'a, C> {
             self.advance();
             let right = self.add_sub_expr()?;
             let position = self.position();
-            let index = self
+            node = self
                 .nodes
-                .make_np2(opcode, position, Some(&node), Some(&right));
-            node = self.nodes.node(index);
+                .make_np2(opcode, position, Some(node), Some(right));
         }
         Ok(node)
     }
 
     /// An addition or a subtraction.
-    fn add_sub_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn add_sub_expr(&mut self) -> Result<usize, ParseError> {
         let mut node = self.mul_div_expr()?;
         loop {
             let opcode = match self.peek_kind() {
@@ -1416,10 +1471,9 @@ impl<'a, C: Commands> Parser<'a, C> {
             self.advance();
             let right = self.mul_div_expr()?;
             let position = self.position();
-            let index = self
+            node = self
                 .nodes
-                .make_np2(opcode, position, Some(&node), Some(&right));
-            node = self.nodes.node(index);
+                .make_np2(opcode, position, Some(node), Some(right));
         }
         Ok(node)
     }
@@ -1431,7 +1485,7 @@ impl<'a, C: Commands> Parser<'a, C> {
     ///
     /// The star that ends an argument is not a multiplication: the token
     /// that follows the star tells the two apart.
-    fn mul_div_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn mul_div_expr(&mut self) -> Result<usize, ParseError> {
         let mut node = self.unary_expr()?;
         loop {
             let opcode = match self.peek_kind() {
@@ -1449,10 +1503,9 @@ impl<'a, C: Commands> Parser<'a, C> {
             self.advance();
             let right = self.unary_expr()?;
             let position = self.position();
-            let index = self
+            node = self
                 .nodes
-                .make_np2(opcode, position, Some(&node), Some(&right));
-            node = self.nodes.node(index);
+                .make_np2(opcode, position, Some(node), Some(right));
         }
         Ok(node)
     }
@@ -1464,7 +1517,7 @@ impl<'a, C: Commands> Parser<'a, C> {
     /// argument.
     fn operand_follows(&mut self) -> bool {
         self.fill(2);
-        let Some(token) = self.lookahead.get(1) else {
+        let Some(token) = self.lookahead.get(1).copied().flatten() else {
             return false;
         };
         matches!(
@@ -1505,7 +1558,7 @@ impl<'a, C: Commands> Parser<'a, C> {
     }
 
     /// A unary expression.
-    fn unary_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn unary_expr(&mut self) -> Result<usize, ParseError> {
         let opcode = match self.peek_kind() {
             Some(TokenKind::Exclamation) => Some(token::T_EXCRAMATION),
             Some(TokenKind::Tilde) => Some(token::T_TILDE),
@@ -1530,8 +1583,8 @@ impl<'a, C: Commands> Parser<'a, C> {
             self.advance();
             let operand = self.unary_expr()?;
             let position = self.position();
-            let index = self.nodes.make_np1(opcode, position, Some(&operand));
-            return Ok(self.nodes.node(index));
+            let index = self.nodes.make_np1(opcode, position, Some(operand));
+            return Ok(index);
         }
 
         // the cast: the type that follows the parenthesis is read, so the
@@ -1547,8 +1600,8 @@ impl<'a, C: Commands> Parser<'a, C> {
             self.expect(TokenKind::RightParenthesis)?;
             let operand = self.unary_expr()?;
             let position = self.position();
-            let index = self.nodes.make_np1(opcode, position, Some(&operand));
-            return Ok(self.nodes.node(index));
+            let index = self.nodes.make_np1(opcode, position, Some(operand));
+            return Ok(index);
         }
 
         // the new operator takes a call: the grammar gives the new a
@@ -1557,7 +1610,7 @@ impl<'a, C: Commands> Parser<'a, C> {
             self.advance();
             let index = self.func_call_expr()?;
             self.nodes.set_opcode(index, token::T_NEW);
-            return Ok(self.nodes.node(index));
+            return Ok(index);
         }
 
         let node = self.incontextof_expr()?;
@@ -1565,8 +1618,8 @@ impl<'a, C: Commands> Parser<'a, C> {
             Some(TokenKind::IsValid) => {
                 self.advance();
                 let position = self.position();
-                let index = self.nodes.make_np1(token::T_ISVALID, position, Some(&node));
-                Ok(self.nodes.node(index))
+                let index = self.nodes.make_np1(token::T_ISVALID, position, Some(node));
+                Ok(index)
             }
             Some(TokenKind::InstanceOf) => {
                 self.advance();
@@ -1574,8 +1627,8 @@ impl<'a, C: Commands> Parser<'a, C> {
                 let position = self.position();
                 let index =
                     self.nodes
-                        .make_np2(token::T_INSTANCEOF, position, Some(&node), Some(&right));
-                Ok(self.nodes.node(index))
+                        .make_np2(token::T_INSTANCEOF, position, Some(node), Some(right));
+                Ok(index)
             }
             Some(TokenKind::In) => {
                 self.advance();
@@ -1583,8 +1636,8 @@ impl<'a, C: Commands> Parser<'a, C> {
                 let position = self.position();
                 let index = self
                     .nodes
-                    .make_np2(token::T_IN, position, Some(&node), Some(&right));
-                Ok(self.nodes.node(index))
+                    .make_np2(token::T_IN, position, Some(node), Some(right));
+                Ok(index)
             }
             _ => Ok(node),
         }
@@ -1628,19 +1681,17 @@ impl<'a, C: Commands> Parser<'a, C> {
     }
 
     /// An `incontextof` expression.
-    fn incontextof_expr(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn incontextof_expr(&mut self) -> Result<usize, ParseError> {
         let PriorityExpr { mut index, .. } = self.priority_expr()?;
-        let mut node = self.nodes.node(index);
         while self.peek_kind() == Some(TokenKind::InContextOf) {
             self.advance();
             let right = self.incontextof_expr()?;
             let position = self.position();
             index = self
                 .nodes
-                .make_np2(token::T_INCONTEXTOF, position, Some(&node), Some(&right));
-            node = self.nodes.node(index);
+                .make_np2(token::T_INCONTEXTOF, position, Some(index), Some(right));
         }
-        Ok(node)
+        Ok(index)
     }
 
     /// A priority expression.
@@ -1670,8 +1721,8 @@ impl<'a, C: Commands> Parser<'a, C> {
                     index = self.nodes.make_np2(
                         token::T_LBRACKET,
                         position,
-                        Some(&self.nodes.node(index)),
-                        Some(&bracket),
+                        Some(index),
+                        Some(bracket),
                     );
                 }
                 Some(TokenKind::Dot) => {
@@ -1682,37 +1733,28 @@ impl<'a, C: Commands> Parser<'a, C> {
                     let name = self.nodes.make_np0(token::T_CONSTVAL, position);
                     let value = Value::String(self.name_of(&token));
                     self.nodes.set_value(name, value);
-                    index = self.nodes.make_np2(
-                        token::T_DOT,
-                        position,
-                        Some(&self.nodes.node(index)),
-                        Some(&self.nodes.node(name)),
-                    );
+                    index = self
+                        .nodes
+                        .make_np2(token::T_DOT, position, Some(index), Some(name));
                 }
                 Some(TokenKind::Increment) => {
                     self.advance();
                     let position = self.position();
-                    index = self.nodes.make_np1(
-                        token::T_POSTINCREMENT,
-                        position,
-                        Some(&self.nodes.node(index)),
-                    );
+                    index = self
+                        .nodes
+                        .make_np1(token::T_POSTINCREMENT, position, Some(index));
                 }
                 Some(TokenKind::Decrement) => {
                     self.advance();
                     let position = self.position();
-                    index = self.nodes.make_np1(
-                        token::T_POSTDECREMENT,
-                        position,
-                        Some(&self.nodes.node(index)),
-                    );
+                    index = self
+                        .nodes
+                        .make_np1(token::T_POSTDECREMENT, position, Some(index));
                 }
                 Some(TokenKind::Exclamation) => {
                     self.advance();
                     let position = self.position();
-                    index =
-                        self.nodes
-                            .make_np1(token::T_EVAL, position, Some(&self.nodes.node(index)));
+                    index = self.nodes.make_np1(token::T_EVAL, position, Some(index));
                 }
                 Some(TokenKind::LeftParenthesis) => {
                     self.advance();
@@ -1722,8 +1764,8 @@ impl<'a, C: Commands> Parser<'a, C> {
                     index = self.nodes.make_np2(
                         token::T_LPARENTHESIS,
                         position,
-                        Some(&self.nodes.node(index)),
-                        Some(&arguments),
+                        Some(index),
+                        Some(arguments),
                     );
                     called = true;
                 }
@@ -1745,7 +1787,7 @@ impl<'a, C: Commands> Parser<'a, C> {
                 }
                 let node = self.expr()?;
                 self.expect(TokenKind::RightParenthesis)?;
-                Ok(self.node_index(&node))
+                Ok(node)
             }
             Some(TokenKind::Dot) => {
                 self.advance();
@@ -1755,21 +1797,10 @@ impl<'a, C: Commands> Parser<'a, C> {
                 let name = self.nodes.make_np0(token::T_CONSTVAL, position);
                 let value = Value::String(self.name_of(&token));
                 self.nodes.set_value(name, value);
-                Ok(self
-                    .nodes
-                    .make_np1(token::T_WITHDOT, position, Some(&self.nodes.node(name))))
+                Ok(self.nodes.make_np1(token::T_WITHDOT, position, Some(name)))
             }
             _ => self.factor_expr(),
         }
-    }
-
-    /// The place a node has in the tree the parser made.
-    fn node_index(&self, node: &Rc<Node>) -> usize {
-        self.nodes
-            .all()
-            .iter()
-            .position(|made| Rc::ptr_eq(made, node))
-            .unwrap_or(0)
     }
 
     /// A function call.
@@ -1787,12 +1818,11 @@ impl<'a, C: Commands> Parser<'a, C> {
     }
 
     /// The arguments of a call.
-    fn call_arg_list(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn call_arg_list(&mut self) -> Result<usize, ParseError> {
         if self.peek_kind() == Some(TokenKind::Omit) {
             self.advance();
             let position = self.position();
-            let index = self.nodes.make_np0(token::T_OMIT, position);
-            return Ok(self.nodes.node(index));
+            return Ok(self.nodes.make_np0(token::T_OMIT, position));
         }
         let first = self.call_arg()?;
         // the token that follows the argument is read before the node that
@@ -1800,29 +1830,25 @@ impl<'a, C: Commands> Parser<'a, C> {
         if self.peek_kind() != Some(TokenKind::Comma) {
             let position = self.position();
             let first = self.call_arg_node(first, position);
-            let index = self.nodes.make_np1(token::T_ARG, position, first.as_ref());
-            return Ok(self.nodes.node(index));
+            return Ok(self.nodes.make_np1(token::T_ARG, position, first));
         }
         let position = self.position();
         let first = self.call_arg_node(first, position);
-        let mut index = self.nodes.make_np1(token::T_ARG, position, first.as_ref());
+        let mut index = self.nodes.make_np1(token::T_ARG, position, first);
         loop {
             self.advance();
             let argument = self.call_arg()?;
             let more = self.peek_kind() == Some(TokenKind::Comma);
             let position = self.position();
             let argument = self.call_arg_node(argument, position);
-            index = self.nodes.make_np2(
-                token::T_ARG,
-                position,
-                argument.as_ref(),
-                Some(&self.nodes.node(index)),
-            );
+            index = self
+                .nodes
+                .make_np2(token::T_ARG, position, argument, Some(index));
             if !more {
                 break;
             }
         }
-        Ok(self.nodes.node(index))
+        Ok(index)
     }
 
     /// The node one argument of a call makes.
@@ -1830,19 +1856,15 @@ impl<'a, C: Commands> Parser<'a, C> {
     /// The token that follows the argument is read before the argument is
     /// reduced, so the node the argument makes is placed after that
     /// token.
-    fn call_arg_node(&mut self, argument: CallArg, position: i32) -> Option<Rc<Node>> {
+    fn call_arg_node(&mut self, argument: CallArg, position: i32) -> Option<usize> {
         match argument {
             CallArg::Empty => None,
-            CallArg::ExpandStar => {
-                let index = self.nodes.make_np1(token::T_EXPANDARG, position, None);
-                Some(self.nodes.node(index))
-            }
-            CallArg::Expand(node) => {
-                let index = self
-                    .nodes
-                    .make_np1(token::T_EXPANDARG, position, Some(&node));
-                Some(self.nodes.node(index))
-            }
+            CallArg::ExpandStar => Some(self.nodes.make_np1(token::T_EXPANDARG, position, None)),
+            CallArg::Expand(node) => Some(self.nodes.make_np1(
+                token::T_EXPANDARG,
+                position,
+                Some(node),
+            )),
             CallArg::Node(node) => Some(node),
         }
     }
@@ -1997,20 +2019,16 @@ impl<'a, C: Commands> Parser<'a, C> {
     }
 
     /// One element of an inline array.
-    fn array_elm(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn array_elm(&mut self) -> Result<usize, ParseError> {
         match self.peek_kind() {
             Some(TokenKind::RightBracket) | Some(TokenKind::Comma) => {
                 let position = self.position();
-                let index = self.nodes.make_np1(token::T_ARRAYARG, position, None);
-                Ok(self.nodes.node(index))
+                Ok(self.nodes.make_np1(token::T_ARRAYARG, position, None))
             }
             _ => {
                 let node = self.expr_no_comma()?;
                 let position = self.position();
-                let index = self
-                    .nodes
-                    .make_np1(token::T_ARRAYARG, position, Some(&node));
-                Ok(self.nodes.node(index))
+                Ok(self.nodes.make_np1(token::T_ARRAYARG, position, Some(node)))
             }
         }
     }
@@ -2023,6 +2041,8 @@ impl<'a, C: Commands> Parser<'a, C> {
         self.fill(2);
         self.lookahead
             .get(1)
+            .copied()
+            .flatten()
             .is_some_and(|token| token.kind == TokenKind::Colon)
     }
 
@@ -2109,7 +2129,7 @@ impl<'a, C: Commands> Parser<'a, C> {
                 let node = self.const_inline()?;
                 Ok(self
                     .nodes
-                    .node(node)
+                    .node_ref(node)
                     .value()
                     .cloned()
                     .unwrap_or(Value::Void))
@@ -2164,7 +2184,7 @@ impl<'a, C: Commands> Parser<'a, C> {
                 }
                 let node = self.const_inline()?;
                 self.nodes
-                    .node(node)
+                    .node_ref(node)
                     .value()
                     .cloned()
                     .unwrap_or(Value::Void)
@@ -2237,7 +2257,7 @@ impl<'a, C: Commands> Parser<'a, C> {
     ///
     /// The element is a name and a value, and the name and the value are
     /// told apart by the `:` that follows the name.
-    fn dic_elm(&mut self) -> Result<Rc<Node>, ParseError> {
+    fn dic_elm(&mut self) -> Result<usize, ParseError> {
         if self.peek_kind() == Some(TokenKind::Symbol) && self.name_has_colon() {
             let token = self.advance().unwrap_or(Token::new(TokenKind::Symbol));
             self.expect(TokenKind::Colon)?;
@@ -2246,21 +2266,16 @@ impl<'a, C: Commands> Parser<'a, C> {
             let name = self.nodes.make_np0(token::T_CONSTVAL, position);
             let text = self.name_of(&token);
             self.nodes.set_value(name, Value::String(text));
-            let index = self.nodes.make_np2(
-                token::T_DICELM,
-                position,
-                Some(&self.nodes.node(name)),
-                Some(&value),
-            );
-            return Ok(self.nodes.node(index));
+            return Ok(self
+                .nodes
+                .make_np2(token::T_DICELM, position, Some(name), Some(value)));
         }
         let name = self.expr_no_comma()?;
         self.expect(TokenKind::Comma)?;
         let value = self.expr_no_comma()?;
         let position = self.position();
-        let index = self
+        Ok(self
             .nodes
-            .make_np2(token::T_DICELM, position, Some(&name), Some(&value));
-        Ok(self.nodes.node(index))
+            .make_np2(token::T_DICELM, position, Some(name), Some(value)))
     }
 }

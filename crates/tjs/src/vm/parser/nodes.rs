@@ -9,6 +9,11 @@
 //!
 //! A child may be absent: the grammar makes nodes with a null child — the
 //! empty call argument and the empty array element.
+//!
+//! A node is named by the place it has in the tree the parser made: the
+//! nodes are kept in the order they were made, and a node is addressed by
+//! its number in that order. The grammar's rules pass the numbers around,
+//! so a node is never looked for by its identity.
 
 use std::rc::Rc;
 
@@ -31,6 +36,11 @@ impl Nodes {
         &self.nodes
     }
 
+    /// The nodes that were made, moved out of the tree.
+    pub fn into_vec(self) -> Vec<Rc<Node>> {
+        self.nodes
+    }
+
     /// The number of nodes that were made.
     pub fn len(&self) -> usize {
         self.nodes.len()
@@ -44,6 +54,14 @@ impl Nodes {
     /// The node at the given place.
     pub fn node(&self, index: usize) -> Rc<Node> {
         self.nodes[index].clone()
+    }
+
+    /// The node at the given place, borrowed.
+    ///
+    /// The node is borrowed and not copied, so the tree the parser built
+    /// costs no handle of its own on the way to the generator.
+    pub fn node_ref(&self, index: usize) -> &Rc<Node> {
+        &self.nodes[index]
     }
 
     /// The node at the given place, for a change.
@@ -65,12 +83,17 @@ impl Nodes {
     /// Makes a node with an opcode, a place and one child.
     ///
     /// The expression folds when the child is a constant.
-    pub fn make_np1(&mut self, opcode: i32, position: i32, child: Option<&Rc<Node>>) -> usize {
-        if let Some(folded) = fold_unary(opcode, child) {
+    pub fn make_np1(&mut self, opcode: i32, position: i32, child: Option<usize>) -> usize {
+        let folded = match child {
+            Some(child) => fold_unary(opcode, &self.nodes[child]),
+            None => None,
+        };
+        if let Some(folded) = folded {
             return self.keep(Node::with_value(token::T_CONSTVAL, position, folded));
         }
         let mut node = Node::new(opcode, position);
-        Rc::make_mut(&mut node).children.push(child.cloned());
+        let child = child.map(|child| self.nodes[child].clone());
+        Rc::make_mut(&mut node).children.push(child);
         self.keep(node)
     }
 
@@ -81,17 +104,25 @@ impl Nodes {
         &mut self,
         opcode: i32,
         position: i32,
-        first: Option<&Rc<Node>>,
-        second: Option<&Rc<Node>>,
+        first: Option<usize>,
+        second: Option<usize>,
     ) -> usize {
-        if let Some(folded) = fold_binary(opcode, first, second) {
+        let folded = match (first, second) {
+            (Some(first), Some(second)) => {
+                fold_binary(opcode, &self.nodes[first], &self.nodes[second])
+            }
+            _ => None,
+        };
+        if let Some(folded) = folded {
             return self.keep(Node::with_value(token::T_CONSTVAL, position, folded));
         }
         let mut node = Node::new(opcode, position);
+        let first = first.map(|first| self.nodes[first].clone());
+        let second = second.map(|second| self.nodes[second].clone());
         {
             let children = &mut Rc::make_mut(&mut node).children;
-            children.push(first.cloned());
-            children.push(second.cloned());
+            children.push(first);
+            children.push(second);
         }
         self.keep(node)
     }
@@ -103,16 +134,19 @@ impl Nodes {
         &mut self,
         opcode: i32,
         position: i32,
-        first: Option<&Rc<Node>>,
-        second: Option<&Rc<Node>>,
-        third: Option<&Rc<Node>>,
+        first: Option<usize>,
+        second: Option<usize>,
+        third: Option<usize>,
     ) -> usize {
         let mut node = Node::new(opcode, position);
+        let first = first.map(|first| self.nodes[first].clone());
+        let second = second.map(|second| self.nodes[second].clone());
+        let third = third.map(|third| self.nodes[third].clone());
         {
             let children = &mut Rc::make_mut(&mut node).children;
-            children.push(first.cloned());
-            children.push(second.cloned());
-            children.push(third.cloned());
+            children.push(first);
+            children.push(second);
+            children.push(third);
         }
         self.keep(node)
     }
@@ -128,14 +162,14 @@ impl Nodes {
     }
 
     /// Adds a child to a node.
-    pub fn add_child(&mut self, index: usize, child: Rc<Node>) {
+    pub fn add_child(&mut self, index: usize, child: usize) {
+        let child = self.nodes[child].clone();
         node::add_child(&mut self.nodes[index], child);
     }
 }
 
 /// The folded value of a unary operation, when it folds.
-fn fold_unary(opcode: i32, child: Option<&Rc<Node>>) -> Option<Value> {
-    let child = child?;
+fn fold_unary(opcode: i32, child: &Rc<Node>) -> Option<Value> {
     if child.opcode != token::T_CONSTVAL {
         return None;
     }
@@ -144,9 +178,7 @@ fn fold_unary(opcode: i32, child: Option<&Rc<Node>>) -> Option<Value> {
 }
 
 /// The folded value of a binary operation, when it folds.
-fn fold_binary(opcode: i32, first: Option<&Rc<Node>>, second: Option<&Rc<Node>>) -> Option<Value> {
-    let first = first?;
-    let second = second?;
+fn fold_binary(opcode: i32, first: &Rc<Node>, second: &Rc<Node>) -> Option<Value> {
     if first.opcode != token::T_CONSTVAL || second.opcode != token::T_CONSTVAL {
         return None;
     }
