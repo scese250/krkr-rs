@@ -54,10 +54,25 @@ name for the universal rule-image transition with a hard threshold
 (`crates/engine/src/trans/mod.rs`).
 
 Every option is read through the shared option helpers and validated inside the
-engine, so an out-of-range value is a typed error rather than a silent clamp.
+engine. A value the engine rejects while the transition is built is a typed
+error, not a silent clamp; a value only the provider's own draw-time check
+rejects draws the cross-fade instead, and the fallback is reported. The two
+sources differing in size when the frame is drawn is the same case: the
+cross-fade draws the part of the source that covers the destination, and the
+fallback is reported.
 The defaults are the reference's (`wave.cpp:327-331`, `mosaic.cpp:436-445`,
 `turn.cpp:555-563`, `rotatetrans.cpp:183-193,284-291,453-465`,
 `ripple.cpp:1574-1627`).
+
+A name no provider answers is drawn as the cross-fade, the way the reference's
+provider lookup falls back to `crossfade`
+(`reference/cpp/core/visual/TransIntf.cpp:296-299,331-341`). The fallback is
+reported once per transition, in one record that names the name the script
+asked for:
+
+```
+compat.layer: an unknown transition is drawn as a cross-fade transition=nope fallback=crossfade
+```
 
 ## State and lifetime
 
@@ -67,16 +82,17 @@ transition state owns for the duration of the transition.
 
 ## Errors
 
-None from this module. A transition name the dispatcher does not know, or an
-option outside its range, is reported by the transition dispatcher as a typed
-error during `Layer.beginTransition`.
+None from this module. A transition name the dispatcher does not know is drawn
+as the cross-fade and reported, not raised; an option outside its range is
+reported by the transition dispatcher as a typed error during
+`Layer.beginTransition`.
 
 ## Tests
 
 | file | what it pins |
 |---|---|
 | `crates/compat/tests/transitions.rs` | each provider's output, the reference option defaults, that the options reach the handlers, and that an invalid option is a typed error |
-| `crates/compat/tests/layer.rs` | that every `extrans` provider name starts and stops a real transition, and that an unknown name or an invalid option raises a typed error |
+| `crates/compat/tests/layer.rs` | that every `extrans` provider name starts and stops a real transition, that an unknown name is drawn as the cross-fade, and that an invalid option raises a typed error |
 | `crates/compat/tests/plugin.rs` | that `extrans.dll` — one of the DLLs the shipped game links — resolves to the built-in table |
 
 ## Known gaps
@@ -85,10 +101,11 @@ error during `Layer.beginTransition`.
   script could, in principle, extend. The port's dispatcher is a fixed match,
   so a script cannot add a transition provider of its own. No reference plugin
   exposes that registry to TJS, so nothing script-visible changes.
-* An **unknown** transition name is not an error in the reference: the
-  provider lookup shows a warning box and falls back to `crossfade`
-  (`reference/cpp/core/visual/TransIntf.cpp:332-341`). The port raises a typed
-  error instead (`Layer.beginTransition: unsupported transition …`). The
-  port's extra spellings (`""`, `fade`, `slide`, `push`, `mask`) are its own;
-  the reference knows none of them, so in the reference they would all take the
-  warning-and-cross-fade path.
+* The reference shows a **message box** when the provider lookup misses
+  (`reference/cpp/core/visual/TransIntf.cpp:332-341`); the port writes the
+  record above instead. The transition that is drawn is the same one in both:
+  the cross-fade.
+* The port's extra spellings (`""`, `fade`, `slide`, `push`, `mask`) are its
+  own; the reference knows none of them, so in the reference they would all
+  take the warning-and-cross-fade path. The port maps `""` straight to the
+  cross-fade, so that spelling draws the same transition without a record.

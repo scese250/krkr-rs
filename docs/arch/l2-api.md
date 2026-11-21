@@ -450,8 +450,8 @@ Code map: [`../code/engine/timer.md`](../code/engine/timer.md).
 
 | item | what it is |
 |---|---|
-| `Trans` | one transition: the kind, the duration, the elapsed time, the phase, the rule and the completion flag |
-| `TransKind` | the kinds: `CrossFade`, `Universal { vague }`, `Mask`, `Scroll { from, stay }`, `Wave`, `Mosaic`, `Turn`, `RotateZoom`, `RotateVanish`, `RotateSwap`, `Ripple` |
+| `Trans` | one transition: the kind, the duration, the elapsed time, the phase, the rule, the completion flag and the fallback flag |
+| `TransKind` | the kinds: `CrossFade`, `Universal { vague }`, `Mask`, `Scroll { from, stay }`, `Wave`, `Mosaic`, `Turn`, `RotateZoom`, `RotateVanish`, `RotateSwap`, `Ripple`; `name()` gives the provider's own name |
 | `ScrollFrom` / `ScrollStay` | the scroll vocabulary: `Left`, `Top`, `Right`, `Bottom`; `NoStay`, `StayDest`, `StaySrc` |
 | `RuleMask` | the decoded grayscale rule image, tiled over the source |
 | `TransStep` | what one step produced: the normalized progress, the integer phase and the completed flag |
@@ -464,12 +464,20 @@ duration_ms, rule)`, the named constructors `cross_fade`, `universal`,
 `rule`; the drivers `step(dt_ms)`, `seek_ms(elapsed_ms)`,
 `start_at(tick)`, `advance_to(tick)`, `complete()`, `reset()`; and the
 two rendering forms `apply(dst, src1, src2, region)` and
-`effect_draw(src1, src2, size, covers_layer)`.
+`effect_draw(src1, src2, size, covers_layer)`. `with_fallback()` marks a
+transition that stands in for a name no provider answers, and
+`apply_with_fallback(dst, src1, src2, region)` returns the reason a kind
+could not draw its frame.
 
 A kind is composited in one of two ways, and the host picks the first one
 it can serve: a **custom-shader draw** (`CrossFade` and `Scroll`) or a
 **CPU blend** (`Universal`, `Mask` and the seven `extrans` kinds, and every
 kind on a backend that runs no effect pipeline).
+
+A kind that cannot draw its frame is drawn as the **cross-fade**: the engine's
+own blend of the two sources at the transition's phase. The reason comes back
+with the frame, so the caller can report the fallback. A transition marked
+with `with_fallback()` is never drawn with a device program.
 
 Invariants: the phase runs from 0 to `PHASE_MAX` (255) and is computed as
 `elapsed × phase_max / duration`, truncated and clamped; a completed
@@ -481,7 +489,7 @@ tiled; `phase_max` is `PHASE_MAX + vague` for `Universal`.
 
 **Error type:** `TransError` — `InvalidDuration`, `InvalidVague`,
 `MissingRule`, `UnexpectedRule`, `InconsistentRule`, `SizeMismatch`,
-`InvalidOption`. Nothing is clamped to a fallback.
+`InvalidOption`. Nothing is clamped to a substitute value.
 
 Code map: [`../code/engine/trans.md`](../code/engine/trans.md).
 
@@ -1073,9 +1081,10 @@ Two consequences hold for a caller:
 
 * every value the compatibility layer reads or writes is in VM pixels, and
   every value a script observes stays in VM pixels;
-* an OS resize changes the framebuffer only. A script-side window-size
-  change travels the other way, through `Engine::take_window_resize()`, and
-  the translation fits the unchanged screen into the new client.
+* a device resize, applied by the caller through `Engine::resize`, changes the
+  framebuffer only. A script-side window-size change travels the other way,
+  through `Engine::take_window_resize()`, and the translation fits the
+  unchanged screen into the new framebuffer.
 
 The rule is stated in [`overall.md`](overall.md) §3 and
 [`../rules/arch_rules.md`](../rules/arch_rules.md) §5; the architecture is

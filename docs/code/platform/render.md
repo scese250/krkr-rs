@@ -98,9 +98,10 @@ free functions that take the pipeline plus the caller-owned state.
 
 ```rust
 pub enum BackendKind { Null, Vulkan }
+pub enum TextureFilter { Point, Linear }
 pub struct PipelineConfig { pub backend: BackendKind, pub application_name: String,
                            pub preferred_format: TextureFormat, pub validation: bool,
-                           pub frame_interval: Duration }
+                           pub filter: TextureFilter, pub frame_interval: Duration }
 pub struct RenderPipeline { /* the backend mechanism */ }
 pub struct RenderState { /* L2-owned */ }
 pub struct Surface { /* L2-owned */ }
@@ -375,10 +376,35 @@ because its introspection — `NullRenderPipeline::last_frame`,
 
 The **null** backend has two jobs: it *counts* the draws, and it composes the
 scene with the real software rasterizer, which clears to `background`, walks
-the tree with the same rules and samples each quad with nearest-texel
-filtering. Because a CPU compositor naturally reads the destination, it
+the tree with the same rules and samples each quad with the pipeline's
+filter. Because a CPU compositor naturally reads the destination, it
 evaluates the destination-dependent `BlendMode`s exactly, using the
 reference's Photoshop/KiriKiri formulas.
+
+### The texture filter
+
+The pipeline's `filter` is the mode every sampler reads textures with. It is
+chosen when the pipeline is created, because the Vulkan samplers are device
+resources created with the device, and the null backend's rasterizer reads
+the same mode.
+
+| mode | the sampler | what a magnified layer looks like |
+|---|---|---|
+| `Point` (the default) | `NEAREST`, clamp to edge | the texel copied for texel — the reference's own default, which starts at `StretchType(stNearest)` and selects the point copy for anything below the fast-linear threshold (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2902`, `:3191-3226`) |
+| `Linear` | `LINEAR`, clamp to edge | the blend of the four texels around the sample point — the reference's `stFastLinear` (`reference/krkr2/cpp/core/visual/LayerBitmapIntf.h:63-65`), which the reference exposes as a parameter it does not default to (`reference/krkr2/cpp/core/visual/RenderManager.cpp:3012-3022`) |
+
+The CPU rasterizer is the **baseline** the GPU is checked against, so the two
+read a texture the same way: the texel centres sit at the half-integer
+coordinates, the sample point is `u - 0.5` texels from the first texel's
+centre, and the border repeats its edge texel. The GPU's filter weights are
+eight bits, so a blended texel can be one level off the exact arithmetic —
+the same tolerance the motion draw list's GPU path uses.
+
+The filter is a **rendering choice, not a script-visible one**: it changes the
+picture the device draws and nothing a script reads. The composition root
+reaches it through the engine's rendering policy (`engine::RenderPolicy`),
+which is the one switch the launcher's `--native-resolution` flag turns
+([`../../arch/l2.md`](../../arch/l2.md) §4).
 
 The composed frame is the **presented frame**: the null backend hands it to
 the caller through the presented-frame slot, and a windowed run copies it into

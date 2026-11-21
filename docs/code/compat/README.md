@@ -82,8 +82,8 @@ the family's own state ownership:
 
 | Page | Covers |
 |---|---|
-| [`plugins.md`](plugins.md) | the plugin architecture and the whole ported set |
-| [`plugins/`](plugins/) | one page per ported plugin: `addFont`, `csvParser`, `dirlist`, `emotePlayer`, `extrans`, `fftGraph`, `fstat`, `getAbout`, `getSample`, `json`, `layerEx`, `motionPlayer`, `psbFile`, `psdFile`, `saveStruct`, `scriptsEx`, `simpleBinder`, `steam`, `textRender`, `varFile`, `win32Dialog`, `windowEx`, `wutcwf`, `wuvorbis`, `xp3Filter` |
+| [`plugins.md`](plugins.md) | the plugin architecture, the whole ported set, and the plugins the engine has not built in |
+| [`plugins/`](plugins/) | one page per ported plugin: `addFont`, `csvParser`, `dirlist`, `emotePlayer`, `extrans`, `fftGraph`, `fstat`, `getAbout`, `getSample`, `json`, `layerEx`, `motionPlayer`, `psbFile`, `psdFile`, `saveStruct`, `scriptsEx`, `shrinkCopy`, `simpleBinder`, `steam`, `textRender`, `varFile`, `win32Dialog`, `windowEx`, `wutcwf`, `wuvorbis`, `xp3Filter` |
 
 ### The visual modules
 

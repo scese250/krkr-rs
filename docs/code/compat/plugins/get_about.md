@@ -31,9 +31,10 @@ the `windowEx` surface in with it. The module itself installs nothing.
 The registry registers the dependency first, so `System.getAboutString` is on
 the VM by the time the link returns.
 
-The dependency is **not** a link of its own: `Plugins.getList` reports
-`getabout.dll` alone, never `windowEx.dll` — the dependency is the reference's
-pre-registration load, not something the script asked for.
+The dependency is a module that was loaded, so `Plugins.getList` names it:
+the list holds `getabout.dll` and `windowex.dll` — the dependency is the
+reference's pre-registration load, and the load puts the module in the same
+set the list reports.
 
 `System.getAboutString()` returns the about string. The reference returns
 `TVPGetAboutString` (`reference/cpp/core/base/MsgIntf.cpp:144`); the port

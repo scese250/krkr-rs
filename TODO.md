@@ -98,200 +98,15 @@ residuals:
 
 ## 4. Rendering and layers
 
-### 4.0 The transition's subtree is recomposited whole, every tick - CLOSED
-
-**Closed by `5f5fd8bc` (the content signature), then by the region's shape**
-(`LayerState::content_region`, the reference's `CacheRecalcRegion`). The
-composite reconstructs only the region that changed, and an empty region
-leaves the cached bitmap untouched. The record of what is in `docs/perf.md`
-§11.4-§11.6.
-
-**Measured on the real game, in gameplay** (the title menu is idle and shows
-nothing): the 1% low is **1.1 fps** (889 ms), and 151 frames of 6 000 are
-over 100 ms. The stalls are discrete, not a steady cost.
-
-The chain, measured with the phases split:
-
-| where | the cost |
-|---|---|
-| the frame tail's `advance_transitions` | 751 ms, 745 ms, 1 053 ms |
-| inside it, `transition_sources_subtree` | 727 ms of the 751 ms |
-| inside it, `render_layer_subtree` | the CPU composite of the subtree's pixels |
-| the async poll's `onFire` dispatch | 1128 ms, 997 ms, 553 ms |
-
-**The shape.** A whole-subtree transition composites its two sources on the
-CPU. `render_layer_subtree` writes the **whole** 1920×1080 plane: it fills
-the backdrop over every pixel and then composites every draw of the subtree
-into it. The cache that would skip that work is guarded by a **boolean**
-(`cache_recalc`) and a generation counter - and a transition's own advancing
-frame invalidates its **ancestors'** caches, so the flag is set again and the
-whole plane is recomposited.
-
-**The cost is discrete, not per tick.** The costs above are the recomposites
-themselves; in 3 000 gameplay frames there were **eight** of them, each
-around 700 ms. The flag was set again on each of those frames, not on every
-frame of the transition.
-
-**The reference does not do this.** `tTJSNI_BaseLayer::Complete(rect)`
-(`reference/krkr2/cpp/core/tjs2/../core/visual/LayerIntf.cpp:7719-7748`)
-reconstructs only `CacheRecalcRegion` - a **region**, not a flag - and
-returns the cached bitmap untouched when the region is empty
-(`:7737-7740`). The reference's `CacheRecalcRegion` is a `tTVPComplexRect`
-filled with the changed rectangles (`:6254`, `:6285`, `:6329`), and
-`:7738` skips the whole reconstruction when nothing changed.
-
-So the shape is: our cache says *whether* to recomposite, the reference's
-says *where*. The fix is the region, not a faster pixel loop: a transition
-tick changes the transition's own frame, and the sources' pixels do not
-change, so the sources' composites stay valid and only the destination's
-frame is new.
-
-The second half of the stall is the `onFire` dispatch (1 128 ms): the game's
-own scenario handler. That is script work - the reference does the same work
-in the same place - so the fix there is to make the *engine* cheaper, not to
-skip the script.
-
-**What the script does.** The game's KAG runtime (`system/conductor.tjs`)
-holds a `OneShotAsyncTrigger` whose action is the conductor's
-`timerCallback`. The callback walks the scenario's tags in a `while` loop:
-`getNextParseTag()`, `checkNextParseTag()`, then `onTag(obj)` for the tag's
-handler, until a tag asks to wait. `waitAndBreak` is what ends the loop: a
-tag that returns a positive step sets the timer's interval and returns, and
-a tag that returns `-4` re-triggers the one-shot so the events are processed
-first.
-
-So the loop runs until the scenario asks to wait, and everything it did in
-that time is **inside one frame**. That is the reference's own shape - the
-reference's KAG does the same - so the fix is that the engine's own costs
-inside the loop must be small: the tag handlers load images, build layers and
-start transitions, and each of those is an engine cost.
-
-**Where the engine's cost is in that loop.** The tag handlers that start a
-transition are the ones that pay the subtree composite above, once per
-transition tick. A transition that runs for 30 ticks at 60 Hz pays 30 whole-
-plane composites, and each of them is inside the frame that runs the
-scenario.
-
-### 4.0.1 The blend kernel is a naive per-pixel loop - CLOSED
-
-**Closed by `8b7a392e` (the row pass and the dispatch hoist) and by the
-shared per-channel tables.** The per-pixel `match kernel` is gone: each
-mode's arithmetic is a type of its own, so the row loop is monomorphised and
-the mode is resolved once per row. The mode kernels are 3.5x faster as a
-family and the soft light 13.8x. The record is in `docs/perf.md` §11.3.
-
-**This is the real cost, and caching it would only hide it.** Measured with
-the blend-family benchmark over a 512x512 rectangle of a 1920x1080 plane
-(`crates/engine/examples/blend_family_bench.rs`), in a **release** build:
-
-| the draw | the cost |
-|---|---|
-| a row copy (`blit_copy_clipped`) | **0.11 ns per pixel** |
-| mode 1 (the copy kernel) | 7.48 ns per pixel |
-| **mode 2 (the alpha source-over)** | **8.49 ns per pixel** |
-| mode 20 (the Photoshop soft light) | 37.9 ns per pixel |
-
-So one blend of the alpha source-over costs **~77x** what moving the same
-bytes costs, and the soft light costs **~340x**.
-
-**The first measurement of this was wrong and is withdrawn.** The 201 ms
-figure for a 1280x960 draw was taken on a **debug** build; the same draw in
-release is 1 228 800 px x 8.49 ns = **10.4 ms**. The relative shape of the
-problem survives - the blend is ~77x the cost of moving the same bytes - but
-the absolute numbers do not, and every gameplay figure measured on the
-debug build has to be read that way.
-
-**Why.** `operate_rect_on` (crates/engine/src/layer_ops.rs:3003) runs
-
-```rust
-for y in dc.1..dc.3 {
-    for x in dc.0..dc.2 {
-        let color = read_pixel(src, src_rect.0 + (x - dx), src_rect.1 + (y - dy));
-        blend_pixel_mode(dst, x, y, color, opa, kernel);
-    }
-}
-```
-
-`read_pixel` (`:187`) does a bounds-checked `pixel_offset` and a slice
-`get`; `blend_pixel_mode` (`:2009`) checks the bounds again, reads the
-destination pixel through the same accessor, and writes it back through a
-third. So every pixel pays four bounds checks and three accessor calls to do
-about twenty arithmetic operations - and the arithmetic itself (the word
-mix in `alpha_blend`, `:2501`) is already the reference's own shape.
-
-**But the accessors were only ~10-25 % of it.** The dominant cost is the
-**per-pixel kernel dispatch**: `apply_mode_kernel` (`:3212`) is a 35-arm
-`match kernel` **inside** the pixel loop, it is not inlined, and the
-destination pixel is spilled to a stack slot and read back for every
-pixel. The proof is the copy kernel: mode 1 does almost no arithmetic and
-still costs **7.48 ns per pixel**, while the same naive loop without a
-kernel - `blit_plane COPY_MAIN` - costs **1.29 ns per pixel**. The
-difference is the dispatch, and it is ~70 % of every mode's cost.
-
-So the fix is two things, in this order: **hoist the dispatch out of the
-pixel loop** (one monomorphised loop per kernel, so the pixel stays in
-registers and the kernel's arithmetic inlines), and **work on rows** with
-the bounds resolved once. The row-based pass is landed; the dispatch hoist
-is next.
-
-The **row-copy path does it right**: `blit_copy_clipped` and
-`copy_plane_rows` resolve the bounds once and copy whole rows with
-`copy_from_slice` - one `memcpy` per row, no per-pixel work at all, at
-0.11 ns per pixel. That is the shape every other kernel must have.
-
-**So the fix is the algorithm**: the blend pass must work on rows, with the
-bounds resolved once, the way the row-copy path does. Six places carried
-the naive loop (`:1089`, `:1118`, `:1594`, `:3003`, `:3422`, `:3568`) -
-they now share one row-based pass (`BlendPass`, `BandBlend`, `PassSource`),
-so the shape is one owner for the blend pass rather than a per-mode copy.
-
-**The kernels that are pathological beyond the dispatch.** The benchmark
-found these, and each one is arithmetic the reference does NOT do:
-
-| the kernel | the cost | what it does per pixel |
-|---|---:|---|
-| mode 20, the Photoshop soft light | 37.9 ns | **3 `f64::powf`** - and the GPU path already reads a 256x256 `soft_light_table()` (`crates/platform/render/src/blend.rs`) that the CPU path does not use |
-| `noise` | 24.5 ns | a serial xorshift step and an `f32` conversion, three times |
-| mode 8, the dodge | 9.2 ns | **3 integer divisions** (`reciprocal`, `65536u32.checked_div`) |
-| modes 21/22/23, the dodge and burn | 9.1-9.9 ns | one integer division per channel |
-| modes 18/19, the overlay and hard light | 10.3-10.5 ns | a data-dependent branch per channel |
-| `fill_color_on_alpha` with opa < 255 | 8.2 ns | 2 `f32` divisions - the 64 KiB `opacity_on_opacity` table already exists |
-| `stretch_blit` | 12.8-21.0 ns | 2 `f32` divisions per pixel for divisors that are **constant for the whole pass** |
-| `blit_over`, the plain source-over | 8.3 ns | 3 hardware integer divisions per pixel |
-
-Every one of these is a table or a hoist, not SIMD: a table lookup, a
-loop-invariant divisor lifted out of the loop, or a branch turned into a
-select.
-
-The mode 2 kernel is the **alpha face**'s source-over (`AlphaOnAlpha`,
-`blt_method_for` at `:2209`), which is the blend the subtree composite uses
-for every layer whose type is `ltAlpha` - the game's own layers. This is
-the same kernel the CPU presentation path uses, so the fix helps every
-CPU-rendered frame, not only the transitions.
-
-**The whole family may have the same problem, and only the mode-1 path has
-been measured.** The six naive loops are the pattern to look for; the
-benchmark over the whole blend family is what settles it.
-
-**What SIMD can and cannot reach.** The kernels are not all the same shape:
-
-| the kernel's work | can it be vectorized? |
-|---|---|
-| the word arithmetic (`alpha_blend` and the rest) | yes - it is packed-byte arithmetic on a u32, which is what a SIMD lane does |
-| the per-pixel table lookup (`opacity_on_opacity`, `negative_mul` - a 64 KiB table indexed by the source and destination alphas) | a gather, or a smaller table |
-| the per-pixel float divide (the darken and lighten blends' colour mix) | no - it stays scalar |
-
-So the arithmetic is vectorizable and the LOOKUP is the hard part. The
-reference's own blend functors
-(`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h`) are the oracle for
-what each kernel computes, and the bytes must not move.
-
-### 4.0.2 The transition's subtree composite is a CPU full-frame blend
+### 4.1 The transition's subtree composite is a CPU full-frame blend
 
 The subtree composite runs on the CPU even on the Vulkan backend, where the
 reference's `IsGPU()` path draws the transition with the GPU
 (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7615-7621`). Every pixel of
-every transition frame goes through the software rasterizer.
+every transition frame goes through the software rasterizer. The device path
+that would draw it on the backend exists and reconstructs the region that
+changed, but the real games' trees are refused, so the CPU is the path they
+take (§4.3).
 
 * **R8b/R9/R10** `hasImage = true` must raise `TVPLayerCannotHaveImage` when the
   layer type cannot carry an image (`LayerIntf.cpp:2489-2493`): the three
@@ -412,6 +227,17 @@ every transition frame goes through the software rasterizer.
     The renderer gives the ordinary dodge (`omDodge`) and the Photoshop dodge
     (`omPsColorDodge`) the same kernel (`crates/platform/render/src/cpu.rs`,
     `composite`). Worst difference **111 levels**.
+* **The noise kernel is still a per-pixel generator.** The blend-family
+  benchmark measured it at **24.5 ns per pixel**: a serial xorshift step and
+  an `f32` conversion, three times over, once per colour channel. Every
+  other kernel the benchmark found is a table or a hoist now - the soft
+  light reads the shared per-channel table, the dodge and the burn read the
+  reciprocal and the colour tables, the overlay and the hard light read the
+  overlay table, the copy family below the full opacity reads the opacity
+  table, the stretch pass computes its mapping once per column and once per
+  row, and the plain source-over is the word arithmetic. The noise is the one
+  the family left: it is a table or a hoist too, and no script member reaches
+  it yet, so nothing a script draws pays for it yet.
 * **The GPU's ordinary and plain blends are not the reference's arithmetic.**
   The reference selects a blend method per draw
   (`reference/cpp/core/visual/RenderManager.cpp:2425-2459`, `:2857-2924`) and
@@ -662,6 +488,83 @@ every transition frame goes through the software rasterizer.
   (`0a014cc2b581` and `f180790ea6d1`), so the escape is a per-build
   extension: the games whose scenarios use it ship a build that has it.
 
+### 4.2 A frame that cannot be presented pays for the render nobody sees
+
+The engine uploads its textures and composites the device work before it asks
+the backend for an image, and the backend acquires the image inside its
+`render` call. A frame whose swapchain hands out no image therefore pays for
+the uploads and the composite and then draws nothing.
+
+* **The render crate needs a two-phase frame.** The Vulkan presenting state's
+  `render` acquires, records, submits and presents in one call
+  (`crates/platform/render/src/vulkan/mod.rs`); splitting it at the acquire
+  into `prepare_frame` and `draw_frame` lets the engine ask for the image
+  before it does the work the image carries.
+* **The uploads and the device composite move behind the prepare.** The
+  engine's texture uploads and the device composite then run only when an
+  image is in hand.
+* **The projection is not skipped.** The `after_project` hook is given the
+  set of drawn layers, and a self-updating transition steps only when that
+  set says its layer was drawn; a frame that skipped the projection would
+  hand the hook a different set, and the transition would step in another
+  frame, which changes the transition's wall-clock duration. The projection
+  stays where it is.
+* **The "will this frame draw?" rule has to become explicit and exact.**
+  Today a frame draws when the scene is dirty, and the scene is marked dirty
+  by the uploads and by the composite (`mark_dirty`). Once the uploads and
+  the composite move behind the prepare, the flag they set is set too late
+  to decide, so the rule needs its own exact form: what a frame knows before
+  the prepare about whether it has something to draw.
+
+The pacing, the presentation budget and the skip behaviour stay as they are:
+a frame with nothing to show does not draw, and a frame that gets no image is
+reported the way it is today.
+
+### 4.3 The device composite is refused in the real games
+
+The device composite of a layer's subtree draws the tree on the backend and
+reconstructs the region that changed; the CPU composite is the fallback for
+every tree the device path refuses
+(`crates/engine/src/layer_ops.rs`, `composite_subtree_on_device`; the
+fallback is `crates/engine/src/engine.rs`, `composite_subtree_on_cpu`). The
+real games' trees are refused: the refusal names "a copy that takes the
+source's alpha", so the CPU composite draws them, and there the region and
+the area are both the whole plane.
+
+* **Closing the refusal needs a blend the pipeline does not have.** The
+  refused draw is the copy of a source that is read as an opaque image — the
+  reference's `CopyOpaqueImage`
+  (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`, the CPU
+  kernel at `reference/cpp/core/visual/gl/blend_functor_c.h:174-178`), the
+  port's `ModeKernel::CopyOpaque` (`crates/engine/src/layer_ops.rs`) — and
+  the blend enum lives in `crates/platform/api`
+  (`crates/platform/api/src/blend.rs`, `BlendMode`), so the change reaches
+  the shared blend vocabulary and not the composite alone. Until that blend
+  exists, the device path cannot composite a layer's subtree, and the CPU
+  path is the one the games take.
+* **The region's reconstruction is what makes the device path worth
+  taking.** Measured on the device path alone (the Vulkan backend, a debug
+  build, a 640×480 plane with a 64×64 sprite, on a quiet machine): the
+  composite of the whole plane costs **15.71 ms** and the composite of the
+  96×64 region costs **0.44 ms** — the region's own composite cost
+  **15.68 ms** while the device path still drew the whole tree for it. The
+  upload follows the region: 24 KB against the whole plane's 1.2 MB.
+
+### 4.4 A move invalidates the moved layer's own content
+
+The reference's `SetPosition` updates the parent alone
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:2203-2218`; `ParentUpdate`
+at `:6370-6382`, "called when layer moves"), while the port marks the moved
+layer's own region with its whole rectangle (`crates/engine/src/scene.rs`,
+`Scene::update_layer` → `mark_layer_changed`). The picture is the same either
+way, but the moved layer's own content is recomposited for nothing.
+
+The port's behaviour is pinned by `crates/compat/tests/layer.rs`
+(`unchanged_set_pos_write_does_not_invalidate`, "the write marks the layer's
+region"), so the change is a behaviour change and not a cleanup: it needs its
+own decision and its own test.
+
+
 ## 5. Dialogs and popups
 
 The reference draws its own popup: `MenuItem.popup` calls `TVPShowPopMenu` and
@@ -690,6 +593,16 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
   `Font.getList(flags)` accepts `flags` and ignores it (`font_get_list` takes
   `_argv`) where the reference passes it to `GetFontList`
   (`LayerIntf.cpp:11977`).
+* **The font resolution swallows every candidate's error.** The face is a
+  comma-separated candidate list, and each candidate is tried through the
+  registered faces, the attached storage and the host's system fonts
+  (`crates/compat/src/resource.rs`, `resolve_face`). The loop keeps the first
+  candidate that resolves and drops the error of every candidate that does
+  not, so a failed host font scan, an unreadable storage and an unusable font
+  file all reach the caller as one thing: the face does not exist. The three
+  have to stay apart - the text side already carries the typed errors - so
+  the caller can tell a host with no faces from a storage it could not read
+  and from a font file it could not use.
 * **C14 (coverage)** `native_parity.py` checks `reference/cpp/core/**/*.cpp`
   only: plugin surface is machine-checked by `plugin_parity.py`, but plugin
   *behaviour* rests on the audits alone; `Mouse`/`Key` are in neither map (§7).
@@ -892,14 +805,6 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
   and a ported one is truthy. Scope: the script-observable return value of
   `Plugins.link`; the member list is unchanged. Recorded as an approximation
   with its reference gap (D36).
-* **The engine's own plugins are not registered at startup.** The reference
-  registers the built-in plugin modules when the application starts
-  (`reference/cpp/core/plugin/PluginImpl.cpp:90-93`, `TVPLoadInternalPlugins()`),
-  so a script sees `Scripts.getObjectKeys` and its siblings from the first
-  line. The port installs a built-in plugin only when a script calls
-  `Plugins.link("<name>.dll")`, so before that a script that touches a
-  plugin member finds nothing. This changes the script-visible surface, so it
-  needs a reviewed surface-lock baseline update.
 * **`Scripts.propGet` ignores the caller's flag for the read.** The reference
   passes the flag to `PropGet` (`reference/cpp/plugins/scriptsEx.cpp:890-905`),
   so `Scripts.propGet(obj, key, Scripts.pfIgnoreProp)` returns the raw member;
@@ -925,8 +830,7 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
   the app and every compat test, so the change is port-wide.
 * 35 of the 53 plugin names games ship have no emulation — the `**no**` rows of
 `plugins/INVENTORY.md`, the DLLs being gitignored — so each is absent
-(D14): the link is recorded, one warning names the plugin, and nothing is
-registered for it.
+(D14): one warning names the plugin, and nothing is registered for it.
 Per plugin: recover the surface from the DLL with the `plugins/analysis/`
 pipeline, emulate in `crates/compat/src/natives/plugins/<name>/`, register the
 DLL name in `BUILTIN_PLUGINS`, add behaviour tests citing the DLL by path, hash
@@ -1122,6 +1026,149 @@ surface; `krmovie`/`yuzuex` need L1/L2 backends.
   of the plugin family the game ships (the psd/psbfile DLLs): if that family
   is ever ported and brings the member with it, the surface lock changes
   (D29) and the sprite mask handling has to be re-derived.
+
+### 10.1 The plugin families the upstream organisation's trees cover
+
+The names a game links are inventoried in `plugins/INVENTORY.md`; the wider
+set is the organisation that publishes these plugins — 51 plugins and two
+transition providers, each compared member by member with the engine's
+registered surface. The trees carry **no binaries**: a plugin's behaviour is
+read from its source, and the reference's own plugin table names the upstream
+project of each name (`reference/krkr2/docs/KRKR_PLUGINS.md`), so the
+upstream source is the oracle for every member below. The gaps come in two
+shapes: a plugin the engine has no emulation for is absent as a whole, and a
+plugin the engine already emulates may be missing members.
+
+**The rule the engine follows today.** A plugin with no emulation registers
+nothing: one warning names the plugin, nothing is registered or loaded for it,
+and the name is not among the modules `Plugins.getList` reports, so the script
+sees the plugin as absent — no class, no global, no member. A member a
+ported plugin adds to a class the engine already has is missing the same
+way: the name is not on the class, so the call raises. Every member below
+is therefore unreachable from a script until it is implemented.
+
+* **One upstream function.** Each member's whole behaviour is in one upstream
+  function, with no new format and no fixture.
+  * `layerExAreaAverage`: `Layer.stretchCopyAA`.
+  * `layerExRaster`: `Layer.copyRaster`.
+  * `layerExImage`: `Layer.colorize`, `Layer.modulate`, `Layer.noise` and
+    `Layer.generateWhiteNoise`.
+  * `layerExLongExposure`: `Layer.initExposure`, `Layer.snapExposure`,
+    `Layer.statExposure`, `Layer.copyExposure` and `Layer.termExposure`.
+  * `layerExBTOA`: `Layer.copyRightBlueToLeftAlpha`,
+    `Layer.copyBottomBlueToTopAlpha`, `Layer.fillAlpha`,
+    `Layer.copyAlphaToProvince`, `Layer.clipAlphaRect`, `Layer.overwrapRect`,
+    `Layer.fillByProvince` and `Layer.fillToProvince`.
+  * `layerExSave`: the analytic members — `Layer.clearAlpha`,
+    `Layer.oozeColor`, `Layer.getAverageColor`, `Layer.getCropRect`,
+    `Layer.getCropRectZero`, `Layer.getDiffPixel`, `Layer.getDiffRect`,
+    `Layer.getFingerPrintValue`, `Layer.getShrinkVectorOctet`,
+    `Layer.isBlank`, `Math.octetVectorSum`, and the three `Window` save
+    members `Window.startSaveLayerImage`, `Window.stopSaveLayerImage` and
+    `Window.cancelSaveLayerImage` (its `Layer.copyBlueToAlpha` is recorded
+    above).
+  * `saveStruct`: `Scripts.toStructString`.
+  * `scriptsEx`: `Scripts.stringFuzzySearch`.
+  * `KAGParserEx`: `KAGParser.hasLabel`.
+  * `layerExDraw`: the sixteen `Layer.EncoderValue*` constants and
+    `Layer.getColorRegionRects` — its `drawPathString2` and `measureString2`
+    are commented out upstream, so the port agrees with it there.
+  * `layerExVector`: `GdiPlus.DashStyleCustom` and the four `GdiPlus.Font`
+    properties `fontSize`, `italic`, `letterSpacing` and `fontFamily`.
+  **What it needs:** the upstream source as the oracle — no binary and no
+  fixture. The member lands as a thin member over the engine's own layer in
+  `crates/compat/src/natives/plugins/<name>/`, the DLL name joins the
+  built-in table, the registered surface changes and its baseline is updated
+  with it, and the behaviour test cites the upstream file and line.
+* **A new format and a committed fixture.** The member needs a format the
+  tree does not have, and the bytes of that format are not reproducible from
+  the tree.
+  * `layerExSave`: the PNG and TLG5 encoders — `Layer.saveLayerImagePng`,
+    `saveLayerImagePngOctet`, `saveLayerImageTlg5` and `saveProvinceImage`.
+  * `layerExDraw`: the image encoder `Layer.saveImage`.
+  * `tftSave`: the pre-rendered-font container —
+    `System.savePreRenderedFont`, `System.loadPreRenderedFont`,
+    `System.modifyPreRenderedFont`, `Layer.renderGlyph`, `Layer.setGlyphInfo`
+    and `Layer.glyphCharset`.
+  * `layerExAVI`: the AVI container and the WAV writer — `Layer.openAVI`,
+    `Layer.openCompressedAVI`, `Layer.recordAVI`, `Layer.closeAVI`,
+    `Layer.openWAV`, `Layer.startWAV`, `Layer.stopWAV` and `Layer.closeWAV`.
+  * `minizip`: the zip reader and writer — `Storages.mountZip`,
+    `Storages.unmountZip` and the `Zip` and `Unzip` classes.
+  * `sigcheck`: the signature check — `Window.checkSignature`,
+    `stopCheckSignature` and `cancelCheckSignature`.
+  * `memfile`: the memory storage medium — the seven `Storages` members
+    `Storages.isExistMemoryFile`, `Storages.getMemoryFileInfo`,
+    `Storages.getMemoryFileData`, `Storages.deleteMemoryFile`,
+    `Storages.isExistMemoryDirectory`, `Storages.getMemoryDirectory` and
+    `Storages.deleteMemoryDirectory`.
+  **What it needs:** the upstream source for the format's algorithm and a
+  fixture committed under `crates/compat/tests/fixtures/`, because the bytes
+  are not reproducible from the tree: TLG5 exists nowhere else in it, and
+  the pre-rendered-font container, the AVI container and the zip reader are
+  new. The test reads the committed fixture, and the plugin's own binary is
+  never loaded at test time. Where a game's shipped DLL is the oracle
+  instead of the upstream source, the citation is the DLL's file name and
+  the `sha256[:12]` of the build.
+* **A whole subsystem.** Each is a subsystem with its own shape, and the
+  layer it belongs to has to be decided before its first member.
+  * `krkr_richtext`: a rich-text layout engine — seven classes and 57
+    members.
+  * `krkrthreepp`: a three.js and VRM runtime — 93 members.
+  * `krkrlive2d`: a Live2D runtime — four classes and 21 members.
+  * `gamepad`: a controller stack — two classes and 39 members.
+  * `clipfile`: a CLIP STUDIO PAINT reader and writer — two classes and 38
+    members.
+  * `win32ole`: COM, OLE and `ActiveX` — three classes and 27 members.
+  * `binaryStream`: a compressed binary stream — 27 members.
+  * `httprequest` and `httpserv`: an HTTP client and a server — 17 and 5
+    members.
+  * `expat`: an XML parser — the `XMLParser` class.
+  * `lineParser`: a line parser — the `LineParser` class, the shape the
+    engine's `CSVParser` already has.
+  * `AlphaMovie`: an alpha-movie player — 19 members.
+  * `messenger`: the user messages between windows — 9 members.
+  * `extNagano`: twelve extra transitions, which belong in the engine's own
+    transition module.
+  * `windowExProgress`: a progress bar on `Window` — 5 members.
+  **What it needs:** the upstream source as the oracle and a decision about
+  the layer the behaviour belongs to: a rich-text layout is a text service, a
+  controller stack is platform input, a transition is the engine's own, and a
+  process is the host's. Each surface is large enough to be a change of its
+  own.
+* **One upstream function, but the behaviour reaches outside the
+  compatibility layer.** The member is one upstream function, but what it
+  does belongs to the host or to one of the engine's own services.
+  * `process` and `shellExecute`: `System.commandExecute` and the `Process`
+    class (`commandExecute`, `execute`) — a process is host work.
+  * `systemEx`: its 26 `System` members and constants — `writeRegValue`,
+    `writeEnvValue`, `readEnvValue`, `expandEnvString`, `urlencode`,
+    `urldecode`, `confirm`, `getKnownFolderPath`, `getOSVersion`,
+    `setDpiAwareness` and the rest.
+  * `windowEx`: the 12 members the port still lacks —
+    `System.classLongPtr`, `findWindowEx`, `loadCursor`, `mapVirtualKey`,
+    `setClipCursor`, `setDpiAwareness`, and `Window.acquireImeControl`,
+    `resetImeContext`, `maximizeBox`, `minimizeBox`, `resetExSystemMenu`
+    and `setWindowCornerPreference`.
+  * `steam`: `Steam.RestartAppIfNecessary` and `Steam.isDlcInstalled`.
+  * `layerExVector`: the vector text layout — `GdiPlus.loadFont`,
+    `GdiPlus.unloadFont` and `Layer.drawStringArea`.
+  * `win32dialog`: the dialog — the 1 032 `WIN32Dialog` constants, the 74
+    members the dialog itself still lacks, and the helper classes (`Blob`,
+    `Bitmap`, `DrawItem`, `Header`, `Items`, `NotifyAccessor` and
+    `SolidBrush`) with their 30 members.
+  * `stdio`: the console handles — `System.stdin`, `System.stdout`,
+    `System.stderr`, `System.stdioState`, `System.allocConsole`,
+    `System.attachConsole`, `System.freeConsole` and `System.flush`.
+  **What it needs:** the upstream source as the oracle and a host seam: a
+  process is spawned by the platform, a cursor and a window message are
+  platform's, a vector layout runs in the engine's text service, and the
+  Steam client is a platform service. The member is a thin call over it.
+
+`shrinkCopy` is not listed here: its two members, `Layer.shrinkCopy` and
+`Layer.shrinkCopyFast`, are built in, and the plugin registers no other
+member. The port's provenance and the notice it keeps are on the plugin's own
+page.
 
 ## 11. L3 blockers
 
@@ -1461,6 +1508,12 @@ run on a machine that has one; anything not compiled is documented as unverified
   recreation and **font resolution** (a requested face loads), captured in
   `<filesDir>/krkr.log`. No release without this run; the cpal audio backend has
   never played on a device.
+* **The font and the window-size changes are compiled and tested on the
+  host, not run on a device.** The host font directories follow the selected
+  platform rather than the build target, and the window's resolution is the
+  launcher's choice; both are compiled and tested under the
+  `platform-android` feature on the host, and neither has run on a device.
+  The APK's run on a real device is the verification they need.
 * **PSB/PSD L1 crate on Android.** `forkunion` has a C++ core; the host build
   compiles, but the aarch64 Android build and run are unverified. If it fails,
   use `forkunion`'s `portable` feature and record the result.
@@ -1528,6 +1581,22 @@ run on a machine that has one; anything not compiled is documented as unverified
   §11.8 is therefore not a scene-change measurement** - it is the same path
   the text route takes. The positions have to be read off the title page and
   made relative to the logical screen before the number means anything.
+
+* **The harness's route never reaches a real window.** The route's clicks are
+  injected as platform events and the frames are drawn into an offscreen
+  target on the device: the measurement shape opens no window, and a
+  measurement never puts one on the user's desktop. A defect that only a real
+  window shows - a swapchain that is rebuilt, a surface that is lost, a
+  window the player resizes - is therefore not caught by the route. The route
+  needs a windowed variant that is a check and not a measurement: a run that
+  drives the same clicks through a real window and proves the same pages.
+
+  The harness's own click cannot show a mismatch between the picture and the
+  click either: the click's device position is derived from the engine's own
+  mapping, the mapping the application takes a real click back through, so
+  its round trip is exact at any surface size and a wrong mapping cancels
+  out. The harness proves that the click reached the script, not that the
+  picture is where the script's pixels are.
 
 ## 15. Comments-gate debt
 
@@ -1664,7 +1733,7 @@ an allowlist exemption.
   (`reference/cpp/core/base/impl/SysInitImpl.cpp:131`). The port has no
   current-path notion: a relative name is resolved against the auto-path
   table and then every mounted archive, in a different order
-  (§5 F3/F4). A relative name that the tree finds under the current path
+  (§8 F3/F4). A relative name that the tree finds under the current path
   is therefore missed by the port.
 * **TJS VM in Rust** (`docs.old/migration/08` §10.7) **and `streams.cpp` as a thin
   C++ adapter over it** — both deferred. `streams.cpp` is the only port-authored
@@ -1677,9 +1746,12 @@ an allowlist exemption.
   blended into a bitmap. What is left is a program per kind that needs a
   per-pixel rule or a coordinate warp (`universal`, `mask` and the seven
   `extrans` kinds), and the selection of a program from `engine_api` (the
-  seam carries the draw today, not a program). L1 keeps only the backend
-  mechanism and is never named by L3. The CPU transition path remains the
-  null/headless implementation and the pixel oracle.
+  seam carries the draw today, not a program). The endpoint composite belongs
+  on the device as well: the reference composites into a device texture and
+  reads the source from the source layer's cache, so the transition's own
+  picture is a device resource and not a bitmap the CPU blends into. L1 keeps
+  only the backend mechanism and is never named by L3. The CPU transition path
+  remains the null/headless implementation and the pixel oracle.
 * **A GPU text path and an L3 render-target surface.** `RenderContent::Glyphs`
   is rejected by both renderers, `supports_glyph_atlas` is false everywhere, and
   `create_render_target`/`read_render_target` are plumbed by neither `engine`
@@ -1719,6 +1791,24 @@ new evidence.
   rule (D39) and the VM↔device mapping owned by L2 (D40/D41), no
   `ScalingMode`/`--scaling` left. Render-resolution decoupling stays deferred
   (`07`).
+* **The window's size report reaches the engine's surface in every mode.**
+  A run's resolution is the launcher's choice - the platform's own resizable
+  window, a declared resolution or a fullscreen window - but the framebuffer
+  follows the window in every mode, because the swapchain's extent is the
+  window's extent. The compositor's report of the window's size therefore
+  reaches the engine's surface in every mode, and the presentation mapping
+  the click is taken back through describes the framebuffer the picture is
+  drawn at. What a run keeps fixed is the *client* size it adopts, not the
+  surface it draws into.
+* **The surface size and the presentation mapping are one size.** The engine
+  fits the presentation to its own surface size, so the mapping's device size
+  is the surface's size and the two cannot disagree; a resize that changes
+  one changes the other.
+* **The host font directories follow the selected platform, not the build
+  target.** The platform is chosen at compile time, so the Android backend
+  carries the Android directories and the desktop backend carries the
+  desktop's, and the Android list is compiled and tested on the host whatever
+  machine the check runs on.
 * **GPU decoding is not the lever**: MediaCodec is configured with no surface,
   TLG is entropy-coded with serial dependencies, the pixels must return to CPU
   memory for `getPixel` (D34), and the renderer has no compute pipeline. The
@@ -1901,48 +1991,7 @@ The fix is to place the blurred mask at `glyph.x + blurred.x()` (and the same
 for the vertical offset) in the pre-rendered draw path.
 
 
-## 22. The transition has a second, inexact GPU description - CLOSED
-
-**Closed by the removal of the composited frame.** The engine has one
-description of a transition: the effect draw the projection renders, and the
-CPU blend `Trans::apply` for every kind that has no program.
-
-The removed path was `TransitionFrame`: two source-over draws whose weights
-are the phase, so it composed the two sources as `s2*t + s1*(1-t)`. It was
-inexact in two ways, and both are gone with it:
-
-* it could not express the reference's **coverage mix** — a destination with
-  a straight alpha is covered by the source with the share the two alphas
-  give it (`reference/cpp/core/visual/TransIntf.cpp:664-673`) — while the
-  frame mixed the four channels alike, so at a full-screen fade the two
-  differ by up to **five** 8-bit levels per channel;
-* it applied the layer's **opacity and blend mode per source**, where the
-  reference applies them to the blend result
-  (`reference/cpp/core/visual/TransIntf.cpp:592-600`).
-
-**The path was unreachable for the game's cross-fade and for every
-transition the tree can run.** The game's scene transition is a cross-fade —
-the game's own `transitions` table carries an empty `method`, which becomes a
-cross-fade — and on the Vulkan backend a cross-fade is one pass over the two
-endpoint textures (`crates/engine/src/trans/effect.rs`): the effect draw wins
-before any other description is consulted. On the null backend the flag that
-selected the frame was off, so the CPU blend ran. For the kinds whose effect
-draw is `None` (`universal`, `mask` and the seven `extrans` kinds) the frame
-was `None` too, so they took the CPU blend as well.
-
-**The one behaviour change in the tree** is the corner case of a non-null
-backend with no pipeline for the `CrossFade` program: it took the inexact
-frame, and it now takes the exact CPU blend.
-
-**Still open:** `universal` and `mask` can be a GPU pass (the reference has
-`UnivTransBlend`), and the endpoint composite belongs on the device (the
-reference composites into a device texture and reads the source from the
-source layer's cache). The seven `extrans` kinds stay on the CPU: the
-reference's core does not implement them either, they are the plugin's own
-providers. The programs that would replace the CPU blend are listed in §16.
-
-
-## 23. The class instances keep their script evaluator
+## 22. The class instances keep their script evaluator
 
 The compat's data containers - the fresh arrays and dictionaries - are built
 with the VM's own constructors, behind one helper
@@ -1959,19 +2008,59 @@ that lets a script observe a half-built object. The performance win does not
 justify that risk, so the work stays inside L2 and L3.
 
 
-## 23. A third-party plugin the engine has not built in
+## 23. The native-resolution rendering: what is left
 
-The reference loads no plugin from the game's directory:
-`ncbAutoRegister::LoadModule` (`reference/krkr2/cpp/core/plugin/ncbind.cpp:12-28`)
-consults only the registry of the modules linked into the binary, and the
-`.tpm` path rewrites the extension and ends in the same registry
-(`reference/krkr2/cpp/core/plugin/PluginImpl.cpp:129-143`). A plugin that is
-not in it is logged as an error and the engine continues
-(`reference/krkr2/cpp/core/plugin/PluginImpl.cpp:48-56`).
+The experimental `--native-resolution` flag is landed, and so is the filtered
+sampling it asks for: the device samples every texture with a bilinear filter
+instead of point-sampling it, so a magnified picture is smooth instead of
+blocky. Those are stage 0 and stage 1, and the stages after them are open.
 
-That is the model this engine has (the static plugin table), so a game that
-needs a plugin we have not built in - `shrinkCopy` is one - sees the member
-absent here, and sees it absent in a reference build that does not link the
-plugin either. The fix is to build the plugin in, and its behaviour needs the
-plugin's own build as the evidence: the shipped DLL, cited by its hash, or
-the upstream source. The behaviour is not derivable from the name.
+The policy is the sampler's filter and nothing else
+(`engine::RenderPolicy`): it reaches the device through the pipeline's
+configuration, so the engine's policy and the device's sampler cannot
+disagree. It cannot move a click either - the translation still maps the
+script's pixels to the device's, so the picture and the click are the same
+picture whatever the filter is.
+
+The flag is a launch argument with no value, the Fit-with-letterbox
+presentation is untouched, the logical screen does not move, and no
+script-visible value changes. The architecture and the recorded divergence are
+in [`docs/arch/l2.md`](docs/arch/l2.md) §4.
+
+The stages are: stage 2, the device-scale content; stage 3, the hi-res text;
+stage 4, the sampler's own details; stage 5, the other launchers. The scale
+change is the design question inside stage 2, and the measurement is what
+every stage needs.
+
+What is left, in the order it should be done:
+
+* **Stage 2: the device-scale content.** The content the engine rasterizes -
+  the vector shapes and the text - is still produced at the VM resolution, so
+  its edges are one VM pixel wide and the device magnifies them. Producing it
+  at the device scale needs a per-layer canvas beside the VM bitmap (the
+  memory is `c²` per layer with drawn content), a content handle the L3
+  natives write through, and a projection that reads the canvas's texels
+  instead of the bitmap's. The VM canvas stays exactly as it is, so the
+  script's pixels do not move.
+* **The scale change.** The content scale `c` follows the live Fit scale, so
+  a window resize makes a device-scale canvas stale. The options are to pin
+  the scale per layer and report the staleness, to keep a content log per
+  layer and replay it at the new scale, or to rebuild the canvas by
+  re-sampling the VM canvas. The first is cheap and visibly wrong after a
+  resize; the second is correct and grows without bound on a layer the script
+  redraws every frame.
+* **Stage 3: the hi-res text.** The system-font path can rasterize the
+  glyphs at `size · c`; the coverage cache is keyed by the size, so the
+  device-scale glyphs are their own entries. The pre-rendered `.tft` fonts
+  cannot: their glyphs are fixed-size bitmaps, so they are resampled and stay
+  low-res. That limitation is a property of the format, not of the engine.
+* **Stage 4: the sampler's own details.** Anisotropy (a shallow-angle texture
+  still shimmers with a plain bilinear filter) and a mipmap chain (the
+  minification case aliases without one) are separable from the filter
+  itself.
+* **The measurement.** The frame time, the VRAM and the upload bandwidth with
+  the flag on and off, on a real title, on a quiet machine.
+* **Stage 5: the other launchers.** The Android launcher has no setting for
+  the flag yet, and the Android surface is usually already at the device's
+  resolution, so the flag matters most there. The configuration file cannot
+  set it either; both are one step each.

@@ -154,7 +154,7 @@ the seams and expects the composition root to fill them:
 | audio decoder | `audio.rs` | the `add_audio_decoder` chain, so a sound buffer can decode and play |
 | video source | `video.rs` | the `VideoOverlay` and `LayerExMovie` seams, over the L1 decoder and the L2 storage |
 | system font directories | `platform::system_font_dirs()` | the host's font directories, supplied before a startup script can resolve a face |
-| default font families | `platform::default_font_families()` | the host's default user-interface font, selected as the engine's default-face role and resolved on the text service's first use |
+| default font families | `platform::default_font_families()` | the families the host prefers for its own default font, in preference order: the first one the host provides is the engine's default face, and a host that provides none of them still has one, taken from the host's own enumerated faces. The families are selected as the engine's default-face role and resolved on the text service's first use |
 | Windows host facts | `window_ex.rs` | the monitors, the desktop rectangle, the system metrics, the cursor, the environment |
 | clipboard | an inert backend | `hasFormat` is false, `asText` reads void, a write is a no-op — the reference clipboard does nothing |
 
@@ -179,10 +179,10 @@ never a silently skipped write.
 The **`.tpm` plugin scan** keeps the regular files whose name ends in
 `.tpm` (case-insensitively) from the app directory, `<app>/system` and
 `<app>/plugin`, sorted by ASCII file name. A missing or non-directory entry
-contributes nothing; any other listing error propagates. The scan is the
-root's job because compat owns no file-system access; the reference
-behaviour it follows is recorded in the
-[plugin evidence trail](../../../docs.old/migration/08-tjs-vm-and-native-plugins.md).
+contributes nothing; any other listing error is logged and the scan carries
+on, the way the reference's directory listing logs the failure and returns
+(`reference/cpp/core/base/impl/StorageImpl.cpp:178-194`). The scan is the
+root's job because compat owns no file-system access.
 
 ---
 

@@ -45,7 +45,7 @@ therefore contains no `#[cfg(target_os = …)]` of its own.
 
 | module | source | one-line role | document |
 |---|---|---|---|
-| crate root | `src/lib.rs` | `Host`, `HostConfig`, `HostError`, the crate's public surface | this page |
+| crate root | `src/lib.rs` | `Host`, `HostConfig`, `HostError`, `Resolution`, the crate's public surface | this page |
 | `main` | `src/main.rs` | the `krkr` CLI: arguments, the configuration file, the game path | [main.md](main.md) |
 | `runner` | `src/runner.rs` | `run`, `Launch`, `RunMode`, the headless loop, the windowed event bridge | [main.md](main.md) |
 | `frame_times` | `src/frame_times.rs` | the bounded frame-gap history and the run's frame-time distribution | [`../../perf.md`](../../perf.md) §4.3 |
@@ -106,7 +106,7 @@ pub enum GameError { Mount(..), Storage(..), Startup{..}, NoStartup, Host(..),
                      Audio(..), Vm(..), Plugin(..) }
 
 // the emulator entry point
-pub struct Launch { runtime, backend, game, mode, frame_report }
+pub struct Launch { runtime, backend, game, mode, resolution, policy, frame_report }
 pub enum RunMode { Headless { frames: u32 }, Windowed }
 pub struct GameInput { base_dir: PathBuf, archives: Vec<PathBuf> }
 pub struct RunReport { last_frame: Option<StepReport>,

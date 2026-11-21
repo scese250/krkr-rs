@@ -93,18 +93,23 @@ colour (set only by the constructor).
    `@` for vertical writing): the registry's registered faces, the attached
    storage (only for a file-shaped name), the host's installed system fonts;
 2. the registry's default face — the face registered under the oldest name,
-   the host's own default font, which supplies the metrics of the text;
+   the host's own face: the first of the host's preferred families the host
+   provides, or one of the host's own enumerated faces when the host provides
+   none of them. It supplies the metrics of the text;
 3. otherwise `"no font is available for face '{face}'"`.
 
 A candidate that resolves is recorded as an alias under the requested name.
 `Font.getList` reports the registry's registered names and
 `Font.defaultFaceName` its oldest name.
 
-`Font.defaultFaceName` names the host's default user-interface font, where
-the reference names the last font its platform enumerated. The two are
-different faces, so the metrics of a face name that resolves to nothing
-differ from the reference's by the difference between the two ascents; the
-divergence is recorded in [`../resource.md`](../resource.md) §4.
+`Font.defaultFaceName` names the engine's default face: the first of the
+host's preferred families the host provides, or one of the host's own
+enumerated faces when the host provides none of them. The reference's default
+font is one of the fonts its platform enumerated, and a face name it does not
+know falls back to it. The two are different faces, so the metrics of a face
+name that resolves to nothing differ from the reference's by the difference
+between the two ascents; the divergence is recorded in
+[`../resource.md`](../resource.md) §4.
 
 ---
 
@@ -130,8 +135,9 @@ divergence is recorded in [`../resource.md`](../resource.md) §4.
 * **The ownership** rule: only an owner removes the scene font.
 * **The rasterizer** accepts only index `0` — the single L1 render glyph
   rasterizer.
-* **`Font.defaultFaceName`** writes are ignored: the reference's value comes
-  from the preference / enumeration.
+* **`Font.defaultFaceName`** writes are ignored: the value is the name the
+  default face is registered under, which the reference takes from its
+  enumeration.
 
 ---
 
@@ -154,7 +160,7 @@ divergence is recorded in [`../resource.md`](../resource.md) §4.
 | `"Font.rasterizer: only rasterizer 0 (the platform render rasterizer) is available"` | a rasterizer index other than 0 |
 | `"Font.defaultFaceName: compat context is not bound"` | the binding is not installed |
 | `"Font: text layout failed: {error}"` | the L2 text engine rejected the layout |
-| `"no font is available for face '{face}'"` | no candidate, no default face and no registered face at all |
+| `"no font is available for face '{face}'"` | no candidate resolved and the host provides no usable face, so no face is registered at all |
 | `"Cannot find storage {storage}"` | the pre-rendered font's storage does not resolve |
 | `"Prerendered font mapping failed : {sub}"` | the `.tft` header is invalid |
 

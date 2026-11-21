@@ -37,12 +37,16 @@ pub struct Trans {
     phase: i32,
     rule: Option<RuleMask>,
     completed: bool,
+    fallback: bool,
 }
 ```
 
 A `RuleMask` holds the decoded grayscale rule image (`width`, `height` and
 the byte plane). The rule is **tiled** over the source, exactly like the
 reference's image provider tiles a smaller rule graphic.
+
+The `fallback` flag marks a transition that stands in for a name no provider
+answers. It is drawn with the CPU blend, never with a device program.
 
 ---
 
@@ -69,6 +73,10 @@ pub enum ScrollFrom { Left, Top, Right, Bottom }
 pub enum ScrollStay { NoStay, StayDest, StaySrc }
 pub enum DestAlpha { Opaque, Straight, Additive }
 
+impl TransKind {
+    pub fn name(&self) -> &'static str;
+}
+
 impl RuleMask {
     pub fn new(width: u32, height: u32, gray: Vec<u8>) -> Result<Self, TransError>;
     pub fn from_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Self, TransError>;
@@ -87,6 +95,7 @@ impl Trans {
     pub fn universal(duration_ms: f64, vague: i32, rule: RuleMask) -> Result<Self, TransError>;
     pub fn mask(duration_ms: f64, rule: RuleMask) -> Result<Self, TransError>;
     pub fn scroll(duration_ms: f64, from: ScrollFrom, stay: ScrollStay) -> Result<Self, TransError>;
+    pub fn with_fallback(self) -> Self;
 
     pub fn kind(&self) -> TransKind;
     pub fn duration_ms(&self) -> f64;
@@ -105,6 +114,8 @@ impl Trans {
     pub fn reset(&mut self);
     pub fn apply(&self, dst: &mut BitmapState, src1: &BitmapState, src2: &BitmapState,
                  region: RectI) -> Result<(), TransError>;
+    pub fn apply_with_fallback(&self, dst: &mut BitmapState, src1: &BitmapState, src2: &BitmapState,
+                                region: RectI) -> Option<TransError>;
     pub fn full_region(bitmap: &BitmapState) -> RectI;
     pub fn effect_draw(&self, src1: u32, src2: u32, size: (u32, u32),
                        covers_layer: bool) -> Option<EffectDraw>;
@@ -144,6 +155,25 @@ it can serve:
   per-pixel rule or coordinate warp, so they have no program; every kind on
   a backend that runs no effect pipeline is blended with `Trans::apply` into
   the destination bitmap.
+
+A kind that cannot draw its frame is drawn as the **cross-fade**: the engine's
+own blend of the two sources at the transition's phase, so the frame that is
+drawn is the arithmetic the cross-fade kind uses and not an approximation of
+the kind that failed. `Trans::apply_with_fallback` returns the reason the kind
+could not draw the frame, so the caller can report the fallback: a fallback
+nobody reports is a silent one.
+
+A transition that stands in for a name no provider answers is marked with
+`Trans::with_fallback` and is drawn with the CPU blend, never with a device
+program: the device path is for the kinds the device can draw, and the
+fallback is the engine's own arithmetic.
+
+A draw whose uniform block is not usable is not drawn: the record names the
+transition and the reason, and the frame is blended on the CPU instead.
+
+```
+engine.scene: the transition effect's uniform block is not usable transition=crossfade reason={reason}
+```
 
 ---
 
@@ -209,6 +239,7 @@ two hosts, one frame:
    │     → the destination bitmap (VM pixels)
    │     → the layer's transition slot (cache_bitmap / transition_self)
    │     → the projection draws that slot in place of the layer's image/subtree
+   │     → apply_with_fallback: the cross-fade stands in and the reason comes back
    └─ Trans::effect_draw(src1, src2, size, covers_layer)
          → LayerState::effect (an EffectDraw)
          → the projection draws one node per pass, in place of the layer's image
@@ -236,9 +267,12 @@ placements do not invalidate it.
 | a rule whose buffer length disagrees with its dimensions | `TransError::InconsistentRule` |
 | the two sources have different dimensions | `TransError::SizeMismatch` |
 | an `extrans` option outside the range the reference accepts | `TransError::InvalidOption` |
+| a kind that cannot draw its frame | the frame is drawn as the cross-fade and `apply_with_fallback` returns the reason |
 
-Nothing is silently clamped to a fallback: every rejected parameter is a
-typed error, and L3 turns it into the script error text.
+Every rejected parameter is a typed error, and L3 turns it into the script
+error text. Nothing is clamped to a substitute value. A kind that cannot draw
+its frame is not a parameter: the frame is drawn as the cross-fade, and the
+reason comes back with it so the caller can report the fallback.
 
 ---
 
@@ -248,9 +282,10 @@ typed error, and L3 turns it into the script error text.
   the seven `extrans` kinds have no program: their per-pixel rule or
   coordinate warp would need a fragment shader this crate does not ship, so
   `Trans::apply` blends them on every host, GPU included. That is a
-  renderer limitation, not a per-run fallback. The programs that would
-  replace it are deferred work (`TODO.md` §16); the registry that carries
-  them is documented in [shader.md](shader.md).
+  renderer limitation, not a fallback: the kind is blended by its own
+  arithmetic. The programs that would replace it are deferred work
+  (`TODO.md` §16); the registry that carries them is documented in
+  [shader.md](shader.md).
 * **The custom-shader draw needs a backend that runs effect pipelines.** A
   backend that cannot build one (the headless backend) has no pipeline for
   any program, so the transition is blended on the CPU with `Trans::apply`
@@ -277,7 +312,8 @@ typed error, and L3 turns it into the script error text.
 ## 9. Tests
 
 * `crates/engine/tests/trans.rs` — the state machine, the kinds, the rule
-  mask and the errors.
+  mask, the errors and the fallback: the cross-fade that stands in for a kind
+  that cannot draw its frame.
 * `crates/engine/tests/trans_blend.rs` — the blend the CPU path writes: the
   cross-fade and the rule blend against the per-channel arithmetic of the
   reference, and a timing measurement of the 1920x1080 cross-fade.

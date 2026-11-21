@@ -390,14 +390,19 @@ The order the windowed loop in `crates/app/src/runner.rs` uses:
 1. **Apply the pending resize.** The device framebuffer size changed, so
    `Engine::resize` rebinds the surface, or replaces the offscreen target
    with one of the new size. The scene's window and layer sizes do not
-   change: an OS resize moves no value a script observes.
+   change: an OS resize moves no value a script observes. A host that keeps
+   a fixed resolution applies the size the compositor reports as well: the
+   framebuffer is the window's extent, and the surface size is what the
+   presentation mapping is fitted to.
 2. **Fold the input events into the input state.**
    `InputState::begin_frame`, one `apply` per event, `end_frame`. See
    [§9](#9-input-the-state-and-the-frame-protocol).
 3. **Drive the frame.** `engine.run(&clock, &mut hooks)`.
 4. **Apply a script-side window resize.** The engine surfaces one through
-   `Engine::take_window_resize`; the host resizes its own window and reports
-   the new size back through `Engine::resize`.
+   `Engine::take_window_resize`; the host decides what to do with it. A host
+   whose window follows the device resizes its own window and reports the new
+   size back through `Engine::resize`; a host that keeps a fixed resolution
+   takes the request and reports it, and the window keeps its size.
 5. **Mix and write the audio.** The mixer is advanced and rendered into the
    host's buffer, outside the engine frame. See
    [§8](#8-audio-the-mixer-and-the-device-callback).
@@ -745,7 +750,37 @@ with one of that size; the window's client size and the primary layer's rect
 are untouched, and the presentation refits the screen into the new
 framebuffer. The other direction is a script-side window size: the engine
 surfaces one through `Engine::take_window_resize()`, and the host applies it
-to its own window.
+to its own window when that window follows the device.
+
+**The framebuffer is the window's extent.** The picture is drawn into the
+swapchain, and the swapchain's extent is the window's extent, so the
+compositor owns the size. The window's size report reaches the engine's
+surface in every mode, and the surface size is what the presentation mapping
+is fitted to — the same mapping that places the picture and that the click
+is taken back through, so the picture and the click agree.
+
+**The window's shape is the host's choice.** The platform owns that choice,
+and `platform::Resolution` carries it: the variant `Default`, the variant
+`Size(width, height)` and the variant `Fullscreen`. `PlatformConfig` holds
+the one the run was created with, and the composition root selects it from
+the command line — `--resolution WxH` asks for a size, `--fullscreen` for a
+fullscreen window. The engine's logical screen is the VM's own in every one
+of them, and the Fit mapping from it into the framebuffer is the rule above.
+
+**The default window follows the device; a declared resolution keeps the
+window.** `Default` creates the platform's own window: it takes a logical
+size, it is resizable, and the framebuffer follows it. An OS resize changes
+the framebuffer, and the frame path serves the resize to the engine before
+the frame body runs; a script's `Window.setInnerSize` resizes the OS window,
+and the surface follows it. `Size` is a declared resolution in device pixels:
+the window is created at it and it does not allow a resize, so the player
+cannot change it. `Fullscreen` covers the primary monitor at the display's
+own resolution and does not allow a resize either. A window that keeps the
+resolution it was created at adopts no client size: a script's window size
+is taken and not applied. That is the whole of what it fixes — the *window*
+keeps its size — while the engine's view of the size is not frozen: a size
+the compositor reports reaches the surface in every mode, and the picture
+and the click still agree.
 
 The code map is [`translate.md`](translate.md); the architecture is
 [`docs/arch/l2.md`](../../arch/l2.md) §4.
@@ -890,7 +925,9 @@ full list is in `crates/app/src/main.rs`.
       sees them.
 - [ ] A device resize goes through `Engine::resize` and changes nothing in
       the scene; a script-side window size is taken from
-      `Engine::take_window_resize` and applied to the host's own window.
+      `Engine::take_window_resize` and applied to the host's own window — or,
+      when the host keeps a fixed resolution, neither is applied and the
+      script still sees `onResize`.
 
 **The scene**
 

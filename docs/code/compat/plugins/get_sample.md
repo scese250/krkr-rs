@@ -76,7 +76,7 @@ Its `onFlip` timer action reads that flag before it reads the plugin's
 `sampleValue`, so a port that registered the surface at startup would leave
 the flag unset and the action would raise
 `Member "enableGetSample" does not exist` on every fire. The link is
-idempotent, and `Plugins.unlink` only forgets the link: the ABI cannot
+idempotent, and `Plugins.unlink` changes nothing: the ABI cannot
 remove a member, so the surface stays on the class
 ([`../plugin.md`](../plugin.md)).
 

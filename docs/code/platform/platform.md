@@ -54,12 +54,21 @@ pub trait EventHandler {
 
 pub enum Flow { Continue, Exit }
 pub struct PlatformConfig { pub title: String, pub size: (u32, u32),
+                            pub resolution: Resolution,
                             pub frame_interval: Duration }   // #[non_exhaustive]
+pub enum Resolution { Default, Size(u32, u32), Fullscreen }
 pub enum PlatformError { EventLoop(String), Window(String), Audio(AudioError),
                          Handle(String), Unsupported, NotImplemented(String) }
 
 pub fn run<H: EventHandler>(config: PlatformConfig, handler: H) -> Result<(), PlatformError>;
 ```
+
+`size` is the **default** window's size in logical pixels: the backend
+scales it by the display's scale factor. `resolution` says how the window is
+created: `Default` takes that logical size and leaves the window resizable,
+`Size(w, h)` creates it at that resolution in device pixels and does not let
+it change, and `Fullscreen` covers the primary monitor at the display's own
+resolution, where `size` does not apply.
 
 The platform loop owns the window and the ticker; the handler owns the engine
 and returns `Flow::Exit` to stop the loop. `PlatformEvent::CloseRequested`
@@ -76,6 +85,16 @@ pub struct FramePacing { pub poll_ms: f64, pub input_ms: f64 }
 The handler may query the window's size and request a new inner size, so a
 script-driven client-area change reaches the backend; the backend reports the
 applied size back as `PlatformEvent::Resized`.
+
+The Linux backend creates the **default** window at the configured logical
+size and leaves it resizable, so the player can resize it and the framebuffer
+follows. A window created at a declared resolution or in fullscreen keeps
+the resolution it was created at, so neither the player nor the window
+manager changes it. A `Resized` event can still arrive — a compositor or a
+scale-factor change reports one — and it carries the size the backend saw;
+what the run does with it is the composition root's decision. The
+composition root applies it to the surface in every mode: the framebuffer is
+the window's extent, so the compositor owns it.
 
 ### The Linux backend
 
@@ -140,6 +159,16 @@ impl PlatformWindow {
     pub fn software_surface(&self) -> Result<SoftwareSurface, PlatformError>;
 }
 ```
+
+The window's size is a **startup choice**. The Linux backend creates the
+default window at `PlatformConfig::size` in logical pixels and leaves it
+resizable, so the framebuffer the run draws into follows the window. A
+window created at a declared resolution, or one that covers the primary
+monitor at the display's own resolution, keeps the resolution it was created
+at: the player cannot resize it, and a script's window size is not applied
+to it. The framebuffer follows the window in every mode — the window's
+extent is the swapchain's extent — so a size the compositor reports reaches
+the surface in every mode.
 
 The **software surface** copies an RGBA8 frame into the window's pixels
 without a GPU, so the null render backend can show a game. It talks to the
@@ -300,21 +329,27 @@ pub fn process_io() -> Option<ProcessIo>;
 ```
 
 `system_font_dirs` returns the host's system-font directories: the Android
-list (`/system/fonts`, `/product/fonts`, `/vendor/fonts`) on Android, and the
-Unix system directories plus the per-user XDG locations on a desktop. The
-Android list itself is crate-private: the function is the only way to reach
-it. A returned directory may not exist; the caller treats
-a missing entry as an absent source rather than an error. The engine (L2) may
-not name a platform path, so the composition root supplies this list.
+list (`/system/fonts`, `/product/fonts`, `/vendor/fonts`) under the
+`platform-android` feature, and the Unix system directories plus the per-user
+XDG locations under `platform-linux`. The list follows the **selected
+platform**, not the machine the build runs on, so the Android list is
+compiled and tested on a host that selects the Android backend. The Android
+list itself is crate-private: the function is the only way to reach it. A
+returned directory may not exist; the caller treats a missing entry as an
+absent source rather than an error. The engine (L2) may not name a platform
+path, so the composition root supplies this list.
 
-`default_font_families` names the families the host installs as its own
-default user-interface font, in the order the engine tries them: the first
-family the host provides is the engine's default face, the face whose metrics
-a face name that resolves to nothing takes. The desktop list starts with the
-desktop's own default font and names the metric-compatible faces a
-distribution ships instead; the Android list names the platform's font and the
-vendor faces an image carries instead. The engine (L2) may not name a
-platform font, so the composition root supplies this list.
+`default_font_families` names the families the host prefers for its own
+default user-interface font, in the order the engine tries them. They are a
+**preference**, not a requirement: the first family the host provides is the
+engine's default face, the face whose metrics a face name that resolves to
+nothing takes, and a host that provides none of them still has a default
+face — one of the host's own faces. The list follows the selected platform as
+well: the desktop list starts with the desktop's own default font and names
+the metric-compatible faces a distribution ships instead; the Android list
+names the platform's font and the vendor faces an image carries instead. The
+engine (L2) may not name a platform font, so the composition root supplies
+this list.
 
 The metrics readers are **stateless free functions**: each reads the host
 interface on every call and holds no cache, so the caller's refresh cadence
@@ -365,6 +400,11 @@ graph for.
 
 The rule it protects is in [`arch_rules.md`](../../rules/arch_rules.md) §12.
 
+The host's font directories and its default font families follow the same
+rule: each platform carries its own list, so the Android list is compiled and
+tested under `platform-android` and the desktop's under `platform-linux`,
+whatever machine the check runs on.
+
 ---
 
 ## 10. Failure modes
@@ -405,8 +445,9 @@ Every other case is an error.
   non-contact actions having no phase.
 * `crates/platform/platform/src/clock.rs` `mod tests` — the ticker poll
   behaviour and the interval bounds.
-* `crates/platform/platform/src/fonts.rs` `mod tests` — the Android font
-  directories and the non-empty host list.
+* `crates/platform/platform/src/fonts.rs` `mod tests` — the font directories
+  and the default font families of the selected platform, and the non-empty
+  host lists.
 * `crates/platform/platform/src/memory.rs` `mod tests` — the `VmRSS` parsing
   and the unknown cases (missing line, unparsable value, overflowing byte
   conversion).

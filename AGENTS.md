@@ -496,9 +496,12 @@ file §9.
   follows it: `video-ffmpeg` on Linux, `video-mediacodec` on Android.
 - **D14 — native plugins are static, built into L3.** One `BUILTIN_PLUGINS`
   table; `Plugins.link(name)` recognizes every ported DLL. A DLL we have
-  **not** ported registers nothing: the link is recorded, one `warn!` names
-  the plugin, and the script sees the plugin as absent — no class, no object
-  that swallows member accesses. A ported DLL keeps publishing its class.
+  **not** ported registers nothing: one `warn!` names the plugin, and the
+  script sees the plugin as absent — no class, no object that swallows member
+  accesses. A ported DLL keeps publishing its class. `Plugins.getList` reports
+  the modules that were loaded, lower-cased and sorted, the dependencies
+  included and a failed name excluded; `Plugins.unlink` is a no-op that
+  answers `1`.
 - **D15 — loading is explicit.** The archive list comes from the command line
   (repeatable, later archives win); the startup script is found inside the
   mounted archives, and a missing startup is a typed error. D35 adds the one

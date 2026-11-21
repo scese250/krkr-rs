@@ -724,8 +724,9 @@ The `emoteplayer.dll` entry declares `motionplayer.dll` as its **dependency**,
 so a script that links the loader shim gets this port registered first, and
 the `Motion` namespace is on the VM by the time that link returns. Linking
 `motionplayer.dll` directly registers this port on its own. The dependency is
-not a link of its own, so `Plugins.getList` reports only the name the script
-linked.
+named by `Plugins.getList` too: the dependency load runs through the same
+module load as the plugin's own, so the list names every module that was
+loaded.
 
 ## State and lifetime
 

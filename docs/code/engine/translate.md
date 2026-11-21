@@ -149,6 +149,14 @@ have resized a window's primary layer) and after `after_project`.
   The visible difference at `s > 1` is softness — a rasterization
   approximation, not a script-observable difference, because every layout
   metric stays in VM units.
+* **The device scale does not reach the content.** The experimental
+  native-resolution rendering
+  ([`arch/l2.md`](../../arch/l2.md) §4) filters the textures the device
+  samples, so a magnified picture is smooth; the content the engine
+  rasterizes is still produced at the VM resolution, so its edges are still
+  one VM pixel wide. `raster_scale()` has no consumer yet, and the mapping
+  itself does not change with the policy: the logical screen and the
+  translation stay where they are.
 
 ---
 

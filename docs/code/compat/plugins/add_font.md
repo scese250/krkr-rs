@@ -67,8 +67,11 @@ entry for the same family (`reference/cpp/core/visual/FontImpl.cpp:118,127`).
 The shared face resolver `crates/compat/src/resource.rs` consults the registry
 first, then the attached storage, then the host's installed system fonts. A
 face no source knows — a pre-rendered `*name`, for example — falls back to the
-**default face**, the face registered under the registry's oldest name, which
-the reference makes the default font
+**default face**, the face registered under the registry's oldest name. That
+face is the host's own: the first of the host's preferred families the host
+provides, or one of the host's own enumerated faces when the host provides
+none of them. The reference makes its default font one of the fonts its
+platform enumerated, and a face name it does not know falls back to it
 (`reference/cpp/core/visual/FontImpl.cpp:243-244`, `:159-168`). The visual
 `Font` native (`crates/compat/src/natives/visual/font.rs`), the `TextRenderBase`
 plugin (`crates/compat/src/natives/plugins/text_render/metrics.rs`) and the

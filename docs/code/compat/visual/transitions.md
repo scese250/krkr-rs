@@ -44,6 +44,11 @@ The reference's **order of error precedence** is reproduced exactly:
 9. **`selfupdate` and `callback`** are captured from the options object
    *before* the transition is registered.
 
+A name no provider answers is not in that list: it is drawn as the cross-fade,
+the way the reference's provider lookup falls back to `crossfade`
+(`reference/cpp/core/visual/TransIntf.cpp:296-299,331-341`). The `time`
+option is read for the fallback too, so a missing `time` still raises.
+
 On success, with `withchildren` the cache-consumer count of both layers is
 incremented, the transition is stored in the L3 `LayerExtras::transitions`
 map and the runtime state (`self_update`, the retained tick callback,
@@ -79,7 +84,9 @@ over the native no-op default.
 
 ## 4. The transition kinds
 
-The lookup is an **exact, case-sensitive** name with **no silent fallback**.
+The lookup is an **exact, case-sensitive** name. A name no provider answers is
+not an error: the transition is drawn as the cross-fade and the fallback is
+reported (§11).
 
 | Script name | L2 kind | Options (reference defaults) |
 |---|---|---|
@@ -160,11 +167,17 @@ Every other kind needs a per-pixel rule or a coordinate warp, so it has no
 program and the transition is blended with `Trans::apply` on every host —
 GPU included.
 
-The two **rendered** sources must have the same size in both forms; a mismatch
-is `TransError::SizeMismatch` — `"transition source size mismatch: {src1:?} vs
-{src2:?}"` — raised as a script error. This is a later check than the
-provider's own up-front size check, which compares the endpoints' declared
-sizes.
+The CPU blend is `Trans::apply_with_fallback`: a kind that cannot draw its
+frame draws the cross-fade instead, and the reason comes back with the frame
+(§11). A transition that stands in for a name no provider answers is drawn
+with the CPU blend as well, never with a device program.
+
+The two **rendered** sources must have the same size in both forms. A
+mismatch is `TransError::SizeMismatch` — `"transition source size mismatch:
+{src1:?} vs {src2:?}"` — and the frame is drawn as the cross-fade, which
+blends the part of the source that covers the destination; the fallback is
+reported (§11). This is a later check than the provider's own up-front size
+check, which compares the endpoints' declared sizes and raises.
 
 A drawn transition changes every tick, but only because its blend weights (or
 placements) change: the endpoint **subtrees** it samples do not. The draw
@@ -243,7 +256,10 @@ For each active transition:
    reference computes its phase in, a tick difference rather than an
    accumulated frame delta.
 6. **Rendering**: the transition's blend target is written through the
-   borrowed machine.
+   borrowed machine. A kind that cannot draw its frame draws the cross-fade
+   instead (§11). A frame whose endpoints' images are gone is not written at
+   all: the transition keeps running, and the layer shows the content it
+   showed before (§11).
 7. **Completion**: the transition is torn down.
 
 The teardown **removes the entry before the dispatch**, so a handler that
@@ -313,7 +329,7 @@ This is what makes an `AffineLayer` render: its `onPaint` copies the hidden
 |---|---|
 | the transition machine, the rule image, the blend target, the destination's alpha handling | L2 `engine_api::Trans` / `TransKind` / `RuleMask` / `DestAlpha` |
 | the active transition per layer (`Trans`, the source id, `with_children`) | L3 `LayerExtras::transitions` |
-| the runtime state (`self_update`, the retained tick callback, `pending_ms`) | L3 `TransitionRuntimeState` |
+| the runtime state (`self_update`, the retained tick callback, `pending_ms`, the reported fallbacks) | L3 `TransitionRuntimeState` |
 | the cache revisions | L3 `LayerExtras::cache_revisions` |
 | the cache slots and the consumer count | L2 `Scene` |
 | the recorded effect draw | L2 `Scene` (`LayerState::effect`) |
@@ -344,12 +360,29 @@ This is what makes an `AffineLayer` render: its `onPaint` copies the hidden
 
 ---
 
-## 11. Tests
+## 11. The records
+
+A transition that could not draw its frame is reported once per transition:
+the kind fails on every tick, so the reader gets one record and not one per
+frame. The records are `compat.layer` records:
+
+| Record | Written when |
+|---|---|
+| `compat.layer: an unknown transition is drawn as a cross-fade transition={name} fallback=crossfade` | the name no provider answered |
+| `compat.layer: the transition is drawn as a cross-fade transition={kind} reason={reason}` | the kind could not draw its frame: its own option validation, or a size mismatch between the two sources |
+| `compat.layer: the transition frame is not drawn transition={kind} reason={reason}` | the endpoints' images were gone when the frame was due |
+
+`{name}` is the name the script asked for, `{kind}` is the provider's own
+name and `{reason}` is the failure the engine reported.
+
+---
+
+## 12. Tests
 
 | Test | What it asserts |
 |---|---|
-| `crates/compat/tests/layer.rs` | `transitions_begin_and_stop`, `extrans_transitions_begin_and_stop`, `unsupported_transitions_and_media_helpers_raise_typed_errors`. |
-| `crates/compat/tests/transitions.rs` | the transition behaviours: the kinds, the options, the `withchildren` semantics, the completion event, the callback tick and the self-update mode. |
+| `crates/compat/tests/layer.rs` | `transitions_begin_and_stop`, `extrans_transitions_begin_and_stop`, `unsupported_transitions_and_media_helpers_raise_typed_errors`, `an_unknown_transition_is_drawn_as_the_cross_fade`. |
+| `crates/compat/tests/transitions.rs` | the transition behaviours: the kinds, the options, the `withchildren` semantics, the completion event, the callback tick, the self-update mode and `an_unknown_transition_name_falls_back_to_the_cross_fade`. |
 | `crates/compat/tests/layer_behaviour.rs` | the cache and repaint semantics. |
 | `crates/compat/tests/visual.rs` | the scene-level transitions. |
 

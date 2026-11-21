@@ -146,8 +146,8 @@ reads is worth at most 8 ms of a 630 ms phase — it is not worth doing.
 | the storage namespace | an index by the first path component would save ~20–30 ms |
 | the archive mount | eight independent index parses, ~15–18 ms, parallelisable |
 | the read pool | dead while the XP3 filter seam is installed (`crates/engine/src/storage.rs:2160-2164`), so every read runs on the calling thread; the reference filters the *decoded* bytes, so only the filter needs the script's thread |
-| the TJS2 C++ flags | **measured, no effect**: `-O2` gives 1.232–1.242 s and `-O3` gives 1.238–1.251 s on the same workload. The `-flto` arm still needs a device A/B (`TODO.md` §17) |
-| the allocator (`mimalloc`) | measured and rejected (`TODO.md` §17) |
+| the TJS2 C++ flags | **measured, no effect**: `-O2` gives 1.232–1.242 s and `-O3` gives 1.238–1.251 s on the same workload. The `-flto` arm still needs a device A/B (`TODO.md` §16) |
+| the allocator (`mimalloc`) | measured and rejected (`TODO.md` §16) |
 | the zlib backend | `flate2` inflates with `zlib-rs`; the system zlib measures 277 MB/s against it and would save ~45 ms, but the feature links the C library, which the Android target would then need |
 | compiling the scripts ahead of time | measured on the game's own 742 KB `mainwindow.tjs`: compile 45.4 ms, bytecode run 6.1 ms, source run 28.9 ms — so ~65–70 ms of the startup, but the bytecode round trip is broken today (`x += 2` and `x++` fail when a script comes from bytecode), and the reference's round trip is broken the same way |
 

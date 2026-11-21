@@ -417,7 +417,15 @@ The platform owns the window and the ticker; your handler owns the engine.
 may be called again after a resume on a mobile platform — make it idempotent.
 `frame` is called once per due frame with the time since the previous frame.
 `PlatformConfig` is `#[non_exhaustive]`: build it with `Default` and
-assign the fields you need.
+assign the fields you need. Its `size` is the default window's initial size
+in logical pixels, and the backend creates a resizable window at it. Its
+`resolution` chooses the window's shape: the default window, a declared
+resolution in device pixels that the window keeps, or a window that covers
+the primary monitor at the display's own resolution. Whichever shape the
+window has, the framebuffer is the window's extent — the picture is drawn
+into the swapchain, and the swapchain's extent is the window's extent — so
+the compositor owns the size and a `PlatformEvent::Resized` reaches your
+engine in every mode.
 
 `PlatformWindow` gives you the handles the surface needs
 (`raw_window_handle()`, `raw_display_handle()`), the physical size
@@ -469,8 +477,8 @@ struct MyApp {
     frame_time: InjectedFrameTime,
     /// The engine, created once the window handle exists.
     engine: Option<Engine>,
-    /// The newest window size an OS resize reported since the last frame.
-    pending_surface_size: Option<(u32, u32)>,
+    /// The newest size an OS resize reported, applied at the frame boundary.
+    pending_size: Option<(u32, u32)>,
 }
 
 impl EventHandler for MyApp {
@@ -539,9 +547,13 @@ impl EventHandler for MyApp {
     fn event(&mut self, event: PlatformEvent) -> Flow {
         match event {
             PlatformEvent::Resized(width, height) => {
-                // The surface follows the newest size at the next frame
-                // boundary; the scene's own sizes do not change.
-                self.pending_surface_size = Some((width, height));
+                // The framebuffer is the window's extent, so the compositor
+                // owns it: the newest size is applied at the frame boundary,
+                // where the engine refits the screen into it. A host that has
+                // a script hands the event to it as well, and the script sees
+                // `onResize`.
+                self.pending_size = Some((width, height));
+                eprintln!("my-app: the window is now {width}x{height}");
                 Flow::Continue
             }
             PlatformEvent::CloseRequested => Flow::Exit,
@@ -553,17 +565,19 @@ impl EventHandler for MyApp {
         // The platform measured the gap since the previous frame; that
         // measurement is the elapsed time the engine's clock advances by.
         self.frame_time.elapsed_ms = f64::from(dt_ms);
+        // The framebuffer is the window's extent: the newest size the event
+        // loop reported is applied here, at the frame boundary, before the
+        // frame body and the draw see it.
+        if let Some(size) = self.pending_size.take()
+            && let Some(engine) = self.engine.as_mut()
+            && let Err(error) = engine.resize(size)
+        {
+            eprintln!("my-app: resize failed: {error}");
+            return Flow::Exit;
+        }
         let Some(engine) = self.engine.as_mut() else {
             return Flow::Continue;
         };
-        // An OS resize is applied once, with the newest size the event loop
-        // reported, before the frame body and the draw see it.
-        if let Some(size) = self.pending_surface_size.take() {
-            if let Err(error) = engine.resize(size) {
-                eprintln!("my-app: resize failed: {error}");
-                return Flow::Exit;
-            }
-        }
         let mut hooks = HostFrame;
         match engine.run(&self.frame_time, &mut hooks) {
             Ok(report) => {
@@ -589,13 +603,21 @@ fn main() -> Result<(), PlatformError> {
     let mut config = PlatformConfig::default();
     config.title = "my-app".to_owned();
     config.frame_interval = Duration::from_millis(16);
+    // `size` is the default window's initial size in logical pixels: the
+    // window is created at it and it is resizable. A host that wants a
+    // window that keeps its size sets `config.resolution` instead:
+    // `Resolution::Size(width, height)` for a declared resolution in device
+    // pixels, `Resolution::Fullscreen` for the primary monitor. Either way
+    // the framebuffer is the window's extent, and the size the compositor
+    // reports reaches the surface.
+    config.size = (1280, 720);
 
     platform::run(
         config,
         MyApp {
             frame_time: InjectedFrameTime::default(),
             engine: None,
-            pending_surface_size: None,
+            pending_size: None,
         },
     )
 }
@@ -790,6 +812,25 @@ with one of that size; the window's client size and the primary layer's rect
 are untouched, and the presentation refits the screen into the new
 framebuffer. The other direction — a script-side window size — travels through
 `Engine::take_window_resize()`, and you apply it to your own window.
+
+**The framebuffer is the window's extent.** The picture is drawn into the
+swapchain, and the swapchain's extent is the window's extent, so the
+compositor owns the size: the size the event loop reports reaches the
+engine's surface, and the surface size is what the presentation mapping is
+fitted to. That mapping places the picture and takes the click back, so the
+picture and the click agree.
+
+The desktop root in `crates/app` uses the platform's own window by default: it
+is resizable, and the frame path serves an OS resize to the engine, so the
+framebuffer follows the window. A run that asks for a fixed resolution gets a
+window that keeps it — created at that resolution in device pixels, or on the
+primary monitor at the display's own resolution — and the player cannot
+resize it; a script's window size is taken and not applied to it. That is
+the whole of what it fixes: the *window* keeps its size, while the engine's
+view of the size is not frozen, and a size the compositor reports reaches
+the surface in every mode. An OS resize is handed to the VM as well, which
+posts `onResize` to the script. A host calls `Engine::resize` with the size
+the event loop reported, as the worked example above does.
 
 ---
 

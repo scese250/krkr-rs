@@ -400,7 +400,7 @@ so it is not cited here: the pages that state each rule in full are in
 | D10 | L1 owns the traversal, the composition, the batching and the draw; L2 keeps the tree current and never builds a draw list |
 | D11 | No silent fallback and no hardcoded limit: a failure that cannot be performed is a typed error |
 | D13 | The platform and the media backend are chosen at compile time, not bundled at run time |
-| D14 | Native plugins are static and built into L3; an unported DLL is absent — the link is recorded, one warning names it, and nothing is registered |
+| D14 | Native plugins are static and built into L3; an unported DLL is absent — one warning names it, nothing is registered for it and nothing is loaded |
 | D15 | Loading takes an explicit archive list; the startup is found inside the mounted archives; a missing startup is a typed error |
 | D16 | L2 stays generic and L3 stays thin: an L3 member reduces to marshal → one L2 call → marshal |
 | D18 | The Win32 environment is emulated: handles, devices, the registry, the shell and the metrics return emulated values, never errors |

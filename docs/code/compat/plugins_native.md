@@ -7,8 +7,8 @@ only** — no instance, no payload — and mirrors the reference `Plugins` class
 
 ```
 Plugins.link(name)    → int (1 when the plugin is linked, 0 when the name has no emulation)
-Plugins.unlink(name)  → bool
-Plugins.getList()     → array of the linked names
+Plugins.unlink(name)  → bool (always 1: the unloading changes nothing)
+Plugins.getList()     → array of the linked modules, lower-cased and sorted
 ```
 
 ---
@@ -19,8 +19,8 @@ Activates a plugin name:
 
 | Outcome | Behaviour | Result |
 |---|---|---|
-| a built-in emulation exists | its classes are registered (once) and the link is recorded | `1` |
-| no built-in emulation | the link is recorded, one warning names the plugin, and **nothing** is registered for it | `0` |
+| a built-in emulation exists | its classes are registered (once) and the module is recorded as linked | `1` |
+| no built-in emulation | one warning names the plugin, and **nothing** is registered or loaded for it — the name is not among the linked modules | `0` |
 
 The call answers the outcome, so a script can test it to learn whether the
 plugin's surface is there. This is a deliberate divergence: the reference's
@@ -47,11 +47,13 @@ its own "class not found" path.
 
 ## 2. `Plugins.unlink(name)`
 
-Forgets a linked name and reports whether it had been linked:
+Changes nothing and answers `1` for every name:
 
-* the built-in classes **stay** on the VM — the ABI cannot remove them; only
-  the `getList` entry goes, and a later `link` is idempotent;
-* an unported link owns no global, so there is nothing to clear.
+* the module stays loaded and `Plugins.getList` keeps naming it — the
+  reference's `TVPUnloadPlugin` does nothing and returns `true`
+  (`reference/cpp/core/plugin/PluginImpl.cpp:58-63`);
+* the built-in classes **stay** on the VM — the ABI cannot remove them, and a
+  later `link` is idempotent.
 
 The result is logged at info: `Plugins.unlink({name:?}) -> {removed}`.
 
@@ -61,11 +63,20 @@ The result is logged at info: `Plugins.unlink({name:?}) -> {removed}`.
 
 ## 3. `Plugins.getList()`
 
-Returns the linked plugin names:
+Returns the linked modules:
 
-* in **insertion order**;
-* with the **script's original casing** — the name the script passed, not the
-  normalised key.
+* **lower-cased** — the module load lower-cases the name before it records it
+  (`reference/cpp/core/plugin/ncbind.cpp:12-28`);
+* **sorted by name** — the reference's set is ordered
+  (`reference/cpp/core/plugin/PluginImpl.cpp:332-349`);
+* the **startup module** (`xp3filter.dll`) is among them from the first line,
+  because the startup load put it on the VM;
+* a **dependency** is among them, because the dependency load runs through
+  the same module load as the plugin's own;
+* a name that **resolved to nothing** is not among them: nothing was loaded
+  for it. The reference joins a name to the set only after the module's
+  registrations have run, and a name that matches no module returns without
+  joining it (`reference/cpp/core/plugin/ncbind.cpp:12-28`).
 
 The reference `getList` has no `numparams` check, so any arguments are
 ignored.
@@ -117,7 +128,7 @@ buffers are owned by the same services the callback was resolved against.
 
 | Test | What it asserts |
 |---|---|
-| `crates/compat/tests/plugin.rs` | `link` on a built-in activates it; `link` on an unported name registers nothing; `unlink` reports the outcome; `getList` preserves the order and the casing |
+| `crates/compat/tests/plugin.rs` | `link` on a built-in activates it; `link` on an unported name registers nothing; `unlink` answers `true` and changes nothing; `getList` names the linked modules lower-cased and sorted |
 | `crates/compat/tests/plugin_autoload.rs` | the autoload path links through the same registry |
 | `crates/compat/tests/menu_dll_surface.rs` | `menu.dll` links as a built-in |
 

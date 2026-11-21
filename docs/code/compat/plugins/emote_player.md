@@ -46,8 +46,8 @@ The table declares `motionplayer.dll` as this entry's **dependency**
 VM by the time the link returns, exactly as the reference's loader shim pulls
 the module in before its own registration.
 
-The dependency is **not** a link of its own: `Plugins.getList` reports
-`emoteplayer.dll` alone, never `motionplayer.dll`.
+The dependency is a module that was loaded, so `Plugins.getList` names it:
+the list holds `emoteplayer.dll` and `motionplayer.dll`.
 
 The classes exist only where the reference puts them. The reference's
 `NCB_REGISTER_SUBCLASS_DELAY` defines members without publishing a global

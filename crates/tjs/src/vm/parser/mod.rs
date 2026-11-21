@@ -448,9 +448,7 @@ impl<'a, C: Commands> Parser<'a, C> {
     /// Consumes the token the parser looks at.
     fn advance(&mut self) -> Option<Token> {
         self.fill(1);
-        let Some(token) = self.lookahead[0].take() else {
-            return None;
-        };
+        let token = self.lookahead[0].take()?;
         for place in 1..self.lookahead_len {
             self.lookahead[place - 1] = self.lookahead[place];
         }

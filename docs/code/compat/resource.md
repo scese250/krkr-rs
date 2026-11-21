@@ -269,8 +269,8 @@ Resolution order:
      draw;
    * the host's installed system fonts (exact family only);
 2. the registry's **default face** — the face registered under the oldest
-   name. It supplies the metrics of the text, so a face name that resolves to
-   nothing is drawn with the host's default font. A registry that holds no
+   name, the host's own face. It supplies the metrics of the text, so a face
+   name that resolves to nothing is drawn with it. A registry that holds no
    face yet gets the host's coverage face first, so a face the host provides
    is never lost to an empty registry;
 3. otherwise the typed error `"no font is available for face '{face}'"`.
@@ -302,25 +302,29 @@ host's faces is not on the startup's critical path:
 
 | role | the face | what it does |
 |---|---|---|
-| the default face | the oldest registered name — the host's own default user-interface font | supplies the metrics of a face name that resolves to nothing |
+| the default face | the oldest registered name — the first of the host's preferred families the host provides, or one of the host's own enumerated faces when the host provides none of them | supplies the metrics of a face name that resolves to nothing |
 | the coverage face | the face the host designates — the first installed face that carries a Japanese ideograph | draws a character the requested face does not carry |
 
-The two roles want different faces on a desktop: the default font is a Latin
-user-interface face and carries no ideograph, while the coverage face has to
-carry one. The reference uses one face for both roles, because its default
-font is a Japanese system font; the port's default face is the host's
-default font, so the coverage face is a second face.
+The two roles want different faces on a desktop: the preferred family is a
+Latin user-interface face and carries no ideograph, while the coverage face
+has to carry one. The reference uses one face for both roles, because its
+default font is a Japanese system font; the port's default face is one of the
+host's own faces, so the coverage face is a second face.
 
 **Documented approximation:** the default face's *name* and its metrics are
-the host's, not the reference platform's. The reference's default font is the
-last font its platform enumerated (a Japanese Windows reports `ＭＳ
-ゴシック`); the port's is the host's default user-interface font (a Linux
-desktop reports `DejaVu Sans`). A face name that resolves to nothing
-therefore takes the ascent of a different font, and the vertical placement
-of a pre-rendered glyph drawn under such a name differs from the reference's
-by the difference between the two ascents. The registered-name list follows
-the default face: it now carries the coverage face's names as well, where the
-reference enumerates every installed font anyway.
+the host's, not the reference platform's. The reference's default font is one
+of the fonts its platform enumerated — the last one it enumerated (a Japanese
+Windows reports `ＭＳ ゴシック`) — and a face name it does not know falls back
+to it; a host with no font at all raises per operation. The port's default
+face is one of the host's own enumerated faces as well: the first of the
+host's preferred families the host provides (a Linux desktop reports `DejaVu
+Sans`), or one of the host's enumerated faces when the host provides none of
+them. A face name that resolves to nothing therefore takes the ascent of a
+different font, and the vertical placement of a pre-rendered glyph drawn
+under such a name differs from the reference's by the difference between the
+two ascents. The registered-name list follows the default face: it now
+carries the coverage face's names as well, where the reference enumerates
+every installed font anyway.
 
 ---
 
@@ -388,7 +392,7 @@ string, or an object's `text`, `char` or `character` member.
 | `set_image_codec(decode, probe, save)` | `CompatHost` (defined in `host.rs`) | the L1 `media` image codec |
 | `set_image_save_type_check(check)` | `CompatHost` (defined in `host.rs`) | the host's table of the formats it can write — the check an unknown format fails at the save |
 | `set_system_font_dirs(dirs)` | the composition root, on the attached L2 text service | where the host's system fonts live |
-| the host's two font roles | the composition root, on the attached L2 text service | which faces fill the default-face and the coverage-face role |
+| the host's two font roles | the composition root, on the attached L2 text service | the families the default face is taken from, and the character the coverage face has to carry |
 
 The attached L2 text service and the attached storage are the other face
 sources.
@@ -404,7 +408,7 @@ sources.
 | `"no image encoder is installed"` | a save was requested and no encoder is installed |
 | `"no image encoder for format {type:?}"` | the host's save-type check rejected the format — raised at the save (§3) |
 | the host's own write failure | the write ran on the calling thread (no pool, or the pool refused the job) — raised at the save; a write that ran on a worker raises it at the next read of the name (§3) |
-| `"no font is available for face '{face}'"` | no candidate resolved and the registry holds no face at all |
+| `"no font is available for face '{face}'"` | no candidate resolved and the host provides no usable face, so no face is registered at all |
 | `"Cannot find storage {storage}"` | the pre-rendered font's storage does not resolve |
 | `"Prerendered font mapping failed : {sub}"` | the `.tft` header is invalid |
 | `"text layout failed: {error}"` | the L2 text engine rejected the layout |

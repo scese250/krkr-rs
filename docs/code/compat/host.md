@@ -20,7 +20,7 @@ host.install(&engine)?;                 // register the classes, then bind
 | Field | Type | Lifetime |
 |---|---|---|
 | `services` | `Box<CompatServices>` | the L3 dispatch state — L2 service handles, the per-family state map, the scratch buffers |
-| `registry` | `Box<PluginRegistry>` | the built-in plugin table and the linked-name list |
+| `registry` | `Box<PluginRegistry>` | the built-in plugin table and the linked-module set |
 | `engine` | `usize` | the address of the bound engine |
 | `services_ptr` | `usize` | the address of the boxed services |
 | `bound` | `bool` | whether the binding is installed |

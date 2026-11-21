@@ -291,10 +291,10 @@ compatibility layer's hit-test only ever see VM coordinates. Events without a
 position — keys, buttons, the wheel, text, focus — pass through unchanged.
 
 **What a host must not do.** It must not write the framebuffer size back into
-the scene's window: an OS resize changes the framebuffer only, and a script's
-window-size change travels the other way, through the engine's window-resize
-request. It must not interpret the root transform, and it must not hand a
-device coordinate to the engine or to the compatibility layer.
+the scene's window: a framebuffer resize changes the framebuffer only, and a
+script's window-size change travels the other way, through the engine's
+window-resize request. It must not interpret the root transform, and it must
+not hand a device coordinate to the engine or to the compatibility layer.
 
 **How to tell.** Search the engine for a device-space value crossing its
 boundary, and search the compatibility layer for the mapping's own methods.
