@@ -13,10 +13,13 @@
 //! The run drives a route through the game's own pages. The title page's
 //! buttons are read from the layout the game ships (`uipsd/title.csv`), and
 //! the click that presses one of them is delivered in the game's logical
-//! pixels — the 1920x1080 space the script sees — so the same click reaches
-//! the same button whatever the backend's surface size is. The page the
-//! route loads is read back from the log, so the run proves the route it
-//! drove: the page the route names is the page the run reached.
+//! pixels — the space the script sees — so the same click reaches the
+//! same button whatever the backend's surface size is. The layout's rows
+//! are the script's rows: the game's UI loader moves the layer the menu
+//! lives on to the layout's base row and places every button at its own
+//! row relative to that base. The page the route loads is read back from
+//! the log, so the run proves the route it drove: the page the route names
+//! is the page the run reached.
 //!
 //! The route has two clicks. The warm-up delivers the click in the middle of
 //! the screen, the click that moves the game's opening sequence along; it
@@ -180,38 +183,33 @@ impl FrameTimeSource for RunClock {
 /// button is 256 pixels wide and 45 pixels high. The
 /// `main/title.func` file says what a button does: the `system2` button jumps
 /// to the `*option` label of `title.ks`, which loads the settings page.
+///
+/// A row of the layout file is a row of the game's screen: the game's UI
+/// loader moves the layer the menu lives on to the layout's base row and
+/// places every button at its own row relative to that base, so the settings
+/// button lies in the screen band 615 to 660, at the left edge of the screen.
 struct TitleButton {
     /// The name the layout file gives the button.
     name: &'static str,
     /// The page the button's action loads.
     loads: &'static str,
-    /// The button's top edge, in the layout's pixels.
+    /// The button's top edge, in the game's logical pixels.
     top: i32,
 }
 
-/// The scale from the layout's screen to the game's logical screen.
-///
-/// The layout the game ships is drawn on a 1280x720 screen, and the game
-/// runs on a 1920x1080 one, so the layout is drawn 1.5 times as large: a
-/// button's row is 384 by 67.5 pixels on the game's screen.
-const LAYOUT_SCALE: f32 = 1.5;
-
-/// The click's offset inside a button, in the layout's pixels.
+/// The click's offset inside a button, in the game's logical pixels.
 ///
 /// The click lands on the button's own picture, which sits in the left part
 /// of the button's row: 110 pixels from the left edge and 25 pixels below
-/// the row's top. In the game's logical pixels that is (165, 960) for the
-/// settings button, whose row is the screen band 922.5 to 990.
+/// the row's top. That is (110, 640) for the settings button, whose row is
+/// the screen band 615 to 660.
 const CLICK_OFFSET: (f32, f32) = (110.0, 25.0);
 
 impl TitleButton {
     /// The point a click lands on to press the button: the game's logical
     /// pixels.
     fn point(&self) -> (f32, f32) {
-        (
-            CLICK_OFFSET.0 * LAYOUT_SCALE,
-            (self.top as f32 + CLICK_OFFSET.1) * LAYOUT_SCALE,
-        )
+        (CLICK_OFFSET.0, self.top as f32 + CLICK_OFFSET.1)
     }
 }
 
