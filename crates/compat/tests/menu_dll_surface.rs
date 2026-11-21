@@ -241,7 +241,7 @@ fn menu_dll_links_as_a_builtin() {
         .expect("link menu.dll");
     assert_eq!(
         host.registry().linked(),
-        vec!["menu.dll".to_string()],
+        vec!["menu.dll".to_string(), "xp3filter.dll".to_string()],
         "the link must be recorded"
     );
     // The plugin's own surface is on the core class; nothing is published

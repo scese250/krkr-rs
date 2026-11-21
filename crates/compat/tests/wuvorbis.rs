@@ -177,10 +177,12 @@ fn plugins_link_wuvorbis_resolves_to_the_builtin_without_a_null_object() {
     let env = Env::new(false);
 
     env.run("Plugins.link('wuvorbis.dll');");
-    // The link is recorded with the script's casing and is idempotent: a
+    // The link is recorded with the module's own name and is idempotent: a
     // second link neither duplicates the list nor re-registers anything.
     env.run("Plugins.link('wuvorbis.dll');");
-    assert_eq!(env.eval_int("Plugins.getList().length"), 1);
+    // The list holds the modules that were loaded: the startup module and
+    // the one this link added, named lower-cased and in name order.
+    assert_eq!(env.eval_int("Plugins.getList().length"), 2);
     assert_eq!(env.eval_str("Plugins.getList()[0]"), "wuvorbis.dll");
 
     // Built-in resolution publishes nothing under the stem, and the

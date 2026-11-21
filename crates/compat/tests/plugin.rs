@@ -79,7 +79,13 @@ fn registry_finds_builtins_case_insensitively() {
     assert!(registry.is_builtin(r"c:\x\stub.dll"));
     assert!(!registry.is_builtin("other.dll"));
     assert!(registry.plugin("stub.dll").is_some());
-    assert!(registry.linked().is_empty());
+    // The startup module is on the VM before any script runs, so it is the
+    // one module the list names before a link.
+    assert_eq!(
+        registry.linked(),
+        vec!["xp3filter.dll".to_string()],
+        "the startup module is the only linked one"
+    );
 }
 
 #[test]
@@ -101,19 +107,74 @@ fn link_unlink_link_is_idempotent_for_builtins() {
     engine
         .exec_script("Plugins.link('reg.dll');", "test")
         .expect("first link registers the class");
+    let linked = vec!["reg.dll".to_string(), "xp3filter.dll".to_string()];
+    assert_eq!(host.registry().linked(), linked);
+    // The unloading changes nothing: the module stays linked, and the list
+    // keeps naming it.
     engine
         .exec_script("Plugins.unlink('reg.dll');", "test")
         .expect("unlink");
-    assert!(host.registry().linked().is_empty());
+    assert_eq!(host.registry().linked(), linked);
     // Re-linking must not re-register the class (the VM rejects duplicates).
     engine
         .exec_script("Plugins.link('reg.dll');", "test")
         .expect("re-link is idempotent");
-    assert_eq!(host.registry().linked(), vec!["reg.dll".to_string()]);
+    assert_eq!(host.registry().linked(), linked);
 }
 
+/// The unloading answers `true` whatever the name is, and it changes
+/// nothing: the module stays linked and its classes stay on the VM.
+///
+/// The reference's `Plugins.unlink` calls `TVPUnloadPlugin`, which returns
+/// `true` and does nothing
+/// (`reference/cpp/core/plugin/PluginImpl.cpp:58-63`, `:315-329`), and the
+/// module stays in the set `getList` reports
+/// (`reference/cpp/core/plugin/ncbind.cpp:12-28`).
 #[test]
-fn linked_list_preserves_insertion_order_and_case() {
+fn the_unloading_answers_true_and_changes_nothing() {
+    let _lock = vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+
+    assert_eq!(
+        engine
+            .eval("Plugins.unlink('never-linked.dll')", "test")
+            .unwrap(),
+        TjsValue::Integer(1),
+        "the unloading succeeds for a name that was never linked"
+    );
+    engine
+        .exec_script("Plugins.link('csvParser.dll');", "test")
+        .expect("link a built-in");
+    let linked = host.registry().linked();
+    assert_eq!(
+        engine
+            .eval("Plugins.unlink('csvParser.dll')", "test")
+            .unwrap(),
+        TjsValue::Integer(1),
+        "the unloading succeeds for a linked name"
+    );
+    assert_eq!(
+        host.registry().linked(),
+        linked,
+        "the list keeps naming the module: nothing was unloaded"
+    );
+    assert_eq!(
+        engine.eval("typeof global['CSVParser']", "test").unwrap(),
+        TjsValue::String("Object".into()),
+        "the classes stay on the VM"
+    );
+}
+
+/// The list names the linked modules, lower-cased and sorted by name.
+///
+/// The reference's `getList` reports the set of the modules that were
+/// loaded, and the set holds the lower-cased module names
+/// (`reference/cpp/core/plugin/ncbind.cpp:12-28`,
+/// `reference/cpp/core/plugin/PluginImpl.cpp:332-349`).
+#[test]
+fn the_linked_modules_are_reported_lower_cased_and_sorted() {
     let _lock = vm_lock();
     let engine = Tjs2Engine::new().expect("create engine");
     let mut host = compat::CompatHost::new();
@@ -121,30 +182,93 @@ fn linked_list_preserves_insertion_order_and_case() {
 
     engine
         .exec_script(
-            "Plugins.link('First.dll'); Plugins.link('second.dll');",
+            "Plugins.link('fstat.dll'); Plugins.link('CSVParser.dll');",
             "test",
         )
-        .expect("link two unported plugins");
+        .expect("link two built-ins");
     assert_eq!(
         host.registry().linked(),
-        vec!["First.dll".to_string(), "second.dll".to_string()]
+        vec![
+            "csvparser.dll".to_string(),
+            "fstat.dll".to_string(),
+            "xp3filter.dll".to_string(),
+        ],
+        "the modules are named lower-cased and in name order"
     );
-    // An unported plugin registers nothing, so its stem stays absent.
+    // The script sees the same list.
     assert_eq!(
-        engine.eval("typeof global['First']", "test").unwrap(),
-        TjsValue::String("undefined".into())
+        engine.eval("Plugins.getList().length", "test").unwrap(),
+        TjsValue::Integer(3),
+        "the list holds every linked module"
     );
 }
 
-/// A plugin we have no emulation for is absent: the link is recorded, one
-/// warning names the plugin, and nothing is registered under the plugin's
-/// stem — no global, no object that swallows member accesses.
+/// A `.tpm` name and a `.dll` name are one module: the extension is
+/// rewritten before the name is looked up.
+///
+/// The reference rewrites a trailing `.tpm` to `.dll` before it loads the
+/// module (`reference/cpp/core/plugin/PluginImpl.cpp:95-146`), so
+/// `Plugins.link("foo.tpm")` names the module `Plugins.link("foo.dll")`
+/// names.
+#[test]
+fn a_tpm_name_resolves_the_module_the_dll_name_resolves() {
+    let _lock = vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+
+    engine
+        .exec_script("Plugins.link('csvParser.tpm');", "test")
+        .expect("link a built-in by its .tpm name");
+    assert_eq!(
+        engine.eval("typeof global['CSVParser']", "test").unwrap(),
+        TjsValue::String("Object".into()),
+        "the .tpm name resolves the built-in"
+    );
+    assert_eq!(
+        host.registry().linked(),
+        vec!["csvparser.dll".to_string(), "xp3filter.dll".to_string()],
+        "the module is named by its .dll name"
+    );
+}
+
+/// A dependency is a module that was loaded, so the list names it.
+///
+/// The reference's dependency load runs through the same module load as the
+/// plugin's own (`reference/cpp/plugins/EmotePlayer.cpp:5-10`), and that
+/// load records the module in the set `getList` reports
+/// (`reference/cpp/core/plugin/ncbind.cpp:12-28`).
+#[test]
+fn a_dependency_is_named_by_the_list() {
+    let _lock = vm_lock();
+    let engine = Tjs2Engine::new().expect("create engine");
+    let mut host = compat::CompatHost::new();
+    host.install(&engine).expect("install compat surface");
+
+    engine
+        .exec_script("Plugins.link('emoteplayer.dll');", "test")
+        .expect("link the loader");
+    assert_eq!(
+        host.registry().linked(),
+        vec![
+            "emoteplayer.dll".to_string(),
+            "motionplayer.dll".to_string(),
+            "xp3filter.dll".to_string(),
+        ],
+        "the dependency is named too: it was loaded"
+    );
+}
+
+/// A plugin we have no emulation for is absent: one warning names the
+/// plugin, nothing is registered under the plugin's stem — no global, no
+/// object that swallows member accesses — and the name is not among the
+/// loaded modules the list reports.
 ///
 /// The reference's `Plugins.link` calls `TVPLoadPlugin(name)`
 /// (`reference/cpp/core/plugin/PluginImpl.cpp:294-312`), which loads the
 /// module and registers its classes; an unknown module is an error log and
 /// nothing else (`reference/cpp/core/plugin/ncbind.cpp:12-29`), so no global
-/// exists for it.
+/// exists for it and the name never reaches the set the list reports.
 #[test]
 fn an_unported_plugin_registers_nothing() {
     let _lock = vm_lock();
@@ -175,22 +299,32 @@ fn an_unported_plugin_registers_nothing() {
         engine.eval("totally_unknown.someMember", "test").is_err(),
         "an absent plugin must not answer member accesses"
     );
-    // `getList` reports the linked name.
+    // The list names the modules that were loaded, and nothing was loaded
+    // for the unknown name: the list holds the startup module alone.
     assert_eq!(
         engine.eval("Plugins.getList()[0]", "test").unwrap(),
-        TjsValue::String("totally_unknown.dll".into())
+        TjsValue::String("xp3filter.dll".into())
+    );
+    assert_eq!(
+        engine.eval("Plugins.getList().length", "test").unwrap(),
+        TjsValue::Integer(1),
+        "a name that resolved to nothing is not named"
     );
     // The reference `getList` has no arity check, so extra arguments are
     // ignored (`PluginImpl.cpp:332-345`).
     assert_eq!(
         engine.eval("Plugins.getList(1, 2)[0]", "test").unwrap(),
-        TjsValue::String("totally_unknown.dll".into())
+        TjsValue::String("xp3filter.dll".into())
     );
-    // Unlink forgets it and reports success.
+    // The unloading changes nothing.
     engine
         .exec_script("Plugins.unlink('totally_unknown.dll');", "test")
         .expect("unlink");
-    assert!(host.registry().linked().is_empty());
+    assert_eq!(
+        host.registry().linked(),
+        vec!["xp3filter.dll".to_string()],
+        "the list keeps naming the modules that were loaded"
+    );
 }
 
 /// The game probes an unported plugin with `typeof` before it uses it, and
@@ -314,8 +448,9 @@ fn core_startup_classes_exist_before_any_plugin_link() {
     let mut host = compat::CompatHost::new();
     host.install(&engine).expect("install compat surface");
     assert!(
-        host.registry().linked().is_empty(),
-        "this test must not link a plugin"
+        host.registry().linked() == vec!["xp3filter.dll".to_string()],
+        "this test must not link a plugin: {:?}",
+        host.registry().linked()
     );
     for name in CORE_STARTUP_CLASSES {
         let value = engine
@@ -352,7 +487,11 @@ fn kagparser_plugin_names_are_empty_placeholders() {
     }
     assert_eq!(
         host.registry().linked(),
-        vec!["KAGParser.dll".to_string(), "KAGParserEx.dll".to_string()]
+        vec![
+            "kagparser.dll".to_string(),
+            "kagparserex.dll".to_string(),
+            "xp3filter.dll".to_string(),
+        ]
     );
     engine
         .exec_script_discard("class AfterParserLink extends KAGParser { }", "plugin_test")

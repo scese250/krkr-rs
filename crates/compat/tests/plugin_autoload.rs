@@ -94,7 +94,10 @@ fn autoload_resolves_tpm_as_dll_builtin() {
         .autoload(&["convert.tpm".to_string()], &mut ctx)
         .expect("autoload");
 
-    assert_eq!(host.registry().linked(), vec!["convert.dll".to_string()]);
+    assert_eq!(
+        host.registry().linked(),
+        vec!["convert.dll".to_string(), "xp3filter.dll".to_string()]
+    );
     assert_eq!(
         engine.eval("typeof ConvertClass", "test").expect("probe"),
         TjsValue::String("Object".into())
@@ -130,10 +133,13 @@ fn autoload_warns_once_for_an_unported_plugin_and_registers_nothing() {
         TjsValue::String("undefined".into())
     );
     assert!(
-        host.registry()
+        !host
+            .registry()
             .linked()
             .iter()
-            .any(|name| name == "Missing.dll")
+            .any(|name| name == "missing.dll"),
+        "a name that resolved to nothing is not named by the list: {:?}",
+        host.registry().linked()
     );
 
     assert_eq!(
@@ -186,7 +192,7 @@ fn plugins_link_path_is_unchanged() {
         .expect("link an unknown name");
     assert_eq!(
         host.registry().linked(),
-        vec!["convert.dll".to_string(), "nope.dll".to_string()]
+        vec!["convert.dll".to_string(), "xp3filter.dll".to_string()]
     );
     assert_eq!(
         engine.eval("typeof ConvertClass", "test").expect("probe"),

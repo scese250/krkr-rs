@@ -1135,6 +1135,8 @@
       "setTransform",
       "setViewTransform",
       "showParentHint",
+      "shrinkCopy",
+      "shrinkCopyFast",
       "smoothingMode",
       "startMovie",
       "stopMovie",

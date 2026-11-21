@@ -1,10 +1,11 @@
 //! The `Plugins` native class: script-facing plugin linking.
 //!
-//! `link(name)` activates a built-in plugin emulation or records the link of
-//! a plugin that has none and answers `1` for the linked plugin and `0` for
-//! a name with no emulation; `unlink(name)` forgets a linked name;
-//! `getList()` returns the linked names. This mirrors the reference
-//! `Plugins` class (static members only).
+//! `link(name)` activates a built-in plugin emulation and answers `1`, or
+//! warns and answers `0` for a name with no emulation: nothing is registered
+//! or loaded for it, and the name is not among the linked modules.
+//! `unlink(name)` changes nothing; `getList()` returns the linked modules,
+//! lower-cased and sorted by name. This mirrors the engine's own `Plugins` class
+//! (static members only).
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
@@ -76,7 +77,7 @@ extern "C" fn native_link(
             0
         }
         Ok(PluginOutcome::Unported) => {
-            // The registry logged the outcome: the link is recorded, one
+            // The registry logged the outcome: one
             // warning names the plugin, and nothing is registered for it.
             set_int(out, 0);
             0

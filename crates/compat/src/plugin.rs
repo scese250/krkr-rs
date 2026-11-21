@@ -25,8 +25,9 @@ pub trait NativePlugin {
 
     /// Modules this plugin loads when it activates (the pre-registration
     /// dependency, e.g. `emoteplayer.dll` → `motionplayer.dll`). The registry
-    /// registers each dependency first and does not report it in
-    /// `Plugins.getList`. Default: none.
+    /// registers each dependency first and reports it in `Plugins.getList`:
+    /// the dependency is a module that was loaded, and the list names every
+    /// module that was loaded. Default: none.
     fn dependencies(&self) -> &[&str] {
         &[]
     }
@@ -65,7 +66,7 @@ pub struct BuiltinPluginDef {
     /// Alternate DLL names resolving to the same `register`.
     pub aliases: &'static [&'static str],
     /// Prerequisite modules, registered first when this plugin activates;
-    /// they are not recorded as links.
+    /// they are recorded as linked modules.
     pub dependencies: &'static [&'static str],
     /// Registers the plugin's native classes when `Plugins.link` activates
     /// it, except for the [`crate::natives::plugins::STARTUP_PLUGINS`] the
@@ -96,45 +97,32 @@ impl NativePlugin for BuiltinPluginDef {
 pub enum PluginOutcome {
     /// A built-in emulation was registered.
     Builtin,
-    /// The plugin has no emulation: the link is recorded and one warning
-    /// names the plugin, and nothing is registered for it — an absent plugin
-    /// reads as absent.
+    /// The plugin has no emulation: one warning names the plugin and nothing
+    /// is registered for it — an absent plugin reads as absent.
     Unported,
-}
-
-/// What a linked name resolves to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LinkedKind {
-    Builtin,
-    Unported,
-}
-
-/// One entry of the `Plugins.getList` list.
-#[derive(Clone, Debug)]
-struct LinkedEntry {
-    /// The name the script passed, case preserved (`getList` uses it).
-    name: String,
-    /// The normalized base name used for built-in lookup.
-    key: String,
-    kind: LinkedKind,
 }
 
 /// Holds the built-in plugins and activates them by name.
 ///
 /// `link` is idempotent: a name that was already activated is not registered
 /// twice (the C++ side rejects duplicate class names). A name with no
-/// built-in emulation is recorded and warned about, and nothing is
-/// registered for it: the absent plugin reads as absent.
+/// built-in emulation is warned about and nothing is registered for it: the
+/// absent plugin reads as absent.
 pub struct PluginRegistry {
     plugins: Vec<Box<dyn NativePlugin>>,
-    /// The linked names in insertion order, so `Plugins.getList` preserves
-    /// both the script's order and the original casing.
-    linked: Mutex<Vec<LinkedEntry>>,
+    /// The modules that are linked, sorted by name: what `Plugins.getList`
+    /// reports. A name is in it when a link resolved to a built-in, when a
+    /// plugin pulled it in as its dependency, or when the startup load put
+    /// it on the VM. A name that resolved to nothing is not in it, because
+    /// nothing was loaded for it.
+    modules: Mutex<BTreeSet<String>>,
     /// Built-ins whose native classes are already on the VM. The ABI cannot
-    /// unregister a class, so this survives `unlink`: a later `link` of the
-    /// same built-in skips `register` instead of hitting the duplicate-class
-    /// rejection.
-    registered: Mutex<BTreeSet<String>>,
+    /// unregister a class, so a later `link` of the same built-in skips
+    /// `register` instead of hitting the duplicate-class rejection.
+    installed: Mutex<BTreeSet<String>>,
+    /// The names a link named and no built-in answered, so the warning names
+    /// each of them once.
+    warned: Mutex<BTreeSet<String>>,
 }
 
 impl Default for PluginRegistry {
@@ -146,19 +134,21 @@ impl Default for PluginRegistry {
 impl PluginRegistry {
     /// An empty registry (no built-in emulations yet).
     ///
-    /// The startup modules are marked registered because
+    /// The startup modules are marked installed because
     /// The host's install always puts their surface on the VM before any
-    /// script runs, whichever registry the host was built with.
+    /// script runs, whichever registry the host was built with. They are
+    /// marked linked too: the startup load put them on the VM, so the
+    /// `Plugins.getList` list names them from the first line.
     pub fn new() -> Self {
+        let startup: BTreeSet<String> = crate::natives::plugins::STARTUP_PLUGINS
+            .iter()
+            .map(|name| normalize_plugin_name(name))
+            .collect();
         Self {
             plugins: Vec::new(),
-            linked: Mutex::new(Vec::new()),
-            registered: Mutex::new(
-                crate::natives::plugins::STARTUP_PLUGINS
-                    .iter()
-                    .map(|name| normalize_plugin_name(name))
-                    .collect(),
-            ),
+            modules: Mutex::new(startup.clone()),
+            installed: Mutex::new(startup),
+            warned: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -166,10 +156,9 @@ impl PluginRegistry {
     ///
     /// Every plugin in the built-in table is added here. The module
     /// available before any script runs (today `xp3filter.dll`) is marked
-    /// registered by [`Self::new`]; a later `Plugins.link` of any
+    /// installed by [`Self::new`]; a later `Plugins.link` of any
     /// other built-in activates it and registers its classes. A name that is
-    /// not in the table is recorded and warned about, and nothing is
-    /// registered for it.
+    /// not in the table is warned about, and nothing is registered for it.
     pub fn builtin() -> Self {
         let mut registry = Self::new();
         for def in crate::natives::plugins::BUILTIN_PLUGINS {
@@ -204,65 +193,56 @@ impl PluginRegistry {
         self.plugin(name).is_some()
     }
 
-    /// The names that have been linked so far, in insertion order and with
-    /// the script's original casing (`Plugins.getList` order).
+    /// The names of the modules that are linked, lower-cased and sorted by
+    /// name: what `Plugins.getList` reports.
+    ///
+    /// A module is linked when a link resolved to it, when a plugin pulled
+    /// it in as its dependency, or when the startup load put it on the VM. A
+    /// name that resolved to nothing is not in it, because nothing was
+    /// loaded for it.
     pub fn linked(&self) -> Vec<String> {
-        self.linked
+        self.modules
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .iter()
-            .map(|entry| entry.name.clone())
+            .cloned()
             .collect()
     }
 
-    /// Activate a plugin name: register the built-in emulation, or record the
-    /// link and warn when the name has no emulation.
+    /// Activate a plugin name: register the built-in emulation, or warn when
+    /// the name has no emulation.
     ///
     /// An unported name registers nothing: no global under the plugin's stem
-    /// and no object that swallows member accesses. The link is recorded, so
-    /// `Plugins.getList` reports it, and one warning names the plugin.
+    /// and no object that swallows member accesses. Nothing is loaded for it,
+    /// so `Plugins.getList` does not name it, and one warning names it.
     ///
     /// # Errors
     ///
     /// Returns [`CompatError::Register`] when the plugin's own registration
     /// fails.
     pub fn activate(&self, name: &str, ctx: &mut CompatCtx) -> Result<PluginOutcome, CompatError> {
-        let key = normalize_plugin_name(name);
-        if let Some(kind) = self.linked_kind(&key) {
-            return Ok(match kind {
-                LinkedKind::Builtin => PluginOutcome::Builtin,
-                LinkedKind::Unported => PluginOutcome::Unported,
-            });
+        let module = module_name(name);
+        if self.is_linked(&module) {
+            return Ok(PluginOutcome::Builtin);
         }
-        if let Some(plugin) = self.plugin(&key) {
+        if let Some(plugin) = self.plugin(&module) {
             // Track the canonical name so aliases sharing one `register`
             // (e.g. `layerExDraw.dll` / `perspective.dll`) register once.
             self.ensure_registered(plugin, ctx)?;
-            self.push_linked(name, &key, LinkedKind::Builtin);
+            self.mark_linked(&module);
             Ok(PluginOutcome::Builtin)
         } else {
-            log::warn!("plugin {name:?}: no built-in emulation; the plugin is not available");
-            self.push_linked(name, &key, LinkedKind::Unported);
+            self.warn_unported(name);
             Ok(PluginOutcome::Unported)
         }
     }
 
-    /// Unlink a name and report whether it had been linked.
+    /// Unload a name.
     ///
-    /// Built-in classes stay registered on the VM (the ABI cannot remove
-    /// them); only the `getList` entry is dropped, and a later `link` is
-    /// idempotent. An unported link owns no global, so there is nothing to
-    /// clear.
-    pub fn unlink(&self, name: &str) -> bool {
-        let key = normalize_plugin_name(name);
-        let mut linked = self
-            .linked
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let Some(pos) = linked.iter().position(|entry| entry.key == key) else {
-            return false;
-        };
-        linked.remove(pos);
+    /// Unloading changes nothing: the module stays loaded, its classes stay
+    /// on the VM, and `Plugins.getList` keeps naming it. The answer is
+    /// `true` whatever the name is.
+    pub fn unlink(&self, _name: &str) -> bool {
         true
     }
 
@@ -270,7 +250,7 @@ impl PluginRegistry {
     /// activated.
     ///
     /// A plugin that no script has linked has no script-visible surface and
-    /// owns no per-frame hook, so its `poll` must not run: the `registered`
+    /// owns no per-frame hook, so its `poll` must not run: the `installed`
     /// set is the same one `activate` fills on the first link.
     ///
     /// # Errors
@@ -278,13 +258,13 @@ impl PluginRegistry {
     /// Returns the first error a plugin's `poll` reports; the remaining
     /// plugins do not run after it.
     pub fn poll(&self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
-        let registered = self
-            .registered
+        let installed = self
+            .installed
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone();
         for plugin in &self.plugins {
-            if registered.contains(&normalize_plugin_name(plugin.name())) {
+            if installed.contains(&normalize_plugin_name(plugin.name())) {
                 plugin.poll(ctx)?;
             }
         }
@@ -304,14 +284,14 @@ impl PluginRegistry {
     /// with the reference's `(info) Loading <name>` line (`:173-174`).
     ///
     /// Linking goes through the same path as `Plugins.link`: a ported name
-    /// activates its built-in emulation, an unported name is recorded and
-    /// warned about, and nothing is registered for it (a DLL that cannot be
-    /// loaded creates no global).
+    /// activates its built-in emulation, an unported name is warned about and
+    /// nothing is loaded for it (a DLL that cannot be loaded creates no
+    /// global).
     ///
     /// # Errors
     ///
     /// Returns [`CompatError::Register`] when a named plugin cannot be
-    /// registered. The names already linked stay linked.
+    /// registered. The names already loaded stay loaded.
     pub fn autoload<I, S>(&self, names: I, ctx: &mut CompatCtx) -> Result<(), CompatError>
     where
         I: IntoIterator<Item = S>,
@@ -320,28 +300,48 @@ impl PluginRegistry {
         for name in names {
             let name = name.as_ref();
             log::info!("(info) Loading {name}");
-            let dll = tpm_to_dll_name(name);
-            self.activate(&dll, ctx)?;
+            self.activate(name, ctx)?;
         }
         Ok(())
     }
 
-    fn linked_kind(&self, key: &str) -> Option<LinkedKind> {
-        self.linked
+    /// Whether the module `module` names is linked.
+    fn is_linked(&self, module: &str) -> bool {
+        self.modules
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .iter()
-            .find(|entry| entry.key == key)
-            .map(|entry| entry.kind)
+            .contains(module)
     }
 
-    /// Register `plugin` and its dependencies once, without recording a link.
+    /// Record that the module `module` names is linked.
+    fn mark_linked(&self, module: &str) {
+        self.modules
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(module.to_string());
+    }
+
+    /// Warn once that the name `name` has no built-in emulation.
+    fn warn_unported(&self, name: &str) {
+        let mut warned = self
+            .warned
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if warned.insert(module_name(name)) {
+            log::warn!("plugin {name:?}: no built-in emulation; the plugin is not available");
+        }
+    }
+
+    /// Register `plugin` and its dependencies once, and record the modules
+    /// as linked.
     ///
-    /// `Plugins.getList` reports only the names a script linked, so a
-    /// dependency loaded on the plugin's behalf (its pre-registration hook)
-    /// is registered but not listed. The `registered` set keeps a second load
-    /// of the same module (an explicit link or another dependent) from
-    /// registering its classes twice.
+    /// The dependencies are registered first, so a plugin's own registration
+    /// finds their surface, and each dependency is recorded as a linked
+    /// module: the dependency load runs through the same path as the
+    /// plugin's own, and `Plugins.getList` names every module that was
+    /// loaded. The `installed` set keeps a second load of the same module
+    /// (an explicit link or another dependent) from registering its classes
+    /// twice.
     fn ensure_registered(
         &self,
         plugin: &dyn NativePlugin,
@@ -349,7 +349,7 @@ impl PluginRegistry {
     ) -> Result<(), CompatError> {
         let canonical = normalize_plugin_name(plugin.name());
         if self
-            .registered
+            .installed
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .contains(&canonical)
@@ -358,7 +358,10 @@ impl PluginRegistry {
         }
         for dependency in plugin.dependencies() {
             match self.plugin(dependency) {
-                Some(dependency) => self.ensure_registered(dependency, ctx)?,
+                Some(resolved) => {
+                    self.ensure_registered(resolved, ctx)?;
+                    self.mark_linked(&normalize_plugin_name(dependency));
+                }
                 None => log::debug!(
                     "plugin {}: dependency {dependency:?} has no built-in emulation",
                     plugin.name()
@@ -366,22 +369,11 @@ impl PluginRegistry {
             }
         }
         plugin.register(ctx)?;
-        self.registered
+        self.installed
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(canonical);
         Ok(())
-    }
-
-    fn push_linked(&self, name: &str, key: &str, kind: LinkedKind) {
-        self.linked
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .push(LinkedEntry {
-                name: name.to_string(),
-                key: key.to_string(),
-                kind,
-            });
     }
 }
 
@@ -391,6 +383,16 @@ impl PluginRegistry {
 pub fn normalize_plugin_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\', '>']).next().unwrap_or(name);
     base.trim().to_ascii_lowercase()
+}
+
+/// The module a name resolves to: the base file name, with a trailing `.tpm`
+/// rewritten to `.dll`, lowercased.
+///
+/// The extension is rewritten before the name is looked up, so `foo.tpm`,
+/// `foo.dll` and `FOO.DLL` name one module, and the name is lowercased
+/// because that is the key the module table is indexed by.
+fn module_name(name: &str) -> String {
+    normalize_plugin_name(&tpm_to_dll_name(name))
 }
 
 /// Replaces a trailing `.tpm` with `.dll` (case-insensitive), preserving the

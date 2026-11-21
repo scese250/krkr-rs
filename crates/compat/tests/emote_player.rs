@@ -148,8 +148,8 @@ fn loader_exposes_the_motionplayer_classes() {
     env.run("Plugins.link('emoteplayer.dll');");
     assert_eq!(
         env.int("Plugins.getList().length"),
-        1,
-        "the link must be idempotent"
+        3,
+        "the link must be idempotent, and the loader names the module it pulls in"
     );
     // A built-in link publishes nothing under the stem.
     assert_eq!(

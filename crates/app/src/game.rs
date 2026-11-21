@@ -13,13 +13,12 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use api::error::FsError;
 use api::fs::FsPath;
 use api::input::InputEvent;
 use compat::{CompatCtx, CompatError, CompileStats, FrameBody};
 use engine::input::InputState;
 use engine::jobpool::JobStats;
-use engine::storage::{MountOptions, StartupPlan, StorageReadError};
+use engine::storage::{MountOptions, StartupPlan};
 use engine::timer::TimerState;
 use engine::{FrameTimeSource, GameFrame, PixelTranslation, Storage};
 use fs::{FileSystem, list};
@@ -1105,7 +1104,7 @@ impl GameHost {
         // `.tpm` plugins in the exe/system/plugin folders are loaded before the
         // startup scripts run. The composition root enumerates with the L1 file
         // system and compat links the ordered names.
-        let tpm_plugins = discover_tpm_plugins(&FileSystem::host(base_dir.clone()), &base_dir)?;
+        let tpm_plugins = discover_tpm_plugins(&FileSystem::host(base_dir.clone()), &base_dir);
         if !tpm_plugins.is_empty() {
             let mut ctx = vm.compat().ctx()?;
             vm.compat().registry().autoload(&tpm_plugins, &mut ctx)?;
@@ -1554,9 +1553,10 @@ fn explicit_project(
 /// The scan keeps regular files whose name ends in `.tpm` (case-insensitive)
 /// in the exe directory, `<exe>/system` and `<exe>/plugin`, sorts the
 /// combined list by file name and loads each. The scan is the composition
-/// root's job: compat owns no file-system access. A missing or non-directory
-/// entry contributes nothing; any other listing error propagates.
-fn discover_tpm_plugins(fs: &FileSystem, base_dir: &Path) -> Result<Vec<String>, GameError> {
+/// root's job: compat owns no file-system access. A folder that cannot be
+/// listed contributes nothing: the scan logs it and carries on, so an
+/// unreadable folder never stops the startup.
+fn discover_tpm_plugins(fs: &FileSystem, base_dir: &Path) -> Vec<String> {
     let mut found = Vec::new();
     for dir in [
         base_dir.to_path_buf(),
@@ -1565,8 +1565,12 @@ fn discover_tpm_plugins(fs: &FileSystem, base_dir: &Path) -> Result<Vec<String>,
     ] {
         let entries = match list(fs, &FsPath::host(dir)) {
             Ok(entries) => entries,
-            Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => continue,
-            Err(error) => return Err(GameError::Storage(StorageReadError::Fs(error))),
+            Err(error) => {
+                // The folder contributes nothing and the scan carries on:
+                // a folder that cannot be listed never stops the startup.
+                log::warn!("app.startup: cannot list a plugin folder: {error}");
+                continue;
+            }
         };
         for entry in entries {
             if !entry.is_dir && has_tpm_extension(&entry.name) {
@@ -1576,7 +1580,7 @@ fn discover_tpm_plugins(fs: &FileSystem, base_dir: &Path) -> Result<Vec<String>,
     }
     // ASCII filename order.
     found.sort();
-    Ok(found)
+    found
 }
 
 /// Whether `name` ends in `.tpm`, case-insensitively.
@@ -2111,7 +2115,7 @@ mod tests {
         }
 
         let fs = FileSystem::host(base.clone());
-        let found = discover_tpm_plugins(&fs, &base).expect("scan");
+        let found = discover_tpm_plugins(&fs, &base);
         assert_eq!(
             found,
             vec![
@@ -2126,8 +2130,7 @@ mod tests {
 
         // A missing directory contributes nothing (the reference tolerates it).
         let missing = base.join("does-not-exist");
-        let empty = discover_tpm_plugins(&FileSystem::host(missing.clone()), &missing)
-            .expect("missing dirs are tolerated");
+        let empty = discover_tpm_plugins(&FileSystem::host(missing.clone()), &missing);
         assert!(
             empty.is_empty(),
             "missing dirs contribute nothing: {empty:?}"

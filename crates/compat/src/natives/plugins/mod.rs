@@ -23,6 +23,7 @@ pub mod psb_file;
 pub mod psd_file;
 pub mod save_struct;
 pub mod scripts_ex;
+pub mod shrink_copy;
 pub mod simple_binder;
 pub mod steam;
 pub mod text_render;
@@ -173,6 +174,12 @@ pub const BUILTIN_PLUGINS: &[BuiltinPluginDef] = &[
         aliases: &[],
         dependencies: &[],
         register: scripts_ex::register,
+    },
+    BuiltinPluginDef {
+        name: "shrinkCopy.dll",
+        aliases: &[],
+        dependencies: &[],
+        register: shrink_copy::register,
     },
     BuiltinPluginDef {
         name: "krkrsteam.dll",
