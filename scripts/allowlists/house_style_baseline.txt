@@ -3274,7 +3274,6 @@
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// called from `reference/cpp/core/environ/Application.cpp:342`). The scan", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// twice (the C++ side rejects duplicate class names). A name with no", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugin.rs", "rule": "reference-citation", "anchor": "/// with the reference's `(info) Loading <name>` line (`:173-174`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/plugins_native.rs", "rule": "reference-citation", "anchor": "//! `getList()` returns the linked names. This mirrors the reference", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugins_native.rs", "rule": "reference-citation", "anchor": "/// The reference `getList` has no `numparams` check, so any arguments are", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugins_native.rs", "rule": "reference-citation", "anchor": "/// ignored (`PluginImpl.cpp:332-349`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/plugins_native.rs", "rule": "reference-citation", "anchor": "/// native call while the C++ trampoline copies the array.", "reason": "legacy comment, cleanup tracked in TODO §15"}

@@ -2095,3 +2095,64 @@ So the staging write is the next lever, and the prune is close behind it:
 the prune was 34.5 ms in the same frames, a device idle wait plus the
 driver's destroys and frees.
 
+
+## 17. The round of the routes and the region
+
+**2026-11-22.** Release build, headless Vulkan, the real game. The load
+average was 1.88, 0.58 and 1.22 before the runs, and one run was
+discarded because the load was 28.
+
+### 17.1 The routes are reached
+
+The harness's route pressed no button at all: it sat on the title page and
+clicked the middle of the screen. The button is now the one the game
+draws, and the run is split into the startup, the title, the gameplay and
+the fast-forward, so a measurement says which part of the game it
+describes. The settings page is reached at frame 275 and the extras page at
+frame 272.
+
+### 17.2 The frame times
+
+| the route | the p50 | the p90 | the p99 | the 1% low | the worst |
+|---|---|---|---|---|---|
+| the gameplay at 120 Hz | 8.39 ms (119.2 fps) | 9.06 ms (110.3 fps) | **9.62 ms (104.0 fps)** | 24.55 ms (40.7 fps) | 168.9 ms |
+| the gameplay, unpaced | 1.05 ms (948 fps) | 1.22 ms | 2.62 ms (381.5 fps) | 19.72 ms (50.7 fps) | 155.1 ms |
+| title to settings at 120 Hz | 8.39 ms | 9.06 ms | 73.75 ms (13.6 fps) | 165.22 ms (6.1 fps) | 340.8 ms |
+| title to extras at 120 Hz | 8.39 ms | 9.06 ms | 82.76 ms (12.1 fps) | 274.43 ms (3.6 fps) | 691.6 ms |
+
+The gameplay route holds 104 fps at the 99th percentile and 40.7 fps at the
+1% low, at a 120 Hz pacing. The two transition routes are where the
+frame rate is lost: on the extras route the async phase alone is 1419.7 ms
+of the 2509.2 ms the slow frames took, the host's residual is 545.5 ms
+and the upload 274.6 ms.
+
+### 17.3 The region is the unit of reconstruction
+
+The device composite computed the region that changed and then drew the
+whole plane, read the whole surface back and marked the whole content
+dirty, so the upload carried the whole plane. The CPU fallback, which
+honours the region, was cheaper than the path it fell back from.
+
+With the region as the unit of reconstruction everywhere - the tree's
+coverage, the scissor and the clear, the composite's read-back and its
+dirty mark - the same work costs:
+
+| | before | after |
+|---|---:|---:|
+| the whole plane | 17.67 ms | 15.71 ms |
+| **the 96x64 region** | **15.68 ms** | **0.44 ms** |
+| the upload's dirty region | none (1.2 MB) | the region (24 KB) |
+
+### 17.4 What is left
+
+The device composite is still refused in the real games - the backend
+reports a copy that takes the source's alpha - so the CPU path composites
+the subtree. Closing it needs a blend the pipeline does not have, and the
+blend's vocabulary lives in the shared API crate, so the change is wider
+than the composite.
+
+A move also invalidates the moved layer's own content, where the
+reference's `SetPosition` updates the parent alone. The picture is the
+same either way; the moved layer's own content is recomposited for
+nothing. That is a behaviour change of its own, and it is left for the
+next round.
