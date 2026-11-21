@@ -39,6 +39,7 @@ use tjs::{
 use crate::native_util::{
     args, report_error, set_bool, set_int, set_void, value_as_string, value_ref,
 };
+use crate::natives::construct;
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
 
@@ -284,7 +285,7 @@ extern "C" fn text_render_get_characters(
     // SAFETY: `instance` is the live payload for the call.
     let inst = unsafe { &*(instance as *const TextRenderInst) };
 
-    let array = match state::retained_object(host, "[]") {
+    let array = match construct::array(host) {
         Ok(array) => array,
         Err(error) => return report_error(out_error, &error),
     };
@@ -462,7 +463,7 @@ fn empty_array_out(engine: *mut c_void, out: *mut Value, out_error: *mut *mut c_
             "TextRenderBase.getKeyWait: compat context is not bound",
         );
     };
-    match state::retained_object(resolved.engine(), "[]") {
+    match construct::array(resolved.engine()) {
         Ok(array) => {
             set_retained_out(out, array);
             0

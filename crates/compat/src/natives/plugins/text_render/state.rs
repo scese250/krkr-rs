@@ -5,7 +5,9 @@
 //! style from a TJS Dictionary (`setDefault`) and `CharacterInfo::serialize`
 //! writes one (`getCharacters`).
 
-use tjs::{DetachedValue, RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue, VAL_OBJECT, Value};
+use tjs::{DetachedValue, Tjs2Engine, Tjs2ValueId, TjsValue, VAL_OBJECT, Value};
+
+use crate::natives::construct;
 
 /// One parsed graphical character (reference `CharacterInfo`).
 ///
@@ -32,7 +34,7 @@ impl CharacterInfo {
     /// Reference `CharacterInfo::serialize`: a TJS Dictionary with the
     /// character's style, position, metrics and colours.
     pub(super) fn serialize(&self, host: &Tjs2Engine) -> Result<DetachedValue, String> {
-        let dict = retained_object(host, "%[]")?;
+        let dict = construct::dictionary(host)?;
         let id = dict.raw_id();
         host.set_member(id, "bold", &TjsValue::Integer(i64::from(self.bold)))?;
         host.set_member(id, "italic", &TjsValue::Integer(i64::from(self.italic)))?;
@@ -221,22 +223,6 @@ impl Default for TextRenderOptions {
 // ---------------------------------------------------------------------------
 // TJS Dictionary helpers
 // ---------------------------------------------------------------------------
-
-/// Evaluate a small object expression (`%[]`) and retain the resulting object.
-pub(super) fn retained_object(
-    host: &Tjs2Engine,
-    expression: &str,
-) -> Result<DetachedValue, String> {
-    match host
-        .eval_retained(expression, "TextRenderBase")
-        .map_err(|error| error.to_string())?
-    {
-        RetainedValue::Object(object) => Ok(object),
-        RetainedValue::Value(value) => Err(format!(
-            "TextRenderBase: expression {expression:?} did not yield an object ({value:?})"
-        )),
-    }
-}
 
 /// Retain a `VAL_OBJECT` argument and return its id, or `None` when the value
 /// is not an object (the reference's `AsObjectNoAddRef()` returning null).

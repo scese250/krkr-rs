@@ -2707,6 +2707,7 @@ pub fn blur_coverage(
     };
 
     let source_width = mask.width as usize;
+    let source_height = mask.height as usize;
     for oy in -bw_i..=bw_i {
         for ox in -bw_i..=bw_i {
             let distance = i64::from(fast_int_hypot(ox as i32, oy as i32));
@@ -2717,16 +2718,36 @@ pub fn blur_coverage(
             if weight == 0 {
                 continue;
             }
-            for sy in 0..mask.height as usize {
-                let row = (sy as i64 + bw_i + oy) * i64::from(width);
-                for sx in 0..source_width {
-                    let index = (row + sx as i64 + bw_i + ox) as usize;
-                    let add = (i64::from(mask.coverage[sy * source_width + sx]) * weight) >> 18;
+            // The destination row of a source row is addressed once: the
+            // kernel's column offset is the same for every row, so the
+            // convolution walks two rows and not the whole destination.
+            let column_offset = bw_i + ox;
+            for sy in 0..source_height {
+                let source_start = sy * source_width;
+                let Some(source_row) = mask.coverage.get(source_start..source_start + source_width)
+                else {
+                    continue;
+                };
+                let row = (sy as i64 + bw_i + oy) as usize * width as usize;
+                let row_end = row + width as usize;
+                if row_end > dest.len() {
+                    continue;
+                }
+                let destination_row = &mut dest[row..row_end];
+                for (sx, &coverage) in source_row.iter().enumerate() {
+                    if coverage == 0 {
+                        continue;
+                    }
+                    let add = (i64::from(coverage) * weight) >> 18;
                     if add == 0 {
                         continue;
                     }
-                    let value = i64::from(dest[index]) + add;
-                    dest[index] = value.min(255) as u8;
+                    let index = (sx as i64 + column_offset) as usize;
+                    let Some(slot) = destination_row.get_mut(index) else {
+                        continue;
+                    };
+                    let value = i64::from(*slot) + add;
+                    *slot = value.min(255) as u8;
                 }
             }
         }
@@ -2780,21 +2801,34 @@ pub fn blit_coverage_into(
     );
     let drawn = clip_glyph_rect(bitmap, clip, rect)?;
     let opacity = f32::from(opacity) / 255.0;
+    // The destination is addressed a row at a time: the pixel offset of a
+    // row is the row's base plus the column, so the bitmap's own bounds
+    // arithmetic is done once per row and not once per pixel.
+    let columns = mask.width as i32;
+    let first_column = drawn.0.saturating_sub(dest_x).max(0);
+    let last_column = drawn.2.saturating_sub(dest_x).clamp(0, columns);
     for row in 0..mask.height as i32 {
-        for column in 0..mask.width as i32 {
-            let index = row as usize * mask.width as usize + column as usize;
-            let coverage = mask.coverage[index];
+        let y = dest_y + row;
+        if y < drawn.1 || y >= drawn.3 {
+            continue;
+        }
+        let Some(row_start) = bitmap.pixel_offset(0, y as u32) else {
+            continue;
+        };
+        let source_row = &mask.coverage[row as usize * mask.width as usize..][..columns as usize];
+        for column in first_column..last_column {
+            let coverage = source_row[column as usize];
             if coverage == 0 {
                 continue;
             }
             let x = dest_x + column;
-            let y = dest_y + row;
-            if x < drawn.0 || y < drawn.1 || x >= drawn.2 || y >= drawn.3 {
+            let Some(column_offset) = (x as u32).checked_mul(4) else {
                 continue;
-            }
-            if let Some(offset) = bitmap.pixel_offset(x as u32, y as u32)
-                && let Some(pixel) = bitmap.rgba.get_mut(offset..offset + 4)
-            {
+            };
+            let Some(offset) = row_start.checked_add(column_offset as usize) else {
+                continue;
+            };
+            if let Some(pixel) = bitmap.rgba.get_mut(offset..offset + 4) {
                 blend_tinted_coverage(pixel, coverage, color, opacity);
             }
         }
@@ -2930,25 +2964,43 @@ fn blend_tinted_coverage(dst: &mut [u8], coverage: u8, color: [u8; 4], opacity: 
     blend_source_over(dst, &src, opacity);
 }
 
+/// The fraction of a colour an 8-bit alpha byte covers.
+///
+/// The table holds the division the blend does per pixel, computed once: the
+/// blend reads the fraction of an alpha byte from here instead of dividing by
+/// 255 for every pixel it writes.
+const ALPHA_FRACTION: [f32; 256] = alpha_fraction_table();
+
+/// Builds [`ALPHA_FRACTION`].
+const fn alpha_fraction_table() -> [f32; 256] {
+    let mut table = [0.0f32; 256];
+    let mut index = 0usize;
+    while index < 256 {
+        table[index] = index as f32 / 255.0;
+        index += 1;
+    }
+    table
+}
+
 /// Source-over blends one straight-alpha RGBA pixel `src` into `dst`, scaled
 /// by `opacity`.
 fn blend_source_over(dst: &mut [u8], src: &[u8], opacity: f32) {
     if dst.len() < 4 || src.len() < 4 {
         return;
     }
-    let source_alpha = src[3] as f32 / 255.0 * opacity;
+    let source_alpha = ALPHA_FRACTION[src[3] as usize] * opacity;
     if source_alpha <= 0.0 {
         return;
     }
-    let dest_alpha = dst[3] as f32 / 255.0;
+    let dest_alpha = ALPHA_FRACTION[dst[3] as usize];
     let out_alpha = source_alpha + dest_alpha * (1.0 - source_alpha);
     if out_alpha <= 0.0 {
         dst[..4].fill(0);
         return;
     }
     for channel in 0..3 {
-        let source = src[channel] as f32 / 255.0;
-        let destination = dst[channel] as f32 / 255.0;
+        let source = ALPHA_FRACTION[src[channel] as usize];
+        let destination = ALPHA_FRACTION[dst[channel] as usize];
         let out =
             (source * source_alpha + destination * dest_alpha * (1.0 - source_alpha)) / out_alpha;
         dst[channel] = (out.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -3818,6 +3870,65 @@ mod tests {
                 opacity,
             );
         }
+    }
+
+    /// The alpha table holds the division the blend does per pixel, so the
+    /// composited pixels are the ones the division produced. Every byte is
+    /// checked: a table entry that differed by one bit would change a
+    /// pixel.
+    #[test]
+    fn the_alpha_fraction_table_is_the_division_it_replaces() {
+        for byte in 0..=255u8 {
+            assert_eq!(
+                ALPHA_FRACTION[byte as usize],
+                byte as f32 / 255.0,
+                "the fraction of {byte} differs from the division"
+            );
+        }
+    }
+
+    /// Reference: the reference blends one character's coverage into the
+    /// pixels the character covers
+    /// (`reference/cpp/core/visual/impl/LayerBitmapImpl.cpp:907-1010`), so a
+    /// row-at-a-time walk of the destination writes the pixels a
+    /// pixel-at-a-time walk writes. The oracle is the pixel-at-a-time walk.
+    #[test]
+    fn the_row_walk_writes_the_pixels_the_pixel_walk_writes() {
+        let coverage: Vec<u8> = (0..6 * 5).map(|index| (index * 37 % 256) as u8).collect();
+        let mask = CoverageMask::new(0.0, 0.0, 6, 5, coverage).expect("mask");
+        let clip = (1, 1, 5, 4);
+        let color = [30, 60, 90, 255];
+        let opacity = 220;
+
+        let mut walked = BitmapState::new(8, 6, vec![0; 8 * 6 * 4]);
+        blit_coverage_into(&mut walked, clip, &mask, 0, 0, color, opacity);
+
+        let mut pixeled = BitmapState::new(8, 6, vec![0; 8 * 6 * 4]);
+        for row in 0..mask.height() as i32 {
+            for column in 0..mask.width() as i32 {
+                let value = mask.coverage()[row as usize * mask.width() as usize + column as usize];
+                if value == 0 {
+                    continue;
+                }
+                let x = column;
+                let y = row;
+                if x < clip.0 || y < clip.1 || x >= clip.2 || y >= clip.3 {
+                    continue;
+                }
+                let Some(offset) = pixeled.pixel_offset(x as u32, y as u32) else {
+                    continue;
+                };
+                let Some(pixel) = pixeled.rgba.get_mut(offset..offset + 4) else {
+                    continue;
+                };
+                blend_tinted_coverage(pixel, value, color, f32::from(opacity) / 255.0);
+            }
+        }
+
+        assert_eq!(
+            walked.rgba, pixeled.rgba,
+            "the row walk writes the pixels the pixel walk writes"
+        );
     }
 
     /// Reference: `tTVPFontAndCharacterData` keys the character cache on the

@@ -352,6 +352,36 @@ fn text_render_layout_uses_the_l2_text_engine() {
     assert_eq!(env.eval_string("t.renderText"), "CD");
 }
 
+/// `getCharacters` builds its array and its per-character dictionaries through
+/// the VM's own object constructors
+/// (`reference/cpp/plugins/TextRender.cpp:999-1013`, `:225-247`): the
+/// reference creates them with `TJSCreateArrayObject()` and
+/// `TJSCreateDictionaryObject()`. A script literal would compile and run one
+/// script per character, so the count of the scripts the VM compiled must not
+/// move beyond the evaluation the test itself makes.
+#[test]
+fn text_render_get_characters_compiles_no_script() {
+    let _lock = vm_lock();
+    let Some((env, name)) = Env::with_font() else {
+        return;
+    };
+    env.run(&format!(
+        "var t = new TextRenderBase(); t.defaultFace = '{name}'; t.setRenderSize(200, 100);"
+    ));
+    env.eval_int("t.render('AB', 0, 0, 0, false)");
+    env.run("t.done();");
+
+    let before = env.engine.script_evaluation_count();
+    let count = env.eval_int("t.getCharacters(0, 0).count");
+    let after = env.engine.script_evaluation_count();
+    assert_eq!(count, 2, "the two rendered characters are returned");
+    assert_eq!(
+        after - before,
+        1,
+        "the characters were built without compiling a script"
+    );
+}
+
 /// The line breaker wraps only when the pen would leave the box
 /// (`reference/cpp/plugins/TextRender.cpp:940-963`), advancing `m_y` by
 /// the ascent plus `lineSpacing` (`TextRender.cpp:849-856`);

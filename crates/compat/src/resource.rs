@@ -802,6 +802,13 @@ fn union(a: RectI, b: RectI) -> RectI {
 /// A positioned pre-rendered or fallback glyph mask.
 struct PrerenderedGlyph {
     mask: CoverageMask,
+    /// The character's code unit in the pre-rendered font, when the font
+    /// carries the character.
+    ///
+    /// A character the font does not carry is drawn by the rasterizer, and
+    /// its shadow is not cached: the rasterized coverage depends on the
+    /// style, and the file's own characters do not.
+    unit: Option<u16>,
     x: i32,
     y: i32,
 }
@@ -861,17 +868,10 @@ fn draw_prerendered_text(
     for unit in params.text.encode_utf16() {
         if let Some(item) = body.find_code_unit(unit) {
             if item.width != 0 && item.height != 0 {
-                let coverage = body.retrieve(&item).map_err(|error| error.to_string())?;
-                let mask = CoverageMask::new(
-                    0.0,
-                    0.0,
-                    u32::from(item.width),
-                    u32::from(item.height),
-                    coverage,
-                )
-                .map_err(|error| format!("pre-rendered glyph: {error}"))?;
+                let mask = body.character(unit, &item)?;
                 glyphs.push(PrerenderedGlyph {
                     mask,
+                    unit: Some(unit),
                     x: pen_x.round() as i32 + i32::from(item.origin_x) + ascent_ofs_x,
                     y: pen_y.round() as i32 - i32::from(item.origin_y) + ascent_ofs_y,
                 });
@@ -905,6 +905,7 @@ fn draw_prerendered_text(
                         .map_err(|error| format!("glyph mask: {error}"))?;
                 glyphs.push(PrerenderedGlyph {
                     mask,
+                    unit: None,
                     x: pen_x.round() as i32 + glyph.bearing_x.round() as i32 + ascent_ofs_x,
                     y: pen_y.round() as i32 + ascent - glyph.bearing_y.round() as i32,
                 });
@@ -925,8 +926,13 @@ fn draw_prerendered_text(
     if params.shadow_level != 0 {
         let level = params.shadow_level.clamp(0, 255) as u8;
         for glyph in &glyphs {
-            let blurred = blur_coverage(&glyph.mask, level, params.shadow_width)
-                .map_err(|error| format!("shadow blur failed: {error}"))?;
+            let blurred = match glyph.unit {
+                Some(unit) => {
+                    body.blurred_character(unit, &glyph.mask, level, params.shadow_width)?
+                }
+                None => blur_coverage(&glyph.mask, level, params.shadow_width)
+                    .map_err(|error| format!("shadow blur failed: {error}"))?,
+            };
             let x = glyph.x.saturating_add(params.shadow_offset.0);
             let y = glyph.y.saturating_add(params.shadow_offset.1);
             if let Some(rect) =
@@ -1104,6 +1110,22 @@ pub(crate) struct PrerenderedBody {
     index_offset: usize,
     /// The whole file, indexed by a descriptor's `offset`.
     image: Rc<Vec<u8>>,
+    /// The characters the file carries, decoded once.
+    characters: RefCell<PrerenderedCharacters>,
+}
+
+/// The characters a pre-rendered font carries.
+///
+/// The decoded character is kept here, so a character that is drawn twice is
+/// decoded from the file once. The cache holds the sharp character and the
+/// blurred shadow that is drawn beside it.
+#[derive(Default)]
+struct PrerenderedCharacters {
+    /// The decoded coverage of a character, by its code unit.
+    sharp: Map<u16, CoverageMask>,
+    /// The blurred coverage of a character's shadow, by the code unit and the
+    /// blur's parameters.
+    blurred: Map<(u16, u8, i32), CoverageMask>,
 }
 
 impl PrerenderedBody {
@@ -1146,7 +1168,69 @@ impl PrerenderedBody {
             ch_index_offset,
             index_offset,
             image,
+            characters: RefCell::new(PrerenderedCharacters::default()),
         })
+    }
+
+    /// The decoded coverage of the character `unit`, decoded from the file on
+    /// the first use.
+    ///
+    /// The coverage of a character the file carries does not depend on the
+    /// style it is drawn in: the file holds the character as it was
+    /// rendered, and the file's character is drawn for every mapping of it.
+    ///
+    /// # Errors
+    ///
+    /// The [`PrerenderedFontError`] when the file's run-length data does not
+    /// decode, and the coverage error when the decoded coverage does not fit
+    /// the character's box.
+    pub(crate) fn character(&self, unit: u16, item: &CharItem) -> Result<CoverageMask, String> {
+        if let Some(mask) = self.characters.borrow().sharp.get(&unit) {
+            return Ok(mask.clone());
+        }
+        let coverage = self.retrieve(item).map_err(|error| error.to_string())?;
+        let mask = CoverageMask::new(
+            0.0,
+            0.0,
+            u32::from(item.width),
+            u32::from(item.height),
+            coverage,
+        )
+        .map_err(|error| format!("pre-rendered glyph: {error}"))?;
+        self.characters
+            .borrow_mut()
+            .sharp
+            .insert(unit, mask.clone());
+        Ok(mask)
+    }
+
+    /// The blurred coverage of the character's shadow, blurred on the first
+    /// use.
+    ///
+    /// The blur's parameters are part of the key, because one blurred
+    /// character is kept per blur.
+    ///
+    /// # Errors
+    ///
+    /// The mask-too-large error when the expanded mask cannot be allocated.
+    pub(crate) fn blurred_character(
+        &self,
+        unit: u16,
+        mask: &CoverageMask,
+        level: u8,
+        width: i32,
+    ) -> Result<CoverageMask, String> {
+        let key = (unit, level, width);
+        if let Some(blurred) = self.characters.borrow().blurred.get(&key) {
+            return Ok(blurred.clone());
+        }
+        let blurred = blur_coverage(mask, level, width)
+            .map_err(|error| format!("shadow blur failed: {error}"))?;
+        self.characters
+            .borrow_mut()
+            .blurred
+            .insert(key, blurred.clone());
+        Ok(blurred)
     }
 
     /// Returns the descriptor for a UTF-16 code unit, or `None`.
