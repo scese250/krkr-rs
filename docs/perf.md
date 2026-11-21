@@ -2063,3 +2063,35 @@ composite of the transition's endpoints. The reference composites them
 into a device texture and reads the source from the source layer's cache,
 so this is a shape difference and not a tuning one.
 
+
+## 16. What the upload costs, step by step
+
+The frame's upload phase used to be one number. It is four now: the
+driver's texture creation, the write into the mapped staging memory, the
+submission, and the wait.
+
+The real game's extras route, release, headless Vulkan:
+
+| the step | the cost |
+|---|---|
+| create | 16.9 ms |
+| stage | 42.3 ms |
+| submit | 0.0 ms |
+| wait | 0.0 ms |
+
+The wait is zero because it left the frame thread: the upload no longer
+blocks on the device, and the wait that guarantees the pixels sits where
+the texture is read, before the frame's submit.
+
+The rest is the frame thread's own work. The headless Vulkan path waits
+for its own fence before the render returns, so the render phase *is* the
+device's frame time and the device was idle while the upload ran. The
+bytes are written by the compatibility layer during the frame's upward
+hook, so a worker that read the bitmap to stage it would race those
+writes; the device's calls cannot move either, because the render crate's
+providers are thread-affine.
+
+So the staging write is the next lever, and the prune is close behind it:
+the prune was 34.5 ms in the same frames, a device idle wait plus the
+driver's destroys and frees.
+
