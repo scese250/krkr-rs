@@ -18,6 +18,13 @@
 //! route loads is read back from the log, so the run proves the route it
 //! drove: the page the route names is the page the run reached.
 //!
+//! The route has two clicks. The warm-up delivers the click in the middle of
+//! the screen, the click that moves the game's opening sequence along; it
+//! ends when the title page is up. The route then delivers the click that
+//! presses the title page's button, until the page that button loads has
+//! been loaded. The warm-up's click is not the button's place: the opening
+//! sequence does not move along for a click on the title page's menu.
+//!
 //! The null backend runs headless and is the default: a measurement never
 //! opens a window. The Vulkan backend has two shapes. The headless one
 //! (`--headless`) draws every frame into an offscreen target on the device
@@ -274,6 +281,13 @@ struct ClickTarget {
     y: f32,
 }
 
+/// The click in the middle of the screen.
+///
+/// The opening sequence moves along on a click in the middle of the screen,
+/// and the scenario's text advances on the same click. The route's warm-up
+/// delivers it.
+const CENTRE_CLICK: ClickTarget = ClickTarget { x: 640.0, y: 360.0 };
+
 /// The scene the run drives.
 ///
 /// The title page is a KAG scene with a column of buttons on the left of the
@@ -310,7 +324,7 @@ impl Scene {
                 let (x, y) = button.point();
                 ClickTarget { x, y }
             }
-            None => ClickTarget { x: 640.0, y: 360.0 },
+            None => CENTRE_CLICK,
         }
     }
 
@@ -462,16 +476,18 @@ impl Schedule {
 /// The route the run drives: the clicks it delivers and the page that proves
 /// it.
 ///
-/// The run has two phases. The warm-up phase clicks where the route's click
-/// lands, which moves the game's opening sequence along; it ends when the
-/// title page is up. The route phase clicks the button the scene names, until
-/// the page that button loads has been loaded.
+/// The run has two phases. The warm-up phase clicks in the middle of the
+/// screen, the click that moves the game's opening sequence along; it ends
+/// when the title page is up. The route phase clicks the button the scene
+/// names, until the page that button loads has been loaded.
 struct Route {
     /// The page the route's button loads, `None` when the scene names none.
     target: Option<&'static str>,
     /// The page whose load ends the warm-up phase.
     title: &'static str,
-    /// The click both phases deliver.
+    /// The click the warm-up phase delivers: it moves the opening along.
+    warmup_click: ClickTarget,
+    /// The click the route phase delivers: it presses the route's button.
     target_click: ClickTarget,
     /// The phase the route is in.
     phase: Phase,
@@ -494,8 +510,10 @@ struct Route {
 impl Route {
     /// A route that drives the scene.
     ///
-    /// An explicit click replaces the scene's own: the run presses where the
-    /// command line says, and the route has no page to prove.
+    /// An explicit click replaces the scene's own button click: the run
+    /// presses the button where the command line says, and the page that
+    /// button loads is the page the route proves. The warm-up's click is the
+    /// run's own, and the command line does not change it.
     fn new(
         scene: Scene,
         explicit: Option<ClickTarget>,
@@ -507,6 +525,7 @@ impl Route {
         Self {
             target: scene.target_script(),
             title: "title.ks",
+            warmup_click: CENTRE_CLICK,
             target_click,
             phase: Phase::Warmup,
             schedule,
@@ -564,7 +583,8 @@ impl Route {
     fn click(&mut self, now_ms: u64, frame: usize) -> Option<ClickTarget> {
         self.advance(now_ms, frame);
         let target = match self.phase {
-            Phase::Warmup | Phase::Target => self.target_click,
+            Phase::Warmup => self.warmup_click,
+            Phase::Target => self.target_click,
             Phase::Done => return None,
         };
         if !self
@@ -1410,6 +1430,10 @@ fn main() {
     println!(
         "the scene: {scene_name}, the click at ({}, {}) in the game's logical pixels",
         target.x, target.y
+    );
+    println!(
+        "the warm-up click: ({}, {}) in the game's logical pixels",
+        CENTRE_CLICK.x, CENTRE_CLICK.y
     );
     println!("the frame delay: {frame_delay_ms} ms");
     println!(
