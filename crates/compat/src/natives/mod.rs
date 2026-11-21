@@ -15,6 +15,9 @@ pub mod async_trigger;
 pub mod cdda_midi;
 pub mod clipboard;
 pub mod constants;
+// The one owner of the fresh script objects a native builds: the VM's own
+// array and dictionary constructors, reached without the script compiler.
+pub(crate) mod construct;
 pub mod debug;
 pub mod event;
 pub mod image_function;

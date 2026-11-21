@@ -7,8 +7,11 @@
 //! `WM_` prefix: `WM(NULL)` writes `"NULL" => 0` and `0 => "NULL"`. We keep
 //! the same ordered table so the reverse lookup resolves duplicate values
 //! (`KEYFIRST`/`KEYDOWN`, `MOUSEFIRST`/`MOUSEMOVE`, ...) to the *last* name
-//! the reference would have written, and we generate the dictionary literal
-//! from the same source.
+//! the table holds, and the dictionary is built from the same source.
+
+use tjs::{DetachedValue, Tjs2Engine, TjsValue};
+
+use crate::natives::construct;
 
 /// `(name, value)` in reference order. Later entries with the same value win
 /// the reverse lookup, matching the reference's `PropSet` order.
@@ -269,13 +272,17 @@ pub(crate) fn name_for(number: i64) -> Option<&'static str> {
         .map(|(name, _)| *name)
 }
 
-/// Build the `Window._Notifications` dictionary literal. Both directions are
+/// Build the `Window._Notifications` dictionary. Both directions are
 /// emitted (name -> number and number -> name), exactly like the reference.
-pub(crate) fn dictionary_literal() -> String {
-    let mut out = String::from("%[");
+pub(crate) fn build_dictionary(engine: &Tjs2Engine) -> Result<DetachedValue, String> {
+    let dictionary = construct::dictionary(engine)?;
     for (name, value) in NOTIFICATIONS {
-        out.push_str(&format!(" \"{name}\" => {value}, {value} => \"{name}\","));
+        engine.set_member(dictionary.raw_id(), name, &TjsValue::Integer(*value))?;
+        engine.set_member(
+            dictionary.raw_id(),
+            &value.to_string(),
+            &TjsValue::String((*name).to_string()),
+        )?;
     }
-    out.push_str(" ]");
-    out
+    Ok(dictionary)
 }

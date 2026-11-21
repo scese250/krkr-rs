@@ -27,6 +27,7 @@ use tjs::{
 };
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::natives::construct;
 use crate::{CompatCtx, CompatError};
 
 use super::host;
@@ -40,15 +41,9 @@ fn monitors_to_array(
     engine: &Tjs2Engine,
     monitors: &[MonitorRect],
 ) -> Result<DetachedValue, String> {
-    let array = match engine
-        .eval_retained("[]", "System.getDisplayMonitors")
-        .map_err(|e| e.to_string())?
-    {
-        RetainedValue::Object(object) => object,
-        RetainedValue::Value(_) => {
-            return Err("System.getDisplayMonitors: cannot build the result array".into());
-        }
-    };
+    let array = construct::array(engine).map_err(|error| {
+        format!("System.getDisplayMonitors: cannot build the result array: {error}")
+    })?;
     for (index, monitor) in monitors.iter().enumerate() {
         let dict = super::util::make_dict(engine, "System.getDisplayMonitors")?;
         write_monitor(engine, dict.raw_id(), *monitor)?;

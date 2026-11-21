@@ -31,11 +31,12 @@ use std::ffi::{c_char, c_int, c_void};
 
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue, VAL_OBJECT, VAL_STRING, VAL_VOID, Value,
+    Tjs2Engine, Tjs2ValueId, TjsValue, VAL_OBJECT, VAL_STRING, VAL_VOID, Value,
 };
 
 use super::super::system::{resolve, try_value_as_i64, value_as_i64};
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
+use crate::natives::construct;
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
@@ -202,13 +203,7 @@ impl CsvParserInst {
         self.line.clear();
         if self.add_line() {
             self.line_no += 1;
-            let fields = match host.eval_retained("[]", "CSVParser.getNextLine") {
-                Ok(RetainedValue::Object(object)) => object,
-                Ok(RetainedValue::Value(value)) => {
-                    return Err(format!("expected an Array object, got {value:?}"));
-                }
-                Err(error) => return Err(error.to_string()),
-            };
+            let fields = construct::array(host)?;
             self.split(host, fields.raw_id())?;
             Ok(Some(fields))
         } else {

@@ -52,6 +52,7 @@ use tjs::{
 };
 
 use crate::native_util::value_as_string;
+use crate::natives::construct;
 use crate::{CompatCtx, CompatError};
 
 /// Per-engine scratch state shared by the `motion_player` callbacks.
@@ -460,13 +461,8 @@ fn install_shortcut_globals(ctx: &CompatCtx) {
 fn register_use_d3d_probe(ctx: &CompatCtx) -> Result<(), CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };
-    let marker = match engine.eval_retained("%[]", "motion_player") {
-        Ok(RetainedValue::Object(marker)) => marker,
-        Ok(RetainedValue::Value(other)) => {
-            return Err(CompatError::Register(format!(
-                "motion_player: the Player.useD3D probe is not an object: {other:?}"
-            )));
-        }
+    let marker = match construct::dictionary(engine) {
+        Ok(marker) => marker,
         Err(error) => {
             return Err(CompatError::Register(format!(
                 "motion_player: could not create the Player.useD3D probe: {error}"

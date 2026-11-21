@@ -4,8 +4,33 @@
 // helper functions. Keeping the ~130 one-line member callbacks here keeps the
 // registration table in `player.rs` readable.
 
+/// The `{chara, motion}` dictionary the `onFindMotion` callback receives.
+///
+/// The dictionary is the VM's own dictionary class, so no script is compiled
+/// to build it.
+fn find_motion_dict(
+    ctx: &CompatCtx,
+    chara: &str,
+    motion: &str,
+) -> Result<DetachedValue, String> {
+    let dict = new_dictionary(ctx)?;
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `find_motion_dict`.
+    let engine = unsafe { ctx.engine() };
+    engine
+        .set_member(dict.raw_id(), "chara", &TjsValue::String(chara.to_string()))
+        .map_err(|error| error.to_string())?;
+    engine
+        .set_member(
+            dict.raw_id(),
+            "motion",
+            &TjsValue::String(motion.to_string()),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(dict)
+}
+
 fn string_list(ctx: &CompatCtx, items: &[String]) -> Result<RetainedValue, String> {
-    let array = eval_object(ctx, "[]")?;
+    let array = new_array(ctx)?;
     // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `string_list`.
     let engine = unsafe { ctx.engine() };
     for (index, item) in items.iter().enumerate() {
@@ -21,7 +46,7 @@ fn string_list(ctx: &CompatCtx, items: &[String]) -> Result<RetainedValue, Strin
 }
 
 fn number_pair(ctx: &CompatCtx, first: f64, second: f64) -> Result<RetainedValue, String> {
-    let array = eval_object(ctx, "[]")?;
+    let array = new_array(ctx)?;
     // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `number_pair`.
     let engine = unsafe { ctx.engine() };
     engine
@@ -218,7 +243,7 @@ extern "C" fn player_get_variable_keys(
     if matches!(&inst.variable_keys, StoredValue::Void) {
         // A void `variableKeys` reads back as a fresh empty array; the stored
         // value is left as it is.
-        return match eval_object(&ctx, "[]") {
+        return match new_array(&ctx) {
             Ok(array) => {
                 super::helpers::set_retained(out, array);
                 0
@@ -568,15 +593,8 @@ extern "C" fn player_set_motion(
     let mut motion_value = motion;
     // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_set_motion`.
     if let Ok(target) = unsafe { ctx.engine() }.retain_object_detached(objthis) {
-        let expression = format!(
-            "%[chara: {}, motion: {}]",
-            super::helpers::tjs_string_literal(&inst.chara),
-            super::helpers::tjs_string_literal(&motion_value)
-        );
-        if let Ok(RetainedValue::Object(dict)) =
-            // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_set_motion`.
-            unsafe { ctx.engine() }.eval_retained(&expression, "onFindMotion")
-        {
+        let dict = find_motion_dict(&ctx, &inst.chara, &motion_value);
+        if let Ok(dict) = dict {
             let id = dict.raw_id().as_ptr() as usize as u64;
             // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `player_set_motion`.
             let called = unsafe { ctx.engine() }.call_member(
@@ -1226,7 +1244,7 @@ mp_method_variant!(
     player_calc_view_param,
     PlayerInst,
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
-        let object = eval_object(ctx, "%[]")?;
+        let object = new_dictionary(ctx)?;
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for this callback.
         let engine = unsafe { ctx.engine() };
         engine
@@ -1286,7 +1304,7 @@ mp_method_variant!(
     player_get_layer_getter_list,
     PlayerInst,
     |p: &mut PlayerInst, _args: &[Value], ctx: &CompatCtx| {
-        let array = eval_object(ctx, "[]")?;
+        let array = new_array(ctx)?;
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for this callback.
         let engine = unsafe { ctx.engine() };
         // The list holds a getter per node but the root, which has no layer
@@ -1509,11 +1527,11 @@ mp_method_variant!(
             .and_then(|snapshot| snapshot.variable_frames.get(&label))
             .cloned()
             .unwrap_or_default();
-        let array = eval_object(ctx, "[]")?;
+        let array = new_array(ctx)?;
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `skip_to_sync`.
         let engine = unsafe { ctx.engine() };
         for (index, frame) in frames.iter().enumerate() {
-            let entry = eval_object(ctx, "%[]")?;
+            let entry = new_dictionary(ctx)?;
             engine
                 .set_member(
                     entry.raw_id(),
@@ -2340,7 +2358,7 @@ mp_method_variant!(
         // `getOuterForce()` returns the `bust` entry as a *dictionary*
         // (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1666-1681`,
         // `EmotePlayer.cpp:881-883`).
-        let object = eval_object(ctx, "%[]")?;
+        let object = new_dictionary(ctx)?;
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for this callback.
         let engine = unsafe { ctx.engine() };
         engine

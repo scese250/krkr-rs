@@ -18,9 +18,8 @@ use super::common::{
     set_visual_string_out,
 };
 use crate::collections::Map;
-use crate::native_util::{
-    args, report_error, set_bool, set_int, set_null, set_void, value_as_string,
-};
+use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::natives::construct;
 use crate::natives::system::{value_as_bool, value_as_i64};
 use crate::{CompatCtx, CompatError};
 
@@ -135,10 +134,7 @@ pub fn refresh_cached_layers(ctx: &crate::CompatCtx) -> Result<(), String> {
     // draw live for it to appear.
     let mut blocked: Vec<u32> = Vec::new();
     for &id in &in_transition {
-        if scene
-            .layer(id)
-            .is_some_and(|layer| layer.transition_frame.is_some() || layer.effect.is_some())
-        {
+        if scene.layer(id).is_some_and(|layer| layer.effect.is_some()) {
             blocked.extend(ancestors(scene, id));
         }
     }
@@ -305,18 +301,8 @@ fn register_layer(ctx: &CompatCtx, id: u32, objthis: *mut c_void) {
 }
 
 /// Build a TJS array of retained Layer objects (used by `Layer.children`).
-fn layer_array(
-    host: &Tjs2Engine,
-    ctx: &CompatCtx,
-    ids: &[u32],
-) -> Result<Option<DetachedValue>, String> {
-    let array = match host
-        .eval_retained("[]", "visual.array")
-        .map_err(|e| e.to_string())?
-    {
-        RetainedValue::Object(object) => object,
-        RetainedValue::Value(_) => return Ok(None),
-    };
+fn layer_array(host: &Tjs2Engine, ctx: &CompatCtx, ids: &[u32]) -> Result<DetachedValue, String> {
+    let array = construct::array(host)?;
     for (index, id) in ids.iter().enumerate() {
         let Some(object) = duplicate_object(ctx, host, ObjectKind::Layer, *id) else {
             continue;
@@ -328,7 +314,7 @@ fn layer_array(
         )?;
         std::mem::forget(object);
     }
-    Ok(Some(array))
+    Ok(array)
 }
 
 // ---------------------------------------------------------------------------
@@ -3589,11 +3575,10 @@ extern "C" fn layer_children_get(
         scene.ordered_children(id)
     };
     match layer_array(resolved.engine(), &ctx, &children) {
-        Ok(Some(array)) => {
+        Ok(array) => {
             set_retained_out(resolved.engine(), out, array.raw_id());
             std::mem::forget(array);
         }
-        Ok(None) => set_null(out),
         Err(error) => return report_error(out_error, &error),
     }
     0

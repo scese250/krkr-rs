@@ -60,6 +60,7 @@ use crate::collections::Map;
 use crate::native_util::{
     args, report_error, set_bool, set_int, set_null, set_void, value_as_string,
 };
+use crate::natives::construct;
 use crate::natives::event::event_object;
 use crate::natives::system::{resolve, set_string_out, try_value_as_i64, value_as_bool};
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -213,18 +214,6 @@ fn retain_handle(host: &Tjs2Engine, handle: usize) -> Option<DetachedValue> {
     // A zero handle is the null pointer, which `retain_object_detached`
     // rejects, yielding `None`.
     host.retain_object_detached(handle as *mut c_void).ok()
-}
-
-/// Evaluate a TJS expression and retain the resulting object, if any.
-fn eval_object(host: &Tjs2Engine, expression: &str, what: &str) -> Option<DetachedValue> {
-    match host.eval_retained(expression, what) {
-        Ok(RetainedValue::Object(object)) => Some(object),
-        Ok(_) => None,
-        Err(error) => {
-            log::warn!("{what}: evaluation failed: {error}");
-            None
-        }
-    }
 }
 
 /// Access a node field without holding the state borrow across later engine
@@ -1493,8 +1482,8 @@ fn children_array(
             .is_some_and(|node| node.children_array.is_some())
     };
     if !has_array {
-        let array = eval_object(host, "[]", "MenuItem.children")
-            .ok_or_else(|| "MenuItem.children: could not create the array".to_string())?;
+        let array = construct::array(host)
+            .map_err(|error| format!("MenuItem.children: could not create the array: {error}"))?;
         let mut state = services.state::<MenuState>();
         if let Some(node) = state.nodes.get_mut(&id)
             && node.children_array.is_none()
@@ -1599,26 +1588,35 @@ extern "C" fn menu_hmenu_get(
 /// unconditional `SetShortCutKeyCode` entries exist.
 const SHORTCUT_KEYS: &[(&str, i64)] = &[("BkSp", 8), ("PgUp", 33), ("PgDn", 34)];
 
-/// Build the initializer for `MenuItem.textToKeycode` (lowercased keys keep
-/// the original-case display strings in the value list).
-fn text_to_keycode_expression() -> String {
-    let mut script = String::from("%[");
-    for (display, code) in SHORTCUT_KEYS {
-        script.push_str(&format!("'{}'=>{code},", display.to_lowercase()));
-    }
-    script.push(']');
-    script
+/// Build the `MenuItem.textToKeycode` table (lowercased keys keep the
+/// original-case display strings in the value list).
+fn text_to_keycode(host: &Tjs2Engine) -> Result<DetachedValue, String> {
+    let keys: Vec<(String, TjsValue)> = SHORTCUT_KEYS
+        .iter()
+        .map(|(display, code)| (display.to_lowercase(), TjsValue::Integer(*code)))
+        .collect();
+    let entries: Vec<(&str, TjsValue)> = keys
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.clone()))
+        .collect();
+    construct::dictionary_of(host, &entries)
 }
 
-/// Build the initializer for `MenuItem.keycodeToText` (a sparse array indexed
-/// by virtual keycode).
-fn keycode_to_text_expression() -> String {
-    let mut script = String::from("(function(){var a=[];");
+/// Build the `MenuItem.keycodeToText` table (a sparse array indexed by
+/// virtual keycode).
+fn keycode_to_text(host: &Tjs2Engine) -> Result<DetachedValue, String> {
+    let array = construct::array(host)?;
     for (display, code) in SHORTCUT_KEYS {
-        script.push_str(&format!("a[{code}]='{display}';"));
+        let index = usize::try_from(*code)
+            .map_err(|_| format!("the shortcut keycode {code} is not an array index"))?;
+        host.set_member(
+            array.raw_id(),
+            &index.to_string(),
+            &TjsValue::String((*display).to_string()),
+        )
+        .map_err(|error| format!("the shortcut keycode {code} was not stored: {error}"))?;
     }
-    script.push_str("return a;})()");
-    script
+    Ok(array)
 }
 
 /// `MenuItem.textToKeycode` (static, read-only).
@@ -1676,18 +1674,12 @@ fn install_shortcut_tables(ctx: &CompatCtx) -> Result<(), CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine, and the
     // host keeps it alive across registration.
     let host = unsafe { ctx.engine() };
-    let text = eval_object(
-        host,
-        &text_to_keycode_expression(),
-        "MenuItem.textToKeycode",
-    )
-    .ok_or_else(|| CompatError::Register("MenuItem: failed to build textToKeycode".into()))?;
-    let keys = eval_object(
-        host,
-        &keycode_to_text_expression(),
-        "MenuItem.keycodeToText",
-    )
-    .ok_or_else(|| CompatError::Register("MenuItem: failed to build keycodeToText".into()))?;
+    let text = text_to_keycode(host).map_err(|error| {
+        CompatError::Register(format!("MenuItem: failed to build textToKeycode: {error}"))
+    })?;
+    let keys = keycode_to_text(host).map_err(|error| {
+        CompatError::Register(format!("MenuItem: failed to build keycodeToText: {error}"))
+    })?;
     // SAFETY: see above.
     let mut state = unsafe { ctx.services() }.state::<MenuState>();
     state.text_to_keycode = Some(text);

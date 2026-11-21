@@ -16,7 +16,7 @@ use tjs::{
 };
 
 use super::StoredValue;
-use super::helpers::{eval_array, inst_mut, set_retained, value_as_f64};
+use super::helpers::{array_of, inst_mut, set_retained, value_as_f64};
 use super::model::MotionNode;
 use crate::engine_api::Scene;
 use crate::engine_api::layer_ops::blit_copy;
@@ -184,19 +184,19 @@ pub(crate) fn populate_layer_getter(
     getter.opacity = (node.accumulated.opacity * 255.0).round().clamp(0.0, 255.0) as i64;
     // The three arrays are built once and kept, so a script that writes into
     // one of them keeps the write until the getter is rebuilt.
-    getter.mtx = Some(eval_array(
+    getter.mtx = Some(array_of(
         ctx,
         &mtx.iter()
             .map(|value| TjsValue::Real(*value))
             .collect::<Vec<_>>(),
     )?);
-    getter.vtx = Some(eval_array(
+    getter.vtx = Some(array_of(
         ctx,
         &vtx.iter()
             .map(|value| TjsValue::Real(*value))
             .collect::<Vec<_>>(),
     )?);
-    getter.color = Some(eval_array(
+    getter.color = Some(array_of(
         ctx,
         &color
             .iter()

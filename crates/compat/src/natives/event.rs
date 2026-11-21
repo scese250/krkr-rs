@@ -13,12 +13,14 @@ use std::ffi::c_void;
 
 use tjs::{DetachedValue, Tjs2Engine, TjsValue};
 
+use crate::natives::construct;
+
 /// Allocate the VM's dictionary object.
 ///
 /// The dictionary is the VM's own dictionary class — the object a script sees
 /// as a `Dictionary`.
 pub fn event_dictionary(host: &Tjs2Engine) -> Result<DetachedValue, String> {
-    host.new_dictionary()
+    construct::dictionary(host)
 }
 
 /// Build the event object.

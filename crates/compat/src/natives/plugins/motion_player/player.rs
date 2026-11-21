@@ -22,7 +22,9 @@ use tjs::{DetachedValue, RetainedValue, TjsValue, VAL_OBJECT, Value};
 use super::StoredValue;
 use super::adaptors::{D3DInst, LayerGetterInst, SeparateInst, populate_layer_getter};
 use super::animator::{Animator, ColorAnimator, ease_weight};
-use super::helpers::{eval_object, inst_mut, inst_ref, set_real, set_string, value_as_f64};
+use super::helpers::{
+    eval_object, inst_mut, inst_ref, new_array, new_dictionary, set_real, set_string, value_as_f64,
+};
 use super::model::{
     DEFAULT_NODE_COLORS, FrameState, IconInfo, MotionClip, MotionEvent, MotionNode, MotionSnapshot,
     TimelineState, VariableFrame, build_node_tree, build_node_tree_at, child_clip_time, child_slot,
@@ -581,7 +583,7 @@ impl PlayerInst {
             .as_ref()
             .map(|snapshot| snapshot.variable_labels.clone())
             .unwrap_or_default();
-        let array = eval_object(ctx, "[]")?;
+        let array = new_array(ctx)?;
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `sync_variable_keys`.
         let engine = unsafe { ctx.engine() };
         for (index, label) in labels.iter().enumerate() {
@@ -1455,7 +1457,7 @@ impl PlayerInst {
 
     pub(crate) fn serialize(&mut self, ctx: &CompatCtx) -> Result<RetainedValue, String> {
         self.ensure_motion_loaded(ctx)?;
-        let object = eval_object(ctx, "%[]")?;
+        let object = new_dictionary(ctx)?;
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `serialize`.
         let engine = unsafe { ctx.engine() };
         let set = |key: &str, value: TjsValue| -> Result<(), String> {
@@ -1473,14 +1475,14 @@ impl PlayerInst {
         set("mirror", TjsValue::Integer(i64::from(self.mirror_base)))?;
         set("tickCount", TjsValue::Real(self.frame_tick_count))?;
         set("allplaying", TjsValue::Integer(i64::from(self.allplaying)))?;
-        let variables = eval_object(ctx, "%[]")?;
+        let variables = new_dictionary(ctx)?;
         for (label, value) in &self.variable_values {
             engine
                 .set_member(variables.raw_id(), label, &TjsValue::Real(*value))
                 .map_err(|error| error.to_string())?;
         }
         install_object(ctx, object.raw_id(), "variables", variables)?;
-        let timelines = eval_object(ctx, "%[]")?;
+        let timelines = new_dictionary(ctx)?;
         for (label, state) in &self.timelines {
             engine
                 .set_member(
@@ -1534,7 +1536,7 @@ impl PlayerInst {
     /// carries the timeline state (`label`, `flags`, `loop`, `playing`,
     /// `currentTime`, `totalFrames`, `blendRatio`).
     pub(crate) fn build_info_list(&self, ctx: &CompatCtx) -> Result<RetainedValue, String> {
-        let array = eval_object(ctx, "[]")?;
+        let array = new_array(ctx)?;
         // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `build_info_list`.
         let engine = unsafe { ctx.engine() };
         let mut index = 0usize;
@@ -1545,7 +1547,7 @@ impl PlayerInst {
             if !state.playing {
                 continue;
             }
-            let entry = eval_object(ctx, "%[]")?;
+            let entry = new_dictionary(ctx)?;
             for (name, value) in [
                 ("label", TjsValue::String(label.clone())),
                 ("flags", TjsValue::Integer(i64::from(state.flags))),

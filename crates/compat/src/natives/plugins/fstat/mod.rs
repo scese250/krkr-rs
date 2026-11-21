@@ -68,6 +68,7 @@ use tjs::{
 };
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::natives::construct;
 use crate::natives::system::{EngineBinding, resolve, set_string_out, value_as_bool, value_as_i64};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
@@ -271,16 +272,20 @@ fn validate_local_name(
     Ok(())
 }
 
-/// Evaluate a small object expression (`%[]`, `[]`, `new Date()`) and retain
-/// the resulting object.
-fn retained_object(engine: &Tjs2Engine, expression: &str) -> Result<DetachedValue, String> {
+/// Build a fresh `Date` object and retain it.
+///
+/// The `Date` class is the VM's own, and the VM exposes no constructor for
+/// it: the class object is a script value, and a script can only reach it
+/// through the compiler. The object is therefore built by evaluating the
+/// class's own constructor expression.
+fn new_date(engine: &Tjs2Engine) -> Result<DetachedValue, String> {
     match engine
-        .eval_retained(expression, "fstat")
+        .eval_retained("new Date()", "fstat")
         .map_err(|error| error.to_string())?
     {
         RetainedValue::Object(object) => Ok(object),
         RetainedValue::Value(value) => Err(format!(
-            "fstat: expression {expression:?} did not yield an object ({value:?})"
+            "fstat: the date expression did not yield an object ({value:?})"
         )),
     }
 }
@@ -400,7 +405,7 @@ fn set_date_member(
     let Some(seconds) = seconds.filter(|seconds| *seconds > 0) else {
         return Ok(());
     };
-    let date = retained_object(engine, "new Date()")?;
+    let date = new_date(engine)?;
     engine.call_member(date.raw_id(), "setTime", &[TjsValue::Integer(seconds)])?;
     engine.set_member(
         dict,
@@ -419,7 +424,7 @@ fn build_time_dict(
     size: Option<u64>,
     times: &[(&str, Option<i64>)],
 ) -> Result<DetachedValue, String> {
-    let dict = retained_object(engine, "%[]")?;
+    let dict = construct::dictionary(engine)?;
     if let Some(size) = size {
         let size = i64::try_from(size)
             .map_err(|_| "file size does not fit in a 64-bit integer".to_string())?;
@@ -923,7 +928,7 @@ extern "C" fn storages_dirlist(
         Ok(entries) => entries,
         Err(_) => return report_error(out_error, "Storages.dirlist: Directory not found."),
     };
-    let array = match retained_object(host, "[]") {
+    let array = match construct::array(host) {
         Ok(array) => array,
         Err(error) => return report_error(out_error, &format!("Storages.dirlist: {error}")),
     };
@@ -971,7 +976,7 @@ extern "C" fn storages_dirlist_ex(
         Ok(entries) => entries,
         Err(_) => return report_error(out_error, "Storages.dirlistEx: Directory not found."),
     };
-    let array = match retained_object(host, "[]") {
+    let array = match construct::array(host) {
         Ok(array) => array,
         Err(error) => return report_error(out_error, &format!("Storages.dirlistEx: {error}")),
     };
@@ -1009,7 +1014,7 @@ extern "C" fn storages_dirlist_ex(
         // `mtime = to_time_t(...)` and `ctime`/`atime` mirroring it
         // (`reference/cpp/plugins/fstat/main.cpp:584-597`).
         let mtime = millis_to_seconds(meta.modified_ms).unwrap_or(0);
-        let dict = match retained_object(host, "%[]") {
+        let dict = match construct::dictionary(host) {
             Ok(dict) => dict,
             Err(error) => return report_error(out_error, &format!("Storages.dirlistEx: {error}")),
         };
@@ -1067,7 +1072,7 @@ extern "C" fn storages_dirtree(
         Ok(path) => path,
         Err(error) => return report_error(out_error, &format!("Storages.dirtree: {error}")),
     };
-    let array = match retained_object(host, "[]") {
+    let array = match construct::array(host) {
         Ok(array) => array,
         Err(error) => return report_error(out_error, &format!("Storages.dirtree: {error}")),
     };

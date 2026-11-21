@@ -45,6 +45,7 @@ use tjs::{
 use crate::binding;
 use crate::collections::Map;
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
+use crate::natives::construct;
 use crate::natives::system::value_as_i64;
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
@@ -382,7 +383,7 @@ fn array_count(engine: &Tjs2Engine, array: &DetachedValue) -> Result<i64, String
 /// `[key0, value0, key1, value1, ...]` (hidden members skipped). This is
 /// the only script-reachable enumeration the vendored VM exposes.
 fn enumerate_flat(engine: &Tjs2Engine, target: &DetachedValue) -> Result<DetachedValue, String> {
-    let flat = new_object(engine, "[]")?;
+    let flat = construct::array(engine)?;
     let argument = engine.duplicate_retained(target.raw_id())?;
     engine.call_member(
         flat.raw_id(),
@@ -451,7 +452,7 @@ pub(crate) fn data_member_names(
 /// `EnumMembers`, which a TJS `Array` rejects with `TJS_E_NOTIMPL`
 /// (`crates/tjs/cpp/tjs2/tjsArray.h:216-219`) — see [`get_object_keys`].
 fn object_keys(engine: &Tjs2Engine, target: &DetachedValue) -> Result<DetachedValue, String> {
-    let keys = new_object(engine, "[]")?;
+    let keys = construct::array(engine)?;
     for (key, _) in enumerate_entries(engine, target)? {
         engine.call_member(keys.raw_id(), "add", &[TjsValue::String(key)])?;
     }
@@ -755,7 +756,7 @@ fn clone_array(
     services: &CompatServices,
     source: &DetachedValue,
 ) -> Result<Owned, String> {
-    let copy = new_object(engine, "[]")?;
+    let copy = construct::array(engine)?;
     let count = object_count(engine, source)?;
     for index in 0..count {
         let value = engine.member(source.raw_id(), &index.to_string())?;
@@ -773,7 +774,7 @@ fn clone_dict(
     services: &CompatServices,
     source: &DetachedValue,
 ) -> Result<Owned, String> {
-    let copy = new_object(engine, "%[]")?;
+    let copy = construct::dictionary(engine)?;
     let keys_array = object_keys(engine, source)?;
     for key in keys_of(engine, &keys_array)? {
         let value = engine.member(source.raw_id(), &key)?;
@@ -783,17 +784,6 @@ fn clone_dict(
         engine.set_member(copy.raw_id(), &key, &argument)?;
     }
     Ok(Owned::Object(copy))
-}
-
-/// Evaluate a TJS array/dictionary literal into a retained object.
-fn new_object(engine: &Tjs2Engine, expression: &str) -> Result<DetachedValue, String> {
-    match engine.eval_retained(expression, "scripts_ex") {
-        Ok(RetainedValue::Object(object)) => Ok(object),
-        Ok(RetainedValue::Value(value)) => Err(format!(
-            "scripts_ex: {expression:?} did not evaluate to an object ({value:?})"
-        )),
-        Err(error) => Err(format!("scripts_ex: {expression:?}: {error}")),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -906,7 +896,7 @@ fn get_object_keys(
     target: &DetachedValue,
 ) -> Result<Owned, String> {
     if is_instance_of(engine, target, "Array")? {
-        return Ok(Owned::Object(new_object(engine, "[]")?));
+        return Ok(Owned::Object(construct::array(engine)?));
     }
     object_keys(engine, target).map(Owned::Object)
 }

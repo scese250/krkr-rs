@@ -31,11 +31,12 @@ use api::blend::BlendMode as SceneBlend;
 use api::fs::FsPath;
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    NativeMethodDef, NativePropertyDef, NativeStaticMembers, RetainedValue, Tjs2Engine,
-    Tjs2ValueId, TjsValue, VAL_INTEGER, VAL_OBJECT, VAL_REAL, VAL_RETAINED, Value,
+    NativeMethodDef, NativePropertyDef, NativeStaticMembers, Tjs2Engine, Tjs2ValueId, TjsValue,
+    VAL_INTEGER, VAL_OBJECT, VAL_REAL, VAL_RETAINED, Value,
 };
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::natives::construct;
 use crate::natives::system::{resolve, set_string_out, value_as_i64};
 use crate::natives::visual::from_native;
 use crate::storage::strip_file_media;
@@ -177,15 +178,6 @@ psd_constant_properties! {
 // ---------------------------------------------------------------------------
 // TJS object helpers
 // ---------------------------------------------------------------------------
-
-/// Evaluate `expression` and keep the resulting object.
-fn new_object(host: &Tjs2Engine, expression: &str, tag: &str) -> Result<DetachedValue, String> {
-    match host.eval_retained(expression, tag) {
-        Ok(RetainedValue::Object(object)) => Ok(object),
-        Ok(RetainedValue::Value(value)) => Err(format!("expected an object, got {value:?}")),
-        Err(error) => Err(error.to_string()),
-    }
-}
 
 /// Set an integer member.
 fn set_int_member(
@@ -663,7 +655,7 @@ fn build_layer_info(
     file: &PsdFile,
     layer: &LayerInfo,
 ) -> Result<DetachedValue, String> {
-    let dict = new_object(host, "%[]", "PSD.getLayerInfo")?;
+    let dict = construct::dictionary(host)?;
     let id = dict.raw_id();
     set_int_member(host, id, "top", i64::from(layer.top))?;
     set_int_member(host, id, "left", i64::from(layer.left))?;
@@ -713,9 +705,9 @@ fn build_layer_info(
         )?;
     }
     if !layer.layer_comps.is_empty() {
-        let comps = new_object(host, "%[]", "PSD.getLayerInfo")?;
+        let comps = construct::dictionary(host)?;
         for (comp_id, comp) in &layer.layer_comps {
-            let entry = new_object(host, "%[]", "PSD.getLayerInfo")?;
+            let entry = construct::dictionary(host)?;
             set_int_member(host, entry.raw_id(), "id", i64::from(comp.id))?;
             set_int_member(host, entry.raw_id(), "offset_x", i64::from(comp.offset_x))?;
             set_int_member(host, entry.raw_id(), "offset_y", i64::from(comp.offset_y))?;
@@ -990,16 +982,16 @@ extern "C" fn psd_get_slices(
     };
     let host = binding.engine();
     let result = (|| -> Result<DetachedValue, String> {
-        let dict = new_object(host, "%[]", "PSD.getSlices")?;
+        let dict = construct::dictionary(host)?;
         let id = dict.raw_id();
         set_int_member(host, id, "top", i64::from(slice.bounding_top))?;
         set_int_member(host, id, "left", i64::from(slice.bounding_left))?;
         set_int_member(host, id, "bottom", i64::from(slice.bounding_bottom))?;
         set_int_member(host, id, "right", i64::from(slice.bounding_right))?;
         set_str_member(host, id, "name", &slice.group_name)?;
-        let array = new_object(host, "[]", "PSD.getSlices")?;
+        let array = construct::array(host)?;
         for (index, item) in slice.slices.iter().enumerate() {
-            let entry = new_object(host, "%[]", "PSD.getSlices")?;
+            let entry = construct::dictionary(host)?;
             let entry_id = entry.raw_id();
             set_int_member(host, entry_id, "id", i64::from(item.id))?;
             set_int_member(host, entry_id, "group_id", i64::from(item.group_id))?;
@@ -1082,12 +1074,12 @@ extern "C" fn psd_get_guides(
     };
     let host = binding.engine();
     let result = (|| -> Result<DetachedValue, String> {
-        let dict = new_object(host, "%[]", "PSD.getGuides")?;
+        let dict = construct::dictionary(host)?;
         let id = dict.raw_id();
         set_int_member(host, id, "horz_grid", i64::from(grid.horizontal_grid))?;
         set_int_member(host, id, "vert_grid", i64::from(grid.vertical_grid))?;
-        let vertical = new_object(host, "[]", "PSD.getGuides")?;
-        let horizontal = new_object(host, "[]", "PSD.getGuides")?;
+        let vertical = construct::array(host)?;
+        let horizontal = construct::array(host)?;
         let mut v = 0usize;
         let mut h = 0usize;
         for guide in &grid.guides {
@@ -1136,7 +1128,7 @@ extern "C" fn psd_get_layer_comp(
     }
     let host = binding.engine();
     let result = (|| -> Result<DetachedValue, String> {
-        let dict = new_object(host, "%[]", "PSD.getLayerComp")?;
+        let dict = construct::dictionary(host)?;
         let id = dict.raw_id();
         set_int_member(
             host,
@@ -1144,9 +1136,9 @@ extern "C" fn psd_get_layer_comp(
             "last_applied_id",
             i64::from(file.last_applied_comp_id),
         )?;
-        let array = new_object(host, "[]", "PSD.getLayerComp")?;
+        let array = construct::array(host)?;
         for (index, comp) in file.layer_comps.iter().enumerate() {
-            let entry = new_object(host, "%[]", "PSD.getLayerComp")?;
+            let entry = construct::dictionary(host)?;
             let entry_id = entry.raw_id();
             set_int_member(host, entry_id, "id", i64::from(comp.id))?;
             set_int_member(

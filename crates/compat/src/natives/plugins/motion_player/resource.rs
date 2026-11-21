@@ -17,7 +17,7 @@ use tjs::{DetachedValue, RetainedValue, TjsValue, VAL_OBJECT, Value};
 
 use super::StoredValue;
 use super::emote::ModuleSettings;
-use super::helpers::{eval_object, inst_mut, set_retained};
+use super::helpers::{inst_mut, new_array, new_dictionary, set_retained};
 use super::model::MotionSnapshot;
 use crate::engine_api::{JobOutcome, JobValue, JobWork, PendingStorage, StorageReadError};
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
@@ -249,7 +249,7 @@ extern "C" fn resource_ctor(
                     .member(window.raw_id(), name)
                     .is_ok_and(|value| !matches!(value, TjsValue::Void));
                 if !defined {
-                    let Ok(dictionary) = eval_object(&ctx, "%[]") else {
+                    let Ok(dictionary) = new_dictionary(&ctx) else {
                         continue;
                     };
                     let id = dictionary.raw_id().as_ptr() as usize as u64;
@@ -504,7 +504,7 @@ fn module_object(
     path: &str,
     snapshot: Option<&MotionSnapshot>,
 ) -> Result<DetachedValue, String> {
-    let object = dictionary_new(ctx)?;
+    let object = new_dictionary(ctx)?;
     // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `module_object`.
     let engine = unsafe { ctx.engine() };
     engine
@@ -570,7 +570,7 @@ fn build_psb(ctx: &CompatCtx, value: &PsbValue) -> Result<Built, String> {
         PsbValue::Double(value) => Ok(Built::Scalar(TjsValue::Real(*value))),
         PsbValue::String(value) => Ok(Built::Scalar(TjsValue::String(value.clone()))),
         PsbValue::Array(values) => {
-            let array = array_new(ctx)?;
+            let array = new_array(ctx)?;
             // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `build_psb`.
             let engine = unsafe { ctx.engine() };
             for value in values {
@@ -581,7 +581,7 @@ fn build_psb(ctx: &CompatCtx, value: &PsbValue) -> Result<Built, String> {
             Ok(Built::Object(array))
         }
         PsbValue::List(items) => {
-            let array = array_new(ctx)?;
+            let array = new_array(ctx)?;
             for item in items {
                 let built = build_psb(ctx, item)?;
                 add_built(ctx, array.raw_id(), built)?;
@@ -589,7 +589,7 @@ fn build_psb(ctx: &CompatCtx, value: &PsbValue) -> Result<Built, String> {
             Ok(Built::Object(array))
         }
         PsbValue::Dictionary(entries) => {
-            let dictionary = dictionary_new(ctx)?;
+            let dictionary = new_dictionary(ctx)?;
             for (key, item) in entries {
                 let built = build_psb(ctx, item)?;
                 install(ctx, dictionary.raw_id(), key, built)?;
@@ -602,24 +602,6 @@ fn build_psb(ctx: &CompatCtx, value: &PsbValue) -> Result<Built, String> {
             i64::from(reference.index)
         }))),
     }
-}
-
-/// A fresh TJS array: the VM's own array class, the object an array
-/// literal produces.
-///
-/// The VM's constructor is used and not a script literal: a literal is
-/// compiled and run once per container, and a container holds tens of
-/// thousands of them.
-fn array_new(ctx: &CompatCtx) -> Result<DetachedValue, String> {
-    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `array_new`.
-    unsafe { ctx.engine() }.new_array()
-}
-
-/// A fresh TJS dictionary: the VM's own dictionary class, the object a
-/// dictionary literal produces.
-fn dictionary_new(ctx: &CompatCtx) -> Result<DetachedValue, String> {
-    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `dictionary_new`.
-    unsafe { ctx.engine() }.new_dictionary()
 }
 
 /// Append `built` to `array`: the VM's `add`, the method a script calls to

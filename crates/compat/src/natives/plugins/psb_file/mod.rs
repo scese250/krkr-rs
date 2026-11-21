@@ -95,6 +95,7 @@ use tjs::{
 use psd::container::PsbValue;
 
 use crate::native_util::{args, report_error, set_bool, set_void, value_as_string};
+use crate::natives::construct;
 use crate::natives::plugins::var_file;
 use crate::natives::storages::extract_storage_name;
 use crate::natives::system::resolve;
@@ -163,13 +164,13 @@ enum Built {
 /// would compile and run one script per container, and a scene file holds
 /// tens of thousands of them.
 fn array_new(host: &Tjs2Engine) -> Result<DetachedValue, String> {
-    host.new_array()
+    construct::array(host)
 }
 
 /// A fresh TJS dictionary: the VM's own dictionary class, the object a
 /// dictionary literal produces.
 fn dictionary_new(host: &Tjs2Engine) -> Result<DetachedValue, String> {
-    host.new_dictionary()
+    construct::dictionary(host)
 }
 
 /// Append `built` to `array`: the VM's `add`, the method a script

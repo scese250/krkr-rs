@@ -859,18 +859,8 @@ int_property_getter!(ncht_border_get, 18);
 /// Install `Window._Notifications`, the two-way bare-name/value dictionary
 /// (`#key` from `windowEx.cpp:801`, e.g. `"PAINT" => 15`).
 pub(super) fn install_notifications(engine: &Tjs2Engine) -> Result<(), CompatError> {
-    let literal = notifications::dictionary_literal();
-    let dict = match engine
-        .eval_retained(&literal, "windowEx._Notifications")
-        .map_err(|error| CompatError::Register(error.to_string()))?
-    {
-        RetainedValue::Object(object) => object,
-        RetainedValue::Value(_) => {
-            return Err(CompatError::Register(
-                "windowEx._Notifications: dictionary literal returned a scalar".into(),
-            ));
-        }
-    };
+    let dict = notifications::build_dictionary(engine)
+        .map_err(|error| CompatError::Register(error.to_string()))?;
     let class = match engine
         .eval_retained("Window", "windowEx._Notifications")
         .map_err(|error| CompatError::Register(error.to_string()))?

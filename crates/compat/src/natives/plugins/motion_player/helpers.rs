@@ -13,6 +13,7 @@ use std::ptr;
 use tjs::{RetainedValue, TjsValue, VAL_INTEGER, VAL_REAL, VAL_RETAINED, VAL_STRING, Value};
 
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::natives::construct;
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
 
 /// Error message used whenever the compat binding has gone away.
@@ -163,20 +164,27 @@ pub(crate) fn set_scalar(ctx: &crate::CompatCtx, out: *mut Value, value: TjsValu
     }
 }
 
+/// A fresh TJS array: the VM's own array class, the object an array literal
+/// produces.
+pub(crate) fn new_array(ctx: &crate::CompatCtx) -> Result<tjs::DetachedValue, String> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `new_array`.
+    construct::array(unsafe { ctx.engine() })
+}
+
+/// A fresh TJS dictionary: the VM's own dictionary class, the object a
+/// dictionary literal produces.
+pub(crate) fn new_dictionary(ctx: &crate::CompatCtx) -> Result<tjs::DetachedValue, String> {
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `new_dictionary`.
+    construct::dictionary(unsafe { ctx.engine() })
+}
+
 /// Build a TJS array holding `values`.
-pub(crate) fn eval_array(
+pub(crate) fn array_of(
     ctx: &crate::CompatCtx,
     values: &[TjsValue],
 ) -> Result<tjs::DetachedValue, String> {
-    let array = eval_object(ctx, "[]")?;
-    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `eval_array`.
-    let engine = unsafe { ctx.engine() };
-    for (index, value) in values.iter().enumerate() {
-        engine
-            .set_member(array.raw_id(), &index.to_string(), value)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(array)
+    // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `array_of`.
+    construct::array_of(unsafe { ctx.engine() }, values)
 }
 
 /// Getter helper for a member that holds a TJS array.
@@ -619,7 +627,12 @@ pub(crate) fn method_variant<T>(
     }
 }
 
-/// Build a TJS object expression and retain it.
+/// Build a script class instance and retain it.
+///
+/// The VM exposes no constructor for a registered class, so the instance is
+/// built by evaluating the class's own constructor expression. The data
+/// containers an array or a dictionary needs are built by [`new_array`] and
+/// [`new_dictionary`] instead.
 pub(crate) fn eval_object(
     ctx: &crate::CompatCtx,
     expression: &str,
@@ -630,22 +643,4 @@ pub(crate) fn eval_object(
         Ok(_) => Err("motionplayer: expression did not yield an object".into()),
         Err(error) => Err(error.to_string()),
     }
-}
-
-/// Escape a string as a TJS double-quoted literal.
-pub(crate) fn tjs_string_literal(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
 }

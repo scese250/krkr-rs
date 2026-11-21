@@ -18,6 +18,7 @@ use tjs::{
 
 use crate::binding;
 use crate::collections::Map;
+use crate::natives::construct;
 
 /// Scratch buffer for a string result. The C++ trampoline copies `out.string`
 /// before the next native call, so a per-binding buffer (never a global) is
@@ -122,15 +123,9 @@ pub(crate) fn finish_retained(
     }
 }
 
-/// Evaluate `%[]` and retain the resulting dictionary.
+/// Build a fresh TJS dictionary.
 pub(crate) fn make_dict(engine: &Tjs2Engine, what: &str) -> Result<DetachedValue, String> {
-    match engine
-        .eval_retained("%[]", what)
-        .map_err(|e| e.to_string())?
-    {
-        RetainedValue::Object(object) => Ok(object),
-        RetainedValue::Value(_) => Err(format!("{what}: could not build a dictionary")),
-    }
+    construct::dictionary(engine).map_err(|error| format!("{what}: {error}"))
 }
 
 /// Retain a raw `objthis` object pointer.

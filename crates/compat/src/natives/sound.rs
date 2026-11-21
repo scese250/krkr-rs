@@ -152,6 +152,7 @@ use crate::native_util::{
     callback_args, host_ref, inst_mut, inst_ref, report_error, set_int, set_void, value_as_string,
     value_ref,
 };
+use crate::natives::construct;
 use crate::natives::event::event_object;
 use crate::natives::system::{resolve, set_string_out, value_as_bool, value_as_i64};
 use crate::storage::strip_file_media;
@@ -725,48 +726,45 @@ fn eval_object(host: &Tjs2Engine, expr: &str, what: &str) -> Option<DetachedValu
     }
 }
 
-/// Escape a `.sli` label name for a single-quoted TJS string literal.
-fn escape_js(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '\\' | '\'' => {
-                out.push('\\');
-                out.push(c);
-            }
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Build the `labels` dictionary expression (reference `WaveLabels`):
+/// Build the `labels` dictionary (`WaveLabels`):
 /// `{ name: { name, samplePosition, position(ms) } }`.
-fn labels_expr(object: &SoundObject) -> String {
+///
+/// The dictionary is the VM's own dictionary class, so no script is compiled
+/// to build it.
+fn build_labels(host: &Tjs2Engine, object: &SoundObject) -> Result<DetachedValue, String> {
     let rate = object
         .source
         .as_ref()
         .map_or(0, |source| source.sample_rate());
-    let mut out = String::from("(function(){var d=%[];");
-    for (index, label) in object.buffer.labels().iter().enumerate() {
+    let labels = construct::dictionary(host)?;
+    for label in object.buffer.labels() {
         if label.name.is_empty() {
             continue;
         }
-        let name = escape_js(&label.name);
+        let position = i64::try_from(label.position)
+            .map_err(|_| "the label position does not fit in a 64-bit integer".to_string())?;
         let ms = if rate > 0 {
-            label.position as i64 * 1000 / i64::from(rate)
+            position * 1000 / i64::from(rate)
         } else {
             0
         };
-        out.push_str(&format!(
-            "var e{index}=%[];e{index}.name='{name}';e{index}.samplePosition={};e{index}.position={ms};d['{name}']=e{index};",
-            label.position
-        ));
+        let entry = construct::dictionary(host)?;
+        host.set_member(
+            entry.raw_id(),
+            "name",
+            &TjsValue::String(label.name.clone()),
+        )?;
+        host.set_member(
+            entry.raw_id(),
+            "samplePosition",
+            &TjsValue::Integer(position),
+        )?;
+        host.set_member(entry.raw_id(), "position", &TjsValue::Integer(ms))?;
+        let id = entry.raw_id().as_ptr() as usize as u64;
+        host.set_member(labels.raw_id(), &label.name, &TjsValue::Retained(id))?;
+        drop(entry);
     }
-    out.push_str("return d;})()");
-    out
+    Ok(labels)
 }
 
 /// Access an object and the shared mixer together (both are disjoint fields
@@ -1278,7 +1276,13 @@ extern "C" fn sound_ctor(
     let action_owner = raw_args
         .first()
         .and_then(|value| host.retain_object_arg(value).ok());
-    let filters = eval_object(host, "[]", "WaveSoundBuffer.filters");
+    let filters = match construct::array(host) {
+        Ok(array) => Some(array),
+        Err(error) => {
+            log::warn!("compat.sound: the filters array could not be created: {error}");
+            None
+        }
+    };
     // SAFETY: the caller resolved `ctx` from the installed binding.
     let services = unsafe { ctx.services() };
     let id = {
@@ -2577,18 +2581,19 @@ extern "C" fn sound_labels_get(
             let raw = match cached {
                 Some(raw) => raw,
                 None => {
-                    let expr =
-                        with_object(services, id, |object, _mixer| Some(labels_expr(object)))
-                            .flatten();
-                    let Some(expr) = expr else {
+                    let built =
+                        with_object(services, id, |object, _mixer| build_labels(host, object));
+                    let Some(built) = built else {
                         return report_error(out_error, "WaveSoundBuffer.labels: not constructed");
                     };
-                    let object = match eval_object(host, &expr, "WaveSoundBuffer.labels") {
-                        Some(object) => object,
-                        None => {
+                    let object = match built {
+                        Ok(object) => object,
+                        Err(error) => {
                             return report_error(
                                 out_error,
-                                "WaveSoundBuffer.labels: could not build the dictionary",
+                                &format!(
+                                    "WaveSoundBuffer.labels: could not build the dictionary: {error}"
+                                ),
                             );
                         }
                     };

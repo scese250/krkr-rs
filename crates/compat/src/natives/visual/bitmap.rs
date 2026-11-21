@@ -15,7 +15,7 @@ use api::geometry::PixelRegion;
 use api::media::{DecodedImage, ImageInfo};
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    NativeMethodDef, NativeStaticMembers, RetainedValue, Tjs2Engine, TjsValue, VAL_VOID, Value,
+    NativeMethodDef, NativeStaticMembers, Tjs2Engine, TjsValue, VAL_VOID, Value,
 };
 
 use super::common::{
@@ -24,9 +24,10 @@ use super::common::{
 };
 use crate::collections::Map;
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::natives::construct;
 use crate::natives::storages::extract_storage_ext;
 use crate::natives::system::value_as_i64;
-use crate::resource::{ResourceResolver, await_pending_write};
+use crate::resource::{ResourceResolver, await_pending_write, resource_state};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -229,10 +230,20 @@ pub(crate) fn resolve_image(
     storage: &Storage,
     name: &str,
 ) -> Result<ResolvedImage, ImageLoadError> {
+    // The names whose write is still in flight. The reader waits for the
+    // write of the name it resolves, and the file that write produced is in
+    // the directory the storage has listed.
+    let written = resource_state(ctx).pending_save_names();
     for candidate in image_candidates(name) {
         // A write of this name may still be in flight: the reader waits for
         // it, so the file is in place when the name is resolved.
+        let awaited = written.contains(&candidate);
         await_pending_write(ctx, &candidate).map_err(ImageLoadError::Message)?;
+        if awaited {
+            // The write landed: the file is in the directory now, so the
+            // storage's listing of that directory no longer describes it.
+            storage.invalidate_disk_listings();
+        }
         match storage.resolve_entry(&candidate)? {
             Some(StorageEntry::File {
                 name: entry_name,
@@ -441,30 +452,267 @@ fn metainfo_object(
     height: u32,
     bpp: u32,
 ) -> Result<DetachedValue, String> {
-    let expression = format!("%[\"width\"=>{width}, \"height\"=>{height}, \"bpp\"=>{bpp}]");
-    match host.eval_retained(&expression, "Bitmap.metainfo") {
-        Ok(RetainedValue::Object(object)) => Ok(object),
-        Ok(RetainedValue::Value(_)) => Err("the metainfo expression was not an object".to_string()),
-        Err(error) => Err(error.to_string()),
-    }
+    let metainfo = construct::dictionary(host)?;
+    host.set_member(
+        metainfo.raw_id(),
+        "width",
+        &TjsValue::Integer(i64::from(width)),
+    )?;
+    host.set_member(
+        metainfo.raw_id(),
+        "height",
+        &TjsValue::Integer(i64::from(height)),
+    )?;
+    host.set_member(metainfo.raw_id(), "bpp", &TjsValue::Integer(i64::from(bpp)))?;
+    Ok(metainfo)
 }
 
-/// The save-option dictionary expression for `type`, or `None` when no
+/// One save option: the entry a save format offers.
+///
+/// The entry carries the option's `type`, the values it offers (`items`), the
+/// bounds of a ranged option (`min`/`max`), its `desc` and its `default`.
+struct SaveOption<'a> {
+    /// The option's kind (`select`, `range`, `boolean`, `integer`, ...).
+    kind: &'a str,
+    /// The offered values, for a kind that offers a list.
+    items: Option<&'a [&'a str]>,
+    /// The bounds, for a kind that has them.
+    bounds: Option<(i64, i64)>,
+    /// The option's description.
+    description: &'a str,
+    /// The option's default value.
+    default: TjsValue,
+}
+
+/// Build one save option's dictionary.
+///
+/// # Errors
+///
+/// Returns the VM's error when the dictionary cannot be created, and the
+/// write's error when a member cannot be stored.
+fn save_option_entry(host: &Tjs2Engine, option: &SaveOption<'_>) -> Result<DetachedValue, String> {
+    let entry = construct::dictionary(host)?;
+    host.set_member(
+        entry.raw_id(),
+        "type",
+        &TjsValue::String(option.kind.to_string()),
+    )?;
+    if let Some(items) = option.items {
+        let array = construct::array(host)?;
+        for (index, item) in items.iter().enumerate() {
+            host.set_member(
+                array.raw_id(),
+                &index.to_string(),
+                &TjsValue::String((*item).to_string()),
+            )?;
+        }
+        let id = array.raw_id().as_ptr() as usize as u64;
+        host.set_member(entry.raw_id(), "items", &TjsValue::Retained(id))?;
+        drop(array);
+    }
+    if let Some((min, max)) = option.bounds {
+        host.set_member(entry.raw_id(), "min", &TjsValue::Integer(min))?;
+        host.set_member(entry.raw_id(), "max", &TjsValue::Integer(max))?;
+    }
+    host.set_member(
+        entry.raw_id(),
+        "desc",
+        &TjsValue::String(option.description.to_string()),
+    )?;
+    host.set_member(entry.raw_id(), "default", &option.default)?;
+    Ok(entry)
+}
+
+/// Install `option` as the named entry of the save-option dictionary.
+///
+/// # Errors
+///
+/// Returns the write's error when the entry cannot be stored.
+fn install_save_option(
+    host: &Tjs2Engine,
+    options: &DetachedValue,
+    name: &str,
+    option: DetachedValue,
+) -> Result<(), String> {
+    let id = option.raw_id().as_ptr() as usize as u64;
+    host.set_member(options.raw_id(), name, &TjsValue::Retained(id))?;
+    drop(option);
+    Ok(())
+}
+
+/// The save options of the BMP writer: the `bpp` entry offers the three
+/// depths.
+///
+/// # Errors
+///
+/// Returns the VM's error when a dictionary cannot be created, and the
+/// write's error when a member cannot be stored.
+fn save_option_bmp(host: &Tjs2Engine) -> Result<DetachedValue, String> {
+    let bpp = save_option_entry(
+        host,
+        &SaveOption {
+            kind: "select",
+            items: Some(&["32", "24", "8"]),
+            bounds: None,
+            description: "bpp",
+            default: TjsValue::Integer(0),
+        },
+    )?;
+    let options = construct::dictionary(host)?;
+    install_save_option(host, &options, "bpp", bpp)?;
+    Ok(options)
+}
+
+/// The save options of the JPEG writer: the quality, the subsampling, the DCT
+/// method and the progressive flag.
+///
+/// # Errors
+///
+/// Returns the VM's error when a dictionary cannot be created, and the
+/// write's error when a member cannot be stored.
+fn save_option_jpeg(host: &Tjs2Engine) -> Result<DetachedValue, String> {
+    let quality = save_option_entry(
+        host,
+        &SaveOption {
+            kind: "range",
+            items: None,
+            bounds: Some((1, 100)),
+            description: "100 is high quality, 1 is low quality",
+            default: TjsValue::Integer(90),
+        },
+    )?;
+    let subsampling = save_option_entry(
+        host,
+        &SaveOption {
+            kind: "select",
+            items: Some(&["4:2:0", "4:2:2", "4:4:4"]),
+            bounds: None,
+            description: "subsampling",
+            default: TjsValue::Integer(0),
+        },
+    )?;
+    let dct = save_option_entry(
+        host,
+        &SaveOption {
+            kind: "select",
+            items: Some(&["islow", "ifast", "float"]),
+            bounds: None,
+            description: "DCT method",
+            default: TjsValue::Integer(0),
+        },
+    )?;
+    let progressive = save_option_entry(
+        host,
+        &SaveOption {
+            kind: "boolean",
+            items: None,
+            bounds: None,
+            description: "progressive",
+            default: TjsValue::Integer(1),
+        },
+    )?;
+    let options = construct::dictionary(host)?;
+    install_save_option(host, &options, "quality", quality)?;
+    install_save_option(host, &options, "subsampling", subsampling)?;
+    install_save_option(host, &options, "dct", dct)?;
+    install_save_option(host, &options, "progressive", progressive)?;
+    Ok(options)
+}
+
+/// The save options of the TLG writer: the blending mode and the two offsets.
+///
+/// # Errors
+///
+/// Returns the VM's error when a dictionary cannot be created, and the
+/// write's error when a member cannot be stored.
+fn save_option_tlg(host: &Tjs2Engine) -> Result<DetachedValue, String> {
+    let mode = save_option_entry(
+        host,
+        &SaveOption {
+            kind: "select text",
+            items: Some(&[
+                "opaque",
+                "alpha",
+                "add",
+                "sub",
+                "mul",
+                "dodge",
+                "darken",
+                "lighten",
+                "screen",
+                "addalpha",
+                "psnormal",
+                "psadd",
+                "pssub",
+                "psmul",
+                "psscreen",
+                "psoverlay",
+                "pshlight",
+                "psslight",
+                "psdodge",
+                "psdodge5",
+                "psburn",
+                "pslighten",
+                "psdarken",
+                "psdiff",
+                "psdiff5",
+                "psexcl",
+            ]),
+            bounds: None,
+            description: "blending mode",
+            default: TjsValue::String("alpha".to_string()),
+        },
+    )?;
+    let offset_x = save_option_entry(
+        host,
+        &SaveOption {
+            kind: "integer",
+            items: None,
+            bounds: None,
+            description: "offset x",
+            default: TjsValue::Integer(0),
+        },
+    )?;
+    let offset_y = save_option_entry(
+        host,
+        &SaveOption {
+            kind: "integer",
+            items: None,
+            bounds: None,
+            description: "offset y",
+            default: TjsValue::Integer(0),
+        },
+    )?;
+    let offset_unit = save_option_entry(
+        host,
+        &SaveOption {
+            kind: "select text",
+            items: Some(&["pixel"]),
+            bounds: None,
+            description: "offset unit",
+            default: TjsValue::String("pixel".to_string()),
+        },
+    )?;
+    let options = construct::dictionary(host)?;
+    install_save_option(host, &options, "mode", mode)?;
+    install_save_option(host, &options, "offs_x", offset_x)?;
+    install_save_option(host, &options, "offs_y", offset_y)?;
+    install_save_option(host, &options, "offs_unit", offset_unit)?;
+    Ok(options)
+}
+
+/// The save-option dictionary for `type`, or `None` when no
 /// handler accepts it (the reference `TVPGetSaveOption` then yields `void`).
-fn save_option_expression(type_name: &str) -> Option<&'static str> {
+fn save_option_object(host: &Tjs2Engine, type_name: &str) -> Option<Result<DetachedValue, String>> {
     let lower = type_name.to_ascii_lowercase();
     if lower.starts_with("bmp") || lower == ".bmp" || lower == ".dib" {
-        Some(r#"%["bpp"=>%["type"=>"select","items"=>["32","24","8"],"desc"=>"bpp","default"=>0]]"#)
+        Some(save_option_bmp(host))
     } else if lower.starts_with("png") || lower == ".png" {
-        Some("%[]")
+        Some(construct::dictionary(host))
     } else if lower.starts_with("jpg") || lower == ".jpg" || lower == ".jpeg" || lower == ".jif" {
-        Some(
-            r#"%["quality"=>%["type"=>"range","min"=>1,"max"=>100,"desc"=>"100 is high quality, 1 is low quality","default"=>90],"subsampling"=>%["type"=>"select","items"=>["4:2:0","4:2:2","4:4:4"],"desc"=>"subsampling","default"=>0],"dct"=>%["type"=>"select","items"=>["islow","ifast","float"],"desc"=>"DCT method","default"=>0],"progressive"=>%["type"=>"boolean","desc"=>"progressive","default"=>true]]"#,
-        )
+        Some(save_option_jpeg(host))
     } else if lower.starts_with("tlg") || lower == ".tlg" || lower == ".tlg5" || lower == ".tlg6" {
-        Some(
-            r#"%["mode"=>%["type"=>"select text","items"=>["opaque","alpha","add","sub","mul","dodge","darken","lighten","screen","addalpha","psnormal","psadd","pssub","psmul","psscreen","psoverlay","pshlight","psslight","psdodge","psdodge5","psburn","pslighten","psdarken","psdiff","psdiff5","psexcl"],"desc"=>"blending mode","default"=>"alpha"],"offs_x"=>%["type"=>"integer","desc"=>"offset x","default"=>0],"offs_y"=>%["type"=>"integer","desc"=>"offset y","default"=>0],"offs_unit"=>%["type"=>"select text","items"=>["pixel"],"desc"=>"offset unit","default"=>"pixel"]]"#,
-        )
+        Some(save_option_tlg(host))
     } else {
         None
     }
@@ -1631,6 +1879,16 @@ extern "C" fn bitmap_save(
     let pool = decode_pool_mut(&ctx);
     match resolver.submit_save(pool, &name, &type_name, width, height, rgba) {
         Ok(()) => {
+            // The write puts a file into the directory the storage has
+            // listed: the listing is dropped, so the next probe of the name
+            // finds the file. A deferred write lands after this call; the
+            // reader of the name waits for it and drops the listing again.
+            if let Some(storage) = services.storage() {
+                // SAFETY: the host keeps the attached storage alive for the
+                // lifetime of the binding, and this is the storage the VM
+                // reads its names through.
+                unsafe { &*storage }.invalidate_disk_listings();
+            }
             set_void(out);
             0
         }
@@ -1850,20 +2108,17 @@ extern "C" fn bitmap_get_save_option(
     // SAFETY: the C++ trampoline passes `argc` valid `Value`s in `argv` for the duration of this callback.
     let type_name = value_as_string(&unsafe { args(argv, argc) }[0]);
     let host = resolved.engine();
-    match save_option_expression(&type_name) {
-        Some(expression) => match host.eval_retained(expression, "Bitmap.getSaveOption") {
-            Ok(RetainedValue::Object(object)) => {
-                set_retained_out(host, out, object.raw_id());
-                std::mem::forget(object);
-            }
-            Ok(RetainedValue::Value(_)) => set_void(out),
-            Err(error) => {
-                return report_error(
-                    out_error,
-                    &format!("Bitmap.getSaveOption: could not build the option object: {error}"),
-                );
-            }
-        },
+    match save_option_object(host, &type_name) {
+        Some(Ok(object)) => {
+            set_retained_out(host, out, object.raw_id());
+            std::mem::forget(object);
+        }
+        Some(Err(error)) => {
+            return report_error(
+                out_error,
+                &format!("Bitmap.getSaveOption: could not build the option object: {error}"),
+            );
+        }
         None => set_void(out),
     }
     0
@@ -2231,6 +2486,7 @@ pub(super) fn register_bitmap_class(ctx: &mut CompatCtx) -> Result<(), CompatErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// A load below the threshold is never reported, a load above it is
     /// reported once, and the next one is held back until the interval has
@@ -2246,5 +2502,133 @@ mod tests {
             !reporter.is_due(),
             "a second slow load inside the interval is held back"
         );
+    }
+
+    /// A unique temporary directory, removed by the caller.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let mut base = std::env::temp_dir();
+        base.push(format!(
+            "krkr-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        base
+    }
+
+    /// The context of a bound engine and its services.
+    fn context(engine: &Tjs2Engine, services: &mut CompatServices) -> CompatCtx {
+        // SAFETY: both values outlive the returned context.
+        unsafe {
+            CompatCtx::from_raw(
+                engine as *const Tjs2Engine as usize,
+                services as *mut CompatServices as usize,
+            )
+        }
+    }
+
+    /// The decoder the pool carries: the test writes no image, so the pool
+    /// only runs the write.
+    struct WriteOnlyDecoder;
+
+    impl engine::imagedecode::ImageDecoder for WriteOnlyDecoder {
+        fn probe(
+            &self,
+            _bytes: &[u8],
+            _hint: Option<&str>,
+        ) -> Result<ImageInfo, engine::imagedecode::ImageDecodeError> {
+            Err(engine::imagedecode::ImageDecodeError::Failed {
+                message: "the test decodes no image".to_string(),
+            })
+        }
+
+        fn decode(
+            &self,
+            _bytes: &[u8],
+            _hint: Option<&str>,
+        ) -> Result<DecodedImage, engine::imagedecode::ImageDecodeError> {
+            Err(engine::imagedecode::ImageDecodeError::Failed {
+                message: "the test decodes no image".to_string(),
+            })
+        }
+    }
+
+    /// The image the game wrote is found by the next probe.
+    ///
+    /// The write is deferred: the reader waits for it, and the file it wrote
+    /// is in the directory the storage has listed, so the reader drops the
+    /// listing before it resolves the name. The file's spelling differs from
+    /// the name the script reads, so only the case-insensitive walk finds it.
+    #[test]
+    fn an_image_the_game_wrote_is_found_by_the_next_probe() {
+        let _lock = crate::native_util::test_vm_lock();
+        let engine = Tjs2Engine::new().expect("create engine");
+        let mut services = CompatServices::new();
+        let dir = unique_temp_dir("bitmap-write");
+        std::fs::create_dir_all(&dir).expect("create the game directory");
+        let mut storage = Storage::mount_archives(
+            fs::FileSystem::host(&dir),
+            dir.clone(),
+            std::iter::empty::<&str>(),
+        )
+        .expect("mount storage");
+        // SAFETY: the storage outlives the context, which is the contract
+        // `attach_storage` documents.
+        unsafe { services.attach_storage(&mut storage as *mut Storage) };
+        let ctx = context(&engine, &mut services);
+
+        // The listing is warmed while the directory holds no file.
+        assert!(
+            resolve_image(&ctx, &storage, "out.png").is_err(),
+            "the file is not there yet"
+        );
+
+        // The game writes the image: the write runs on the pool's worker.
+        let mut pool = engine::imagedecode::DecodePool::new(
+            Arc::new(WriteOnlyDecoder),
+            engine::jobpool::JobPoolConfig::default(),
+        )
+        .expect("start the pool");
+        {
+            let mut resolver = resource_state(&ctx);
+            resolver.set_codec(
+                |_bytes, _hint| Ok(DecodedImage::new(2, 2, vec![0; 16])),
+                |_bytes, _hint| {
+                    Ok(ImageInfo {
+                        width: 2,
+                        height: 2,
+                        has_alpha: true,
+                        format: None,
+                    })
+                },
+                {
+                    let dir = dir.clone();
+                    move |name, _type, _width, _height, _pixels| {
+                        std::fs::write(dir.join(name), b"image").map_err(|error| error.to_string())
+                    }
+                },
+            );
+            resolver
+                .submit_save(
+                    Some(&mut pool),
+                    "Out.PNG",
+                    "bmp",
+                    2,
+                    2,
+                    Arc::new(vec![0u8; 16]),
+                )
+                .expect("submit the write");
+        }
+
+        // The probe of the written name waits for the write, and the probe
+        // with the other spelling finds the file through the listing.
+        let written = resolve_image(&ctx, &storage, "Out.PNG").expect("the written image resolves");
+        assert_eq!(written.name(), "Out.PNG");
+        let spelled = resolve_image(&ctx, &storage, "out.png").expect("the image resolves");
+        assert_eq!(spelled.name(), "out.png");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

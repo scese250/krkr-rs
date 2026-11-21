@@ -68,6 +68,7 @@ use tjs::{
 
 use super::super::system::{resolve, set_string_out, value_as_i64};
 use crate::native_util::{args, report_error, set_int, set_void, value_as_string};
+use crate::natives::construct;
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -543,7 +544,7 @@ fn json_to_owned(engine: &Tjs2Engine, json: &Json) -> Result<TjsOwned, JsonError
         }
         Json::String(value) => TjsOwned::String(value.clone()),
         Json::Array(items) => {
-            let array = new_object(engine, "[]")?;
+            let array = construct::array(engine)?;
             for (index, item) in items.iter().enumerate() {
                 // `PropSetByNum(TJS_MEMBERENSURE)` in the reference: a void
                 // element (JSON null) is stored, it does not shift later ones.
@@ -553,7 +554,7 @@ fn json_to_owned(engine: &Tjs2Engine, json: &Json) -> Result<TjsOwned, JsonError
             TjsOwned::Object(array)
         }
         Json::Object(entries) => {
-            let dict = new_object(engine, "%[]")?;
+            let dict = construct::dictionary(engine)?;
             for (key, value) in entries {
                 let argument = json_to_owned(engine, value)?.to_argument(engine)?;
                 engine.set_member(dict.raw_id(), key, &argument)?;
@@ -561,16 +562,6 @@ fn json_to_owned(engine: &Tjs2Engine, json: &Json) -> Result<TjsOwned, JsonError
             TjsOwned::Object(dict)
         }
     })
-}
-
-/// Evaluate a TJS array/dictionary literal into a retained object.
-fn new_object(engine: &Tjs2Engine, expression: &str) -> Result<DetachedValue, JsonError> {
-    match engine.eval_retained(expression, "json")? {
-        RetainedValue::Object(object) => Ok(object),
-        RetainedValue::Value(value) => Err(JsonError::Engine(format!(
-            "{expression:?} did not evaluate to an object ({value:?})"
-        ))),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -644,7 +635,7 @@ fn enumerate_members(
     services: &CompatServices,
     target: &DetachedValue,
 ) -> Result<Vec<(String, TjsOwned)>, JsonError> {
-    let flat = new_object(engine, "[]")?;
+    let flat = construct::array(engine)?;
     let argument = {
         let duplicate = engine.duplicate_retained(target.raw_id())?;
         let id = duplicate.raw_id().as_ptr() as u64;

@@ -88,6 +88,7 @@ use tjs::{
 
 use crate::binding;
 use crate::native_util::{args, report_error, set_void};
+use crate::natives::construct;
 use crate::{CompatCtx, CompatError, CompatServices};
 
 /// The configuration script the reference reads from the application path.
@@ -588,13 +589,8 @@ fn apply_extraction_filter(
     buffer: &mut [u8],
     entry: &EntryContext,
 ) -> Result<(), String> {
-    let array = match engine.eval_retained("[]", "xp3_filter") {
-        Ok(RetainedValue::Object(array)) => array,
-        Ok(RetainedValue::Value(_)) => {
-            return Err("could not create the filter buffer".into());
-        }
-        Err(error) => return Err(error.to_string()),
-    };
+    let array = construct::array(engine)
+        .map_err(|error| format!("could not create the filter buffer: {error}"))?;
     for (index, byte) in buffer.iter().enumerate() {
         engine.set_member(
             array.raw_id(),
