@@ -21,12 +21,23 @@
 //! the log, so the run proves the route it drove: the page the route names
 //! is the page the run reached.
 //!
-//! The route has two clicks. The warm-up delivers the click in the middle of
-//! the screen, the click that moves the game's opening sequence along; it
-//! ends when the title page is up. The route then delivers the click that
-//! presses the title page's button, until the page that button loads has
-//! been loaded. The warm-up's click is not the button's place: the opening
-//! sequence does not move along for a click on the title page's menu.
+//! The route has four parts, and each is a part of the run the report names.
+//! The warm-up delivers the click in the middle of the screen, the click
+//! that moves the game's opening sequence along; it ends when the title
+//! page is up. The route then delivers the click that presses the title
+//! page's button, until the page that button loads has been loaded. The
+//! warm-up's click is not the button's place: the opening sequence does not
+//! move along for a click on the title page's menu. The story then runs:
+//! the click in the middle of the screen advances the text, and the run
+//! reports that part on its own, because the gameplay is the part the
+//! reader feels. The last part is the game's own fast-forward: the click
+//! that presses the quick menu's skip toggle, and then the story runs on
+//! its own.
+//!
+//! The report names every part: the startup, the title page, the gameplay
+//! and the fast-forward. A measurement of the whole run says little about
+//! the gameplay, because the startup's own pages and the one-off loads are
+//! in it; the gameplay's own distribution is the number a reader wants.
 //!
 //! The null backend runs headless and is the default: a measurement never
 //! opens a window. The Vulkan backend has two shapes. The headless one
@@ -49,6 +60,10 @@
 //! game-time period between the clicks. The click that presses the route's
 //! button is due once the title page is up, so the route follows the game
 //! rather than a clock.
+//!
+//! `--skip-at-frame N` is the frame the fast-forward begins on: the run
+//! presses the quick menu's skip toggle on that frame, and the story runs
+//! on its own from there.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -58,7 +73,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use app::{BackendKind, FrameTimeSource, GameHost, Host, HostConfig};
-use engine::PixelTranslation;
+use engine::{PixelTranslation, RenderPolicy};
 use log::{Log, Metadata, Record as LogRecord};
 use platform::{
     EventHandler, Flow, FramePacing, InputEvent, MouseButton, PlatformConfig, PlatformEvent,
@@ -113,6 +128,21 @@ const TITLE_SETTLE_MS: u64 = 300;
 
 /// The prefix the scenario parser writes when it loads a scenario.
 const SCENARIO_PREFIX: &str = "KAGParser: scenario loaded : ";
+
+/// The page the scenario's click glyph is loaded from.
+///
+/// The click glyph is the picture the scenario draws when it waits for the
+/// reader, so the load of the glyph is the marker that says the story is
+/// on screen and the reader is in control: the gameplay has begun.
+const CLICK_GLYPH: &str = "main/clickglyph.asd";
+
+/// The prefix the container plugin writes when it loads a story container.
+///
+/// The game's story is a container the plugin reads, and the load of the
+/// container and the build of its root are the two one-off costs of
+/// entering the story. The report names them, so the reader does not have
+/// to find them in the title segment.
+const CONTAINER_PREFIX: &str = "psb: the ";
 
 /// The prefix the slow-frame report writes.
 const SLOW_FRAME_PREFIX: &str = "app.frame: slow frame=";
@@ -282,9 +312,25 @@ struct ClickTarget {
 /// The click in the middle of the screen.
 ///
 /// The opening sequence moves along on a click in the middle of the screen,
-/// and the scenario's text advances on the same click. The route's warm-up
-/// delivers it.
+/// and the scenario's text advances on the same click: a click on the
+/// background advances the story, and the middle of the screen is away from
+/// the quick menu and the message window. The route's warm-up and the
+/// story's own advance both deliver it.
 const CENTRE_CLICK: ClickTarget = ClickTarget { x: 640.0, y: 360.0 };
+
+/// The click that presses the game's own skip.
+///
+/// The quick menu's skip toggle is the game's own fast-forward: the
+/// `uipsd/quickmenu.csv` layout puts the toggle in the screen band 690 to
+/// 720, 38 pixels wide at the left edge of the quick menu, and
+/// `main/quickmenu.func` binds it to `SystemAction.skip()`, which turns the
+/// scenario's own skip mode on. The run presses it and leaves the story to
+/// itself: the fast-forward is the game's, not a speed-up of the harness's
+/// clock.
+const SKIP_CLICK: ClickTarget = ClickTarget {
+    x: 1151.0,
+    y: 705.0,
+};
 
 /// The scene the run drives.
 ///
@@ -292,9 +338,13 @@ const CENTRE_CLICK: ClickTarget = ClickTarget { x: 640.0, y: 360.0 };
 /// screen; each of them opens another scene. The run drives one of them, so
 /// the run crosses a scene boundary — the case that costs the most in the
 /// game, and the one a text-advancing run never reaches.
+///
+/// The scenario is the game's story: the run presses the title page's start
+/// button, the button that loads the game's scenario entry, and then the
+/// story runs and the run advances it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scene {
-    /// The scenario: a click in the middle of the screen advances the text.
+    /// The story: the title page's start button, then the scenario's text.
     Scenario,
     /// The title page's settings button: it opens the settings page.
     Settings,
@@ -308,11 +358,19 @@ impl Scene {
     /// The title button the scene presses, `None` for the scenario scene.
     fn button(self) -> Option<&'static TitleButton> {
         match self {
-            Self::Scenario => None,
+            Self::Scenario => button_named("start2"),
             Self::Settings => button_named("system2"),
             Self::Extra => button_named("extra2"),
             Self::Load => button_named("load2"),
         }
+    }
+
+    /// Whether the scene drives the run into the story and keeps it there.
+    ///
+    /// The story is the one scene the run does not stop at: the run's goal
+    /// is the story's own page, and the run drives on from there.
+    fn is_story(self) -> bool {
+        matches!(self, Self::Scenario)
     }
 
     /// The click position of the scene, in the game's logical pixels.
@@ -357,11 +415,16 @@ type Records = Arc<Mutex<Vec<Captured>>>;
 
 /// The text of a record the run keeps, `None` for the records it does not.
 ///
-/// The two kinds are the scenario loads — the proof that a click reached the
-/// page it names — and the slow-frame reports, which name a frame's costs.
+/// The three kinds are the scenario loads — the proof that a click reached
+/// the page it names — the story container's own loads, the one-off costs of
+/// entering the story, and the slow-frame reports, which name a frame's
+/// costs.
 fn kept_text(record: &LogRecord<'_>) -> Option<String> {
     let message = record.args().to_string();
-    if message.starts_with(SCENARIO_PREFIX) || message.starts_with(SLOW_FRAME_PREFIX) {
+    if message.starts_with(SCENARIO_PREFIX)
+        || message.starts_with(SLOW_FRAME_PREFIX)
+        || message.starts_with(CONTAINER_PREFIX)
+    {
         Some(message)
     } else {
         None
@@ -373,12 +436,28 @@ fn scenario_of(text: &str) -> Option<&str> {
     text.strip_prefix(SCENARIO_PREFIX)
 }
 
+/// Whether a load record names the story's click glyph.
+///
+/// The glyph is the picture the scenario draws when it waits for the reader,
+/// so the load of the glyph says the story is on screen.
+fn is_click_glyph(text: &str) -> bool {
+    scenario_of(text).is_some_and(|page| page.ends_with(CLICK_GLYPH))
+}
+
 /// Whether a record is a slow-frame report.
 ///
 /// The report names the frame the gap spans, which is the frame before the
 /// one the report was written on.
 fn is_slow_frame(text: &str) -> bool {
     text.starts_with(SLOW_FRAME_PREFIX)
+}
+
+/// Whether a record is a story container's own load.
+///
+/// The container plugin writes the load of the container and the build of
+/// its root; the two are the one-off costs of entering the story.
+fn is_container_load(text: &str) -> bool {
+    text.starts_with(CONTAINER_PREFIX)
 }
 
 /// The logger the run installs.
@@ -419,14 +498,62 @@ impl Log for RunLogger {
 }
 
 /// The phase of the route.
+///
+/// The phase is what the run's clicks do; the segment is what the report
+/// names. They are two things because the story's own load sits between
+/// the title page and the gameplay: the run is already driving the story
+/// while the story is still loading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     /// The opening sequence is still running: the clicks move it along.
     Warmup,
     /// The title page is up: the clicks press the route's button.
-    Target,
+    Title,
+    /// The story is running: the clicks advance the text.
+    Story,
+    /// The story is running with the game's own skip on.
+    FastForward,
     /// The route is done: the run settles and stops.
     Done,
+}
+
+/// The part of the run a frame belongs to.
+///
+/// The parts are the ones a reader asks about: how the game starts, what
+/// the title page costs, how the gameplay behaves, and what the game's own
+/// fast-forward costs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Segment {
+    /// The game's opening: the startup sequence and the title page's load.
+    Startup,
+    /// The title page: the buttons, and the story's entry.
+    Title,
+    /// The story: the text the reader advances.
+    Gameplay,
+    /// The fast-forward: the story with the game's own skip on.
+    FastForward,
+}
+
+impl Segment {
+    /// The name the report gives the segment.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Title => "title",
+            Self::Gameplay => "gameplay",
+            Self::FastForward => "fast-forward",
+        }
+    }
+
+    /// Every segment, in the order the run drives them.
+    fn all() -> [Segment; 4] {
+        [
+            Segment::Startup,
+            Segment::Title,
+            Segment::Gameplay,
+            Segment::FastForward,
+        ]
+    }
 }
 
 /// The click schedule: when the next click is due.
@@ -471,13 +598,85 @@ impl Schedule {
     }
 }
 
+/// The markers the run reads out of the log.
+///
+/// The markers are found once, as the records arrive, and kept: the route
+/// asks the markers whether the title page is up, whether the page the
+/// route's button loads has been loaded, and whether the story is on
+/// screen.
+struct Markers {
+    /// The records the run kept.
+    records: Records,
+    /// The number of records the markers have looked at.
+    scanned: usize,
+    /// The frame the title page was loaded on.
+    title: Option<usize>,
+    /// The frame the route's page was loaded on.
+    target: Option<usize>,
+    /// The frame the story was on screen: the scenario waited for the reader.
+    story: Option<usize>,
+}
+
+impl Markers {
+    /// A set of markers that reads the run's records.
+    fn new(records: Records) -> Self {
+        Self {
+            records,
+            scanned: 0,
+            title: None,
+            target: None,
+            story: None,
+        }
+    }
+
+    /// Reads the records the run has written since the last look.
+    ///
+    /// The records are appended in order, so the markers read only the new
+    /// ones: a long run does not read the whole log on every frame.
+    fn scan(&mut self, title: &str, target: Option<&str>) {
+        let mut found_title = None;
+        let mut found_target = None;
+        let mut found_story = None;
+        {
+            let records = match self.records.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for record in records.iter().skip(self.scanned) {
+                if found_title.is_none() && scenario_of(&record.text) == Some(title) {
+                    found_title = Some(record.frame);
+                }
+                if found_target.is_none() && target == scenario_of(&record.text) {
+                    found_target = Some(record.frame);
+                }
+                if found_story.is_none() && is_click_glyph(&record.text) {
+                    found_story = Some(record.frame);
+                }
+            }
+            self.scanned = records.len();
+        }
+        if found_title.is_some() {
+            self.title = found_title;
+        }
+        if found_target.is_some() {
+            self.target = found_target;
+        }
+        if found_story.is_some() {
+            self.story = found_story;
+        }
+    }
+}
+
 /// The route the run drives: the clicks it delivers and the page that proves
 /// it.
 ///
-/// The run has two phases. The warm-up phase clicks in the middle of the
+/// The run has four phases. The warm-up phase clicks in the middle of the
 /// screen, the click that moves the game's opening sequence along; it ends
-/// when the title page is up. The route phase clicks the button the scene
-/// names, until the page that button loads has been loaded.
+/// when the title page is up. The title phase clicks the button the scene
+/// names, until the page that button loads has been loaded. The story phase
+/// clicks in the middle of the screen, the click that advances the text.
+/// The fast-forward phase presses the game's own skip toggle and then leaves
+/// the story to itself.
 struct Route {
     /// The page the route's button loads, `None` when the scene names none.
     target: Option<&'static str>,
@@ -485,7 +684,9 @@ struct Route {
     title: &'static str,
     /// The click the warm-up phase delivers: it moves the opening along.
     warmup_click: ClickTarget,
-    /// The click the route phase delivers: it presses the route's button.
+    /// The click the story phase delivers: it advances the text.
+    advance_click: ClickTarget,
+    /// The click the title phase delivers: it presses the route's button.
     target_click: ClickTarget,
     /// The phase the route is in.
     phase: Phase,
@@ -499,10 +700,16 @@ struct Route {
     started: bool,
     /// The wait between the title page's arrival and the route's first click.
     settle_ms: u64,
-    /// The records the run kept.
-    records: Records,
+    /// The markers the run reads out of the log.
+    markers: Markers,
     /// The frame the route's page was loaded on.
     reached: Option<usize>,
+    /// The frame the fast-forward begins on.
+    skip_at_frame: Option<usize>,
+    /// The click that presses the game's own skip.
+    skip_click: ClickTarget,
+    /// Whether the run drives on when the route's page has been loaded.
+    drives_on: bool,
 }
 
 impl Route {
@@ -518,12 +725,14 @@ impl Route {
         records: Records,
         schedule: Schedule,
         settle_ms: u64,
+        skip_at_frame: Option<usize>,
     ) -> Self {
         let target_click = explicit.unwrap_or_else(|| scene.target());
         Self {
             target: scene.target_script(),
             title: "title.ks",
             warmup_click: CENTRE_CLICK,
+            advance_click: CENTRE_CLICK,
             target_click,
             phase: Phase::Warmup,
             schedule,
@@ -531,59 +740,63 @@ impl Route {
             last_frame: 0,
             started: false,
             settle_ms,
-            records,
+            markers: Markers::new(records),
             reached: None,
+            skip_at_frame,
+            skip_click: SKIP_CLICK,
+            drives_on: scene.is_story(),
         }
-    }
-
-    /// The frame the named page was loaded on, `None` when it was not.
-    fn loaded_frame(&self, name: &str) -> Option<usize> {
-        let records = match self.records.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        records
-            .iter()
-            .find(|record| scenario_of(&record.text) == Some(name))
-            .map(|record| record.frame)
     }
 
     /// Moves the route to the phase the game is in.
     ///
-    /// The warm-up ends when the title page is up, and the route ends when
-    /// the page the route's button loads has been loaded. The route follows
-    /// the game rather than a clock, so a slow machine does not make the run
-    /// click a page that is not there yet.
+    /// The warm-up ends when the title page is up, and the title phase ends
+    /// when the page the route's button loads has been loaded. The route
+    /// follows the game rather than a clock, so a slow machine does not make
+    /// the run click a page that is not there yet.
     fn advance(&mut self, now_ms: u64, frame: usize) {
+        self.markers.scan(self.title, self.target);
         match self.phase {
             Phase::Warmup => {
-                if self.loaded_frame(self.title).is_some() {
-                    self.phase = Phase::Target;
+                if self.markers.title.is_some() {
+                    self.phase = Phase::Title;
                     self.started = false;
                     self.schedule.first_ms = now_ms.saturating_add(self.settle_ms);
                     self.last_ms = now_ms;
                     self.last_frame = frame;
                 }
             }
-            Phase::Target => {
-                if let Some(target) = self.target
-                    && let Some(loaded) = self.loaded_frame(target)
-                {
-                    self.phase = Phase::Done;
+            Phase::Title => {
+                if let Some(loaded) = self.markers.target {
                     self.reached = Some(loaded);
+                    self.phase = if self.drives_on {
+                        Phase::Story
+                    } else {
+                        Phase::Done
+                    };
                 }
             }
-            Phase::Done => {}
+            Phase::Story | Phase::FastForward | Phase::Done => {}
         }
     }
 
     /// The click this frame delivers, `None` when the frame delivers none.
     fn click(&mut self, now_ms: u64, frame: usize) -> Option<ClickTarget> {
         self.advance(now_ms, frame);
+        // The fast-forward: the click that presses the game's own skip. The
+        // story runs on its own from here: the run stops clicking, because
+        // a click is the game's own "skip the wait", and it would end the
+        // skip the segment measures.
+        if self.phase == Phase::Story && self.skip_at_frame.is_some_and(|skip_at| skip_at == frame)
+        {
+            self.phase = Phase::FastForward;
+            return Some(self.skip_click);
+        }
         let target = match self.phase {
             Phase::Warmup => self.warmup_click,
-            Phase::Target => self.target_click,
-            Phase::Done => return None,
+            Phase::Title => self.target_click,
+            Phase::Story => self.advance_click,
+            Phase::FastForward | Phase::Done => return None,
         };
         if !self
             .schedule
@@ -595,6 +808,26 @@ impl Route {
         self.last_ms = now_ms;
         self.last_frame = frame;
         Some(target)
+    }
+
+    /// The part of the run the frame belongs to.
+    ///
+    /// The gameplay begins when the story is on screen: the container's own
+    /// load and the build of its root are one-off costs, and they belong to
+    /// the part of the run that entered the story.
+    fn segment(&self) -> Segment {
+        match self.phase {
+            Phase::Warmup => Segment::Startup,
+            Phase::Title | Phase::Story => {
+                if self.markers.story.is_some() {
+                    Segment::Gameplay
+                } else {
+                    Segment::Title
+                }
+            }
+            Phase::FastForward => Segment::FastForward,
+            Phase::Done => Segment::Title,
+        }
     }
 
     /// Whether the route's page has been loaded.
@@ -628,12 +861,31 @@ struct Shared {
     polls: Vec<f64>,
     /// The frame index of each measured frame.
     indexes: Vec<usize>,
+    /// The part of the run each measured frame belongs to.
+    segments: Vec<Segment>,
+    /// The number of bitmaps the scene held at each frame.
+    ///
+    /// The scene's bitmaps are the game's own images, and the device keeps
+    /// a texture for each of them: the count is what says whether the
+    /// device's memory grows with the run.
+    bitmaps: Vec<u32>,
     /// The number of frames the engine presented.
     presented: u64,
     /// The clicks the run delivered.
     clicks: Vec<Click>,
     /// The failure that stopped the run.
     failure: Option<String>,
+}
+
+impl Shared {
+    /// The part of the run the frame belongs to.
+    ///
+    /// The frames are measured in order and the frame numbers are the
+    /// places in the series, so the frame's own number is its place in the
+    /// segment series.
+    fn segment_of(&self, frame: usize) -> Option<Segment> {
+        self.segments.get(frame).copied()
+    }
 }
 
 /// The run's own parameters: what is mounted, how long the run drives and
@@ -662,6 +914,26 @@ struct RunConfig {
     settle_ms: u64,
     /// The frame the run is on, as the logger sees it.
     frame_counter: Arc<AtomicUsize>,
+    /// The size of the surface the run draws into.
+    ///
+    /// The default is the game's logical screen, so the presentation mapping
+    /// is the identity. A size whose ratio to the logical screen is not one
+    /// gives the mapping a scale, and the run then exercises the path a
+    /// window on a scaled display takes.
+    surface_size: (u32, u32),
+    /// The rendering policy the host draws with.
+    policy: RenderPolicy,
+    /// The file the last frame is written to, when the run writes one.
+    dump: Option<PathBuf>,
+    /// The frame whose picture the run writes out.
+    dump_frame: Option<usize>,
+    /// The size the run tells the game its window has.
+    ///
+    /// A windowed run tells the game the window's size when the compositor
+    /// configures it, and the size it tells the game is the window's
+    /// physical size. The headless run has no window, so the option says
+    /// which size the game is told.
+    resize: Option<(u32, u32)>,
 }
 
 /// The harness: the game, the clock and the measurements.
@@ -674,6 +946,8 @@ struct Harness {
     frames: usize,
     /// The presentation budget the host is created with.
     presentation_budget: Duration,
+    /// The rendering policy the host draws with.
+    policy: RenderPolicy,
     /// The frame's clock source: the engine's clock reads it, and the
     /// frame's own delta is written into it before every frame.
     clock: Box<RunClock>,
@@ -712,17 +986,26 @@ impl Harness {
     }
 
     /// Records one frame's measurements.
-    fn record(&mut self, gap: f64, step_ms: f64, poll_ms: f64, presented: bool) {
+    fn record(&mut self, gap: f64, step_ms: f64, poll_ms: f64, presented: bool, segment: Segment) {
         let mut shared = self.shared.borrow_mut();
         shared.gaps.push(gap);
         shared.steps.push(step_ms);
         shared.polls.push(poll_ms);
         shared.indexes.push(self.index);
+        shared.segments.push(segment);
+        shared.bitmaps.push(self.bitmaps());
         if presented {
             shared.presented = shared.presented.saturating_add(1);
         }
         drop(shared);
         self.index = self.index.saturating_add(1);
+    }
+
+    /// The number of bitmaps the scene holds.
+    fn bitmaps(&self) -> u32 {
+        self.game
+            .as_ref()
+            .map_or(0, |game| game.host().scene().bitmaps.len() as u32)
     }
 }
 
@@ -777,6 +1060,7 @@ impl EventHandler for Harness {
         config.window_handle = Some(window_handle);
         config.display_handle = Some(display_handle);
         config.headless = false;
+        config.policy = self.policy;
         // The presentation budget bounds the wait for a swapchain image. An
         // unpaced run drives the frames faster than the display can hand them
         // out, so it needs a budget the display is not measured against; a
@@ -841,6 +1125,10 @@ impl EventHandler for Harness {
             }
             None => Vec::new(),
         };
+        // The part of the run this frame belongs to, read after the click:
+        // the click that presses the game's own skip opens the fast-forward,
+        // and that frame is the fast-forward's first.
+        let segment = self.route.segment();
         let Some(game) = self.game.as_mut() else {
             return Flow::Exit;
         };
@@ -859,12 +1147,14 @@ impl EventHandler for Harness {
             .last_end
             .map_or(0.0, |last| now.duration_since(last).as_secs_f64() * 1000.0);
         self.last_end = Some(now);
-        self.record(gap, step_ms, pacing.poll_ms, report.presented);
+        self.record(gap, step_ms, pacing.poll_ms, report.presented, segment);
         if self.index >= self.frames {
             return Flow::Exit;
         }
         // The route is done: the run settles for a moment and then stops.
-        if self.route.is_reached() {
+        // The story route drives on: its goal is the story's own page, and
+        // the run measures the story itself.
+        if self.route.is_reached() && !self.route.drives_on {
             let reached_at = self.reached_at.get_or_insert(now_ms);
             if now_ms.saturating_sub(*reached_at) >= self.settle_ms {
                 return Flow::Exit;
@@ -915,6 +1205,154 @@ fn report(name: &str, values: &[f64]) {
         "  the frames over 100 ms: {}",
         sorted.iter().filter(|value| **value > 100.0).count()
     );
+}
+
+/// The positions of the frames one segment holds.
+fn segment_positions(shared: &Shared, segment: Segment) -> Vec<usize> {
+    shared
+        .segments
+        .iter()
+        .enumerate()
+        .filter(|(_, part)| **part == segment)
+        .map(|(position, _)| position)
+        .collect()
+}
+
+/// Prints the distribution of one segment's frames.
+///
+/// The whole run's distribution says little about the gameplay: the
+/// startup's own pages and the story's one-off load are in it. The
+/// segment's own distribution is the number a reader wants.
+fn report_segment(shared: &Shared, segment: Segment) {
+    let positions = segment_positions(shared, segment);
+    if positions.is_empty() {
+        println!("the {} segment: no frames", segment.name());
+        return;
+    }
+    let gaps: Vec<f64> = positions
+        .iter()
+        .map(|position| shared.gaps[*position])
+        .collect();
+    let steps: Vec<f64> = positions
+        .iter()
+        .map(|position| shared.steps[*position])
+        .collect();
+    let first = shared.indexes[positions[0]];
+    let last = shared.indexes[*positions.last().expect("the segment has frames")];
+    println!(
+        "the {} segment: the frames {first} to {last}, {} frames",
+        segment.name(),
+        positions.len()
+    );
+    report(
+        &format!("the {} segment's frame gap", segment.name()),
+        &gaps,
+    );
+    report(
+        &format!("the {} segment's engine work", segment.name()),
+        &steps,
+    );
+}
+
+/// Prints the parts of the run: the frames each one holds and how far the
+/// story advanced in it.
+///
+/// The story waits for the reader: the click glyph is the picture the
+/// scenario draws then, so the count of the glyph's loads is the count of
+/// the reader's advances. The fast-forward does not wait — the story runs
+/// on — so there the story's own containers are the mark that it moved.
+fn report_segments(shared: &Shared, records: &[Captured]) {
+    println!("the parts of the run:");
+    for segment in Segment::all() {
+        let positions = segment_positions(shared, segment);
+        if positions.is_empty() {
+            println!("  {}: no frames", segment.name());
+            continue;
+        }
+        let first = shared.indexes[positions[0]];
+        let last = shared.indexes[*positions.last().expect("the segment has frames")];
+        let advances = records
+            .iter()
+            .filter(|record| is_click_glyph(&record.text))
+            .filter(|record| shared.segment_of(record.frame) == Some(segment))
+            .count();
+        let containers = records
+            .iter()
+            .filter(|record| is_container_load(&record.text))
+            .filter(|record| shared.segment_of(record.frame) == Some(segment))
+            .count();
+        println!(
+            "  {}: the frames {first} to {last}, {} frames, the reader's advances {advances}, \
+             the story's containers {containers}",
+            segment.name(),
+            positions.len()
+        );
+    }
+}
+
+/// Prints the story container's own loads.
+///
+/// The story is a container the plugin reads: the load of the container and
+/// the build of its root are the two one-off costs of entering the story,
+/// and they are in the part of the run that entered it, not in the
+/// gameplay.
+fn report_container_loads(records: &[Captured]) {
+    let mut loads = 0;
+    for record in records {
+        if is_container_load(&record.text) {
+            loads += 1;
+            println!("the story's container: {}", record.text);
+        }
+    }
+    if loads == 0 {
+        println!("the story's container: the run loaded no container");
+    }
+}
+
+/// The machine's load average, as the kernel reports it.
+///
+/// The load is what says whether the numbers are a measurement: a number
+/// taken while the machine was busy is not a result.
+///
+/// The file is not everywhere, so its absence is a `None`: a host without
+/// it has no load to report, and that is not a failure. A file that is
+/// there and does not parse is an error, not an absent file: the reader
+/// is told what the kernel wrote.
+fn load_average() -> Result<Option<(f64, f64, f64)>, String> {
+    let text = match std::fs::read_to_string("/proc/loadavg") {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read /proc/loadavg: {error}")),
+    };
+    let mut parts = text.split_whitespace();
+    let mut next = |name: &str| -> Result<f64, String> {
+        let value = parts
+            .next()
+            .ok_or_else(|| format!("/proc/loadavg names no {name}"))?;
+        value
+            .parse()
+            .map_err(|_| format!("/proc/loadavg names a {name} that is not a number: {value}"))
+    };
+    let one = next("one-minute load")?;
+    let five = next("five-minute load")?;
+    let fifteen = next("fifteen-minute load")?;
+    Ok(Some((one, five, fifteen)))
+}
+
+/// Prints the machine's load average.
+///
+/// The load is the machine's own account of how busy it was: a reader needs
+/// it to know whether the numbers beside it are a measurement. A host
+/// without the file has no load to report; a file the kernel wrote and the
+/// harness cannot read is reported as the error it is.
+fn report_load(when: &str) {
+    match load_average() {
+        Ok(Some((one, five, fifteen))) => {
+            println!("the load average {when}: {one:.2} {five:.2} {fifteen:.2}")
+        }
+        Ok(None) => println!("the load average {when}: the kernel did not report one"),
+        Err(error) => eprintln!("the load average {when}: {error}"),
+    }
 }
 
 /// The dominant cost a slow-frame report names, `None` when it names none.
@@ -1046,16 +1484,28 @@ fn run_offscreen(run: RunConfig, shared: Rc<RefCell<Shared>>, backend: BackendKi
         slow_frame_ms,
         settle_ms,
         frame_counter,
+        surface_size,
+        policy,
+        dump,
+        dump_frame,
+        resize,
     } = run;
     let mut clock = Box::new(RunClock::new());
+    // The click the route presses, and the picture the run dumps.
+    let target_click = route.target_click;
+    let mut dumped: Option<Vec<u8>> = None;
+    let mut dumped_frame: Option<usize> = None;
     let mut config = HostConfig::headless().with_backend(backend);
     if backend == BackendKind::Vulkan {
         // The Vulkan backend draws into a target of the surface size, and
         // the target is the size of the game's logical screen, so the
         // presentation mapping is the identity and a click in the game's
-        // logical pixels lands on the same device pixel.
-        config = config.with_surface_size(HEADLESS_SURFACE_SIZE);
+        // logical pixels lands on the same device pixel. A surface of
+        // another size gives the mapping a scale, and the run then
+        // exercises the path a window on a scaled display takes.
+        config = config.with_surface_size(surface_size);
     }
+    config = config.with_policy(policy);
     // The frame period is the cadence the loop paces at, and it is the
     // budget a frame may spend waiting for the display. A headless host has
     // no display, so the budget is never spent.
@@ -1102,17 +1552,66 @@ fn run_offscreen(run: RunConfig, shared: Rc<RefCell<Shared>>, backend: BackendKi
         frame_counter.store(frame, Ordering::Relaxed);
         // No click is due this frame: the frame delivers no event.
         let translation = game.host().translation();
-        let events = match route.click(now_ms, frame) {
+        let mut frame_events = Vec::new();
+        // The window's size, as the compositor reports it: the game learns
+        // its window's size from the event, and the size is the window's
+        // physical size.
+        if let Some((width, height)) = resize
+            && frame == 0
+        {
+            frame_events.push(PlatformEvent::Resized(width, height));
+        }
+        let click = match route.click(now_ms, frame) {
             Some(target) => {
+                // The picture the click is pressed on: the frame before the
+                // click lands is the last frame of the page the button is
+                // on, so the dump shows the button where the picture drew
+                // it.
+                if dump.is_some() && dump_frame.is_none() && target == target_click {
+                    dumped = game.host().read_offscreen_frame().ok().flatten();
+                    dumped_frame = Some(frame);
+                }
                 let (events, click) = click_events(frame, target, translation);
                 shared.borrow_mut().clicks.push(click);
+                // The mapping the picture is drawn with: the projected tree's
+                // root transform, against the mapping the click is taken
+                // back through.
+                if let Some(translation) = translation {
+                    let scene = game.host().render_scene();
+                    let root = scene.node(scene.root);
+                    let transform = root.map(|node| node.transform);
+                    println!(
+                        "the click at frame {frame}: the mapping scale={:.3} offset=({:.1}, {:.1}) \
+                         vm={}x{} device={}x{}; the picture's root transform {:?}",
+                        translation.scale,
+                        translation.offset.0,
+                        translation.offset.1,
+                        translation.vm_size.0,
+                        translation.vm_size.1,
+                        translation.device_size.0,
+                        translation.device_size.1,
+                        transform
+                    );
+                }
                 events
             }
             None => Vec::new(),
         };
+        frame_events.extend(click);
+        let events = frame_events;
+        // The part of the run this frame belongs to, read after the click:
+        // the click that presses the game's own skip opens the fast-forward,
+        // and that frame is the fast-forward's first.
+        let segment = route.segment();
         let started = Instant::now();
         let outcome = game.step(clock.as_ref(), &events);
         let step_ms = started.elapsed().as_secs_f64() * 1000.0;
+        // The picture of a frame the command line names, so the run can show
+        // what the game drew at a chosen moment.
+        if dump_frame == Some(frame) {
+            dumped = game.host().read_offscreen_frame().ok().flatten();
+            dumped_frame = Some(frame);
+        }
         let report = match outcome {
             Ok(report) => report,
             Err(error) => {
@@ -1131,16 +1630,78 @@ fn run_offscreen(run: RunConfig, shared: Rc<RefCell<Shared>>, backend: BackendKi
         shared.steps.push(step_ms);
         shared.polls.push(0.0);
         shared.indexes.push(frame);
+        shared.segments.push(segment);
+        shared
+            .bitmaps
+            .push(game.host().scene().bitmaps.len() as u32);
         if report.presented {
             shared.presented = shared.presented.saturating_add(1);
         }
         drop(shared);
         // The route is done: the run settles for a moment and then stops.
-        if route.is_reached() {
+        // The story route drives on: its goal is the story's own page, and
+        // the run measures the story itself.
+        if route.is_reached() && !route.drives_on {
             let reached = reached_at.get_or_insert(now_ms);
             if now_ms.saturating_sub(*reached) >= settle_ms {
                 break;
             }
+        }
+    }
+    // The mapping the run drew and clicked with: the scale and the offset
+    // the picture and the click share.
+    if let Some(translation) = game.host().translation() {
+        println!(
+            "the mapping: vm={}x{} device={}x{} scale={:.3} offset=({:.1}, {:.1})",
+            translation.vm_size.0,
+            translation.vm_size.1,
+            translation.device_size.0,
+            translation.device_size.1,
+            translation.scale,
+            translation.offset.0,
+            translation.offset.1
+        );
+    }
+    // The picture the run drew: the frame the host's target holds, written
+    // out so the place the button is drawn at can be looked at.
+    if let Some(path) = dump {
+        let media = media::Media::new();
+        // The last frame the run drew, beside the frame the click landed on.
+        let last = game.host().read_offscreen_frame().ok().flatten();
+        if let Some(pixels) = &last {
+            let raw = path.with_extension("last.raw");
+            if let Err(error) = std::fs::write(&raw, pixels) {
+                eprintln!("cannot write {}: {error}", raw.display());
+            }
+        }
+        match dumped {
+            Some(pixels) => {
+                let width = surface_size.0;
+                let height = surface_size.1;
+                // The raw pixels beside the picture: the raw file is what a
+                // measurement reads, and the picture is what a person looks
+                // at.
+                let raw = path.with_extension("raw");
+                if let Err(error) = std::fs::write(&raw, &pixels) {
+                    eprintln!("cannot write {}: {error}", raw.display());
+                }
+                match media::encode_image(&media, width, height, &pixels, "png") {
+                    Ok(bytes) => {
+                        if let Err(error) = std::fs::write(&path, bytes) {
+                            eprintln!("cannot write {}: {error}", path.display());
+                        }
+                    }
+                    Err(error) => eprintln!("cannot encode the frame: {error}"),
+                }
+                println!(
+                    "the dump: {} frame={} size={}x{}",
+                    path.display(),
+                    dumped_frame.unwrap_or(0),
+                    width,
+                    height
+                );
+            }
+            None => eprintln!("the host read no frame"),
         }
     }
 }
@@ -1164,6 +1725,63 @@ where
         },
         None => default,
     }
+}
+
+/// Why a size the command line named is not one.
+///
+/// The three cases are three different mistakes: a name that is not a size,
+/// a dimension that is not a number, and a dimension that is zero. The
+/// error carries the name, so the reader is told what to fix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SizeError {
+    /// The name does not have the `WIDTHxHEIGHT` shape.
+    NotASize(String),
+    /// A dimension of the name is not a number.
+    NotANumber(String),
+    /// A dimension of the name is zero: a surface with no pixels has no
+    /// picture.
+    ZeroDimension(String),
+}
+
+impl std::fmt::Display for SizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotASize(value) => {
+                write!(formatter, "the size is not WIDTHxHEIGHT: {value}")
+            }
+            Self::NotANumber(value) => {
+                write!(
+                    formatter,
+                    "a dimension of the size is not a number: {value}"
+                )
+            }
+            Self::ZeroDimension(value) => {
+                write!(formatter, "a dimension of the size is zero: {value}")
+            }
+        }
+    }
+}
+
+/// Reads a `WIDTHxHEIGHT` size.
+///
+/// A malformed size is an error the caller reports, with the name the
+/// command line gave: the reader is told which of the three mistakes it
+/// is. A zero dimension is not the same mistake as a malformed one, and
+/// the error says which is which.
+fn parse_size(value: &str) -> Result<(u32, u32), SizeError> {
+    let Some((width, height)) = value.split_once(['x', 'X']) else {
+        return Err(SizeError::NotASize(value.to_owned()));
+    };
+    let width: u32 = width
+        .parse()
+        .map_err(|_| SizeError::NotANumber(value.to_owned()))?;
+    let height: u32 = height
+        .parse()
+        .map_err(|_| SizeError::NotANumber(value.to_owned()))?;
+    if width == 0 || height == 0 {
+        return Err(SizeError::ZeroDimension(value.to_owned()));
+    }
+    Ok((width, height))
 }
 
 fn main() {
@@ -1190,6 +1808,12 @@ fn main() {
     let mut vm_report = false;
     let mut vulkan = false;
     let mut headless = false;
+    let mut surface_size = HEADLESS_SURFACE_SIZE;
+    let mut policy = RenderPolicy::default();
+    let mut dump: Option<PathBuf> = None;
+    let mut dump_frame: Option<usize> = None;
+    let mut resize: Option<(u32, u32)> = None;
+    let mut skip_at_frame: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1277,6 +1901,55 @@ fn main() {
                 };
             }
             "--headless" => headless = true,
+            "--surface" => {
+                let value = match args.next() {
+                    Some(value) => value,
+                    None => {
+                        eprintln!("--surface needs a value");
+                        std::process::exit(2);
+                    }
+                };
+                match parse_size(&value) {
+                    Ok(size) => surface_size = size,
+                    Err(error) => {
+                        eprintln!("--surface: {error}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--native-resolution" => policy = RenderPolicy::NativeResolution,
+            "--skip-at-frame" => {
+                skip_at_frame = Some(number(&mut args, "the fast-forward frame", 0));
+            }
+            "--dump-frame" => {
+                dump_frame = Some(number(&mut args, "the frame to dump", 0));
+            }
+            "--resize" => {
+                let value = match args.next() {
+                    Some(value) => value,
+                    None => {
+                        eprintln!("--resize needs a value");
+                        std::process::exit(2);
+                    }
+                };
+                match parse_size(&value) {
+                    Ok(size) => resize = Some(size),
+                    Err(error) => {
+                        eprintln!("--resize: {error}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--dump" => {
+                let value = match args.next() {
+                    Some(value) => value,
+                    None => {
+                        eprintln!("--dump needs a value");
+                        std::process::exit(2);
+                    }
+                };
+                dump = Some(PathBuf::from(value));
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(2);
@@ -1319,6 +1992,9 @@ fn main() {
     log::set_boxed_logger(Box::new(run_logger)).expect("the logger is installed once");
     log::set_max_level(max_level);
     let shared = Rc::new(RefCell::new(Shared::default()));
+    // The load the machine carries before the run: a reader needs it to
+    // know whether the numbers the run produced are a measurement.
+    report_load("before the run");
     // The click the command line names, if it names one.
     let explicit = match (click_x, click_y) {
         (Some(x), Some(y)) => Some(ClickTarget { x, y }),
@@ -1338,7 +2014,14 @@ fn main() {
         first_frame: first_click,
         period_frames: click_frames,
     };
-    let route = Route::new(scene, explicit, Arc::clone(&records), schedule, settle_ms);
+    let route = Route::new(
+        scene,
+        explicit,
+        Arc::clone(&records),
+        schedule,
+        settle_ms,
+        skip_at_frame,
+    );
     let run = RunConfig {
         archives,
         base_dir: dir,
@@ -1350,17 +2033,23 @@ fn main() {
         slow_frame_ms: slow_frame_ms as f64,
         settle_ms,
         frame_counter: Arc::clone(&frame_counter),
+        surface_size,
+        policy,
+        dump,
+        dump_frame,
+        resize,
     };
     if vulkan && !headless {
         let mut config = PlatformConfig::default();
         config.title = "krkr-rs (vulkan)".to_owned();
-        config.size = (1280, 720);
+        config.size = surface_size;
         config.frame_interval = run.interval;
         let harness = Harness {
             archives: run.archives,
             base_dir: run.base_dir,
             frames: run.frames,
             presentation_budget,
+            policy: run.policy,
             clock: Box::new(RunClock::new()),
             cumulative: run.cumulative,
             frame_delay_ms: run.frame_delay_ms,
@@ -1394,7 +2083,6 @@ fn main() {
     let shared = shared.borrow();
     if let Some(failure) = &shared.failure {
         eprintln!("krkr: {failure}");
-        std::process::exit(1);
     }
     println!("the backend: {}", if vulkan { "vulkan" } else { "null" });
     println!(
@@ -1433,7 +2121,24 @@ fn main() {
         "the warm-up click: ({}, {}) in the game's logical pixels",
         CENTRE_CLICK.x, CENTRE_CLICK.y
     );
+    match skip_at_frame {
+        Some(frame) => println!(
+            "the fast-forward: the skip click at frame {frame}, at ({}, {}) in the game's \
+             logical pixels",
+            SKIP_CLICK.x, SKIP_CLICK.y
+        ),
+        None => println!("the fast-forward: the run drives no fast-forward"),
+    }
     println!("the frame delay: {frame_delay_ms} ms");
+    println!("the surface: {}x{}", surface_size.0, surface_size.1);
+    println!(
+        "the policy: {}",
+        if policy == RenderPolicy::NativeResolution {
+            "native resolution"
+        } else {
+            "reference"
+        }
+    );
     println!(
         "the clock: {}",
         if cumulative {
@@ -1445,6 +2150,17 @@ fn main() {
     println!("the frames: {}", shared.gaps.len());
     println!("the frames presented: {}", shared.presented);
     println!("the clicks: {}", shared.clicks.len());
+    // The scene's bitmaps: the game's own images, each of which the device
+    // keeps a texture for.
+    match (shared.bitmaps.first(), shared.bitmaps.last()) {
+        (Some(first), Some(last)) => {
+            println!("the scene's bitmaps: {first} at the first frame, {last} at the last")
+        }
+        _ => println!("the scene's bitmaps: the run measured no frame"),
+    }
+    // The load the machine carries after the run: the numbers above are a
+    // measurement only when the machine was quiet.
+    report_load("after the run");
     // The first gap spans the first frame, the way the null harness's first
     // gap does; the distribution is the frames after it.
     let startup = shared.gaps.first().copied().unwrap_or(0.0);
@@ -1455,13 +2171,24 @@ fn main() {
         shared.steps.get(1..).unwrap_or(&[]),
     );
     report("the platform's wait", shared.polls.get(1..).unwrap_or(&[]));
-    if vm_report {
-        println!("{}", app::vm_report(&compat::compile_stats()));
-    }
-    let kept = match records.lock() {
+    // The records the run kept: the pages it loaded, the slow frames it
+    // reported and the story container's own loads.
+    let kept_records = match records.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     };
+    // The parts of the run: the startup, the title page, the gameplay and
+    // the fast-forward. The gameplay's own distribution is the number a
+    // reader wants; the whole run's says little about it.
+    report_segments(&shared, &kept_records);
+    for segment in Segment::all() {
+        report_segment(&shared, segment);
+    }
+    report_container_loads(&kept_records);
+    if vm_report {
+        println!("{}", app::vm_report(&compat::compile_stats()));
+    }
+    let kept = kept_records;
     report_route(&shared, &kept, scene);
     report_dominant_costs(&kept);
     // The slowest frames: the frames the run spent its time in.
@@ -1487,5 +2214,11 @@ fn main() {
             "the frames over {threshold:.1} ms: {} ({sum:.1} ms in total)",
             over.len()
         );
+    }
+    // The report is printed even when the run failed: the frames the run
+    // measured before the failure are the measurement, and the failure says
+    // where it ended.
+    if shared.failure.is_some() {
+        std::process::exit(1);
     }
 }
