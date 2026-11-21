@@ -14,7 +14,7 @@ use engine::layer_ops::{
     gaussian_blur, operate_rect, render_layer_subtree, stretch_blit, tile_rect,
 };
 use engine::raster::fill_rect_replace;
-use engine::scene::{Rect, TransitionFrame, TransitionSource};
+use engine::scene::Rect;
 use engine::trans::Trans;
 
 fn bitmap(width: u32, height: u32, rgba: Vec<u8>) -> BitmapState {
@@ -1525,7 +1525,7 @@ fn a_stretch_copy_marks_only_the_destination_rectangle() {
     );
 }
 
-/// A whole-subtree transition's tick changes the transition's own frame, not
+/// A whole-subtree transition's tick changes the transition's own draw, not
 /// the pixels of its endpoints: the endpoints' composites stay valid, and the
 /// step reads them as they are.
 ///
@@ -1594,65 +1594,42 @@ fn a_transition_tick_keeps_the_endpoint_composites() {
     let source_region = scene.layer_content_region(source);
     let parent_region = scene.layer_content_region(parent);
 
-    // The first tick's frame.
-    let frame = TransitionFrame::new(
-        (8, 8),
-        true,
-        TransitionSource::new(
-            dest_content,
-            Rect::new(0, 0, 8, 8),
-            Rect::new(0, 0, 8, 8),
-            1.0,
-        ),
-        TransitionSource::new(
-            source_content,
-            Rect::new(0, 0, 8, 8),
-            Rect::new(0, 0, 8, 8),
-            0.5,
-        ),
-    );
-    scene.set_transition_frame(dest, Some(frame));
+    // The first tick's draw: the transition's pass over the two endpoints.
+    let mut trans = Trans::cross_fade(100.0).expect("crossfade");
+    trans.seek_ms(50.0);
+    let draw = trans
+        .effect_draw(dest_content, source_content, (8, 8), true)
+        .expect("the crossfade draws");
+    scene.set_effect(dest, Some(draw));
     assert_eq!(
         scene.layer_content_region(dest),
         dest_region,
-        "the frame marks no region"
+        "the draw marks no region"
     );
     assert_eq!(
         scene.layer_content_region(source),
         source_region,
-        "the frame marks no region in the other endpoint either"
+        "the draw marks no region in the other endpoint either"
     );
     assert_eq!(
         scene.layer_content_region(parent),
         parent_region,
-        "the frame marks no region in the caching ancestors either"
+        "the draw marks no region in the caching ancestors either"
     );
 
-    // The next tick's frame is a new display of the same content.
-    let next = TransitionFrame::new(
-        (8, 8),
-        true,
-        TransitionSource::new(
-            dest_content,
-            Rect::new(0, 0, 8, 8),
-            Rect::new(0, 0, 8, 8),
-            1.0,
-        ),
-        TransitionSource::new(
-            source_content,
-            Rect::new(0, 0, 8, 8),
-            Rect::new(0, 0, 8, 8),
-            0.25,
-        ),
-    );
-    scene.set_transition_frame(dest, Some(next));
+    // The next tick's draw is a new display of the same content.
+    trans.seek_ms(75.0);
+    let next = trans
+        .effect_draw(dest_content, source_content, (8, 8), true)
+        .expect("the crossfade draws");
+    scene.set_effect(dest, Some(next));
     assert_eq!(
         scene.layer_content_region(dest),
         dest_region,
-        "the next frame marks no region either"
+        "the next draw marks no region either"
     );
 
-    // The endpoints' composites are still the ones the frame samples.
+    // The endpoints' composites are still the ones the draw samples.
     let dest_again = render_layer_subtree(&mut scene, dest).expect("the destination content");
     let source_again = render_layer_subtree(&mut scene, source).expect("the source content");
     assert_eq!(

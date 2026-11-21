@@ -532,6 +532,81 @@ fn dim_i32(v: u32) -> i32 {
     v.min(i32::MAX as u32) as i32
 }
 
+/// The number of bytes one row of a clipped rectangle holds.
+///
+/// The rectangle comes from [`intersect`], so it lies inside the bitmap's
+/// own bounds and every one of its rows holds the same number of bytes.
+fn row_bytes(rect: RectI) -> Option<usize> {
+    let width = i64::from(rect.2).checked_sub(i64::from(rect.0))?;
+    let width = usize::try_from(width).ok()?;
+    width.checked_mul(4)
+}
+
+/// Walks the rows of a clipped rectangle of a bitmap and hands each row's
+/// bytes to the operation.
+///
+/// A row is the rectangle's own columns of the bitmap's row, as a byte
+/// slice. The operation reads and writes the bytes alone: no pixel offset is
+/// computed and no bounds are checked per pixel.
+///
+/// The rectangle comes from [`intersect`], so it lies inside the bitmap's
+/// own bounds and every row of it holds [`row_bytes`] bytes.
+fn walk_rows(bitmap: &mut BitmapState, rect: RectI, mut row: impl FnMut(&mut [u8])) {
+    let Some(bytes) = row_bytes(rect) else {
+        return;
+    };
+    let Some(pitch) = usize::try_from(bitmap.width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+    else {
+        return;
+    };
+    let Some(left) = usize::try_from(rect.0)
+        .ok()
+        .and_then(|column| column.checked_mul(4))
+    else {
+        return;
+    };
+    for y in rect.1..rect.3 {
+        let Ok(index) = usize::try_from(y) else {
+            continue;
+        };
+        let Some(start) = index
+            .checked_mul(pitch)
+            .and_then(|row| row.checked_add(left))
+        else {
+            continue;
+        };
+        let Some(end) = start.checked_add(bytes) else {
+            continue;
+        };
+        let Some(destination) = bitmap.rgba.get_mut(start..end) else {
+            continue;
+        };
+        row(destination);
+    }
+}
+
+/// Fills a clipped rectangle with one constant pixel.
+///
+/// The constant is one pixel repeated, so a row of the rectangle is one
+/// pattern and the fill copies that pattern into every row: a canvas-wide
+/// fill runs at the copy's speed and not at the per-pixel store's.
+fn fill_constant(bitmap: &mut BitmapState, rect: RectI, rgba: [u8; 4]) {
+    let Some(bytes) = row_bytes(rect) else {
+        return;
+    };
+    let mut pattern = vec![0u8; bytes];
+    for pixel in pattern.as_chunks_mut::<4>().0 {
+        pixel.copy_from_slice(&rgba);
+    }
+    walk_rows(bitmap, rect, |row| {
+        // The pattern holds one row of the rectangle's pixels, and the row
+        // holds the same number of bytes, so the copy fills it exactly.
+        row.copy_from_slice(&pattern);
+    });
+}
+
 /// `FillColorOnAlpha`: source-over a constant color that **considers the
 /// destination alpha**.
 ///
@@ -549,38 +624,33 @@ pub fn fill_color_on_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 4]
     if !pixels_usable(bitmap, "fillColorOnAlpha") {
         return;
     }
-    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+    let Some(clipped) = intersect(bitmap, rect) else {
         return;
     };
     if opa >= 255 {
-        let rgba = [color[0], color[1], color[2], 255];
-        for y in y0..y1 {
-            for x in x0..x1 {
-                write_pixel(bitmap, x, y, rgba);
+        // The full opacity is one constant pixel over the whole rectangle.
+        fill_constant(bitmap, clipped, [color[0], color[1], color[2], 255]);
+    } else {
+        let opa = opa as u8;
+        let tables = blend_tables();
+        walk_rows(bitmap, clipped, |row| {
+            for pixel in row.as_chunks_mut::<4>().0 {
+                let d = [pixel[0], pixel[1], pixel[2], pixel[3]];
+                let index = (usize::from(opa) << 8) | usize::from(d[3]);
+                let alpha = tables.opacity_on_opacity[index];
+                let out_a = tables.negative_mul[index];
+                let mut out = [0u8; 4];
+                for c in 0..3 {
+                    out[c] = blend_channel(d[c], color[c], alpha);
+                }
+                out[3] = out_a;
+                pixel.copy_from_slice(&out);
             }
-        }
-        // The fill wrote the clipped rectangle alone, so the upload needs
-        // that rectangle and not the whole bitmap.
-        bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
-        return;
+        });
     }
-    let opa = opa as u8;
-    let tables = blend_tables();
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let d = read_pixel(bitmap, x, y);
-            let index = (usize::from(opa) << 8) | usize::from(d[3]);
-            let alpha = tables.opacity_on_opacity[index];
-            let out_a = tables.negative_mul[index];
-            let mut out = [0u8; 4];
-            for c in 0..3 {
-                out[c] = blend_channel(d[c], color[c], alpha);
-            }
-            out[3] = out_a;
-            write_pixel(bitmap, x, y, out);
-        }
-    }
-    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    // The operation wrote the clipped rectangle alone, so the upload needs
+    // that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
 /// Saturating per-channel addition of packed 8-bit values (four lanes packed
@@ -605,54 +675,44 @@ pub fn fill_color_on_add_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8
     if !pixels_usable(bitmap, "fillColorOnAddAlpha") {
         return;
     }
-    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+    let Some(clipped) = intersect(bitmap, rect) else {
         return;
     };
     if opa >= 255 {
-        let rgba = [color[0], color[1], color[2], 255];
-        for y in y0..y1 {
-            for x in x0..x1 {
-                write_pixel(bitmap, x, y, rgba);
-            }
-        }
-        // The fill wrote the clipped rectangle alone, so the upload needs
-        // that rectangle and not the whole bitmap.
-        bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
-        return;
-    }
-    let opa = opa.min(255) as u32;
-    // Scale each RGB channel by `(channel * opa) >> 8`.
-    let src = (((color[0] as u32 * opa) >> 8) << 16)
-        | (((color[1] as u32 * opa) >> 8) << 8)
-        | ((color[2] as u32 * opa) >> 8);
-    let opa_inv = opa ^ 0xff;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let d = read_pixel(bitmap, x, y);
-            let mut dest = (u32::from(d[3]) << 24)
-                | (u32::from(d[0]) << 16)
-                | (u32::from(d[1]) << 8)
-                | u32::from(d[2]);
-            let mut dopa = dest >> 24;
-            dopa = dopa + opa - ((dopa * opa) >> 8);
-            dopa -= dopa >> 8;
-            let scaled = ((((dest & 0x00ff_00ff) * opa_inv) >> 8) & 0x00ff_00ff)
-                + ((((dest & 0x0000_ff00) * opa_inv) >> 8) & 0x0000_ff00);
-            dest = (dopa << 24) + saturated_add(scaled, src);
-            write_pixel(
-                bitmap,
-                x,
-                y,
-                [
+        // The full opacity is one constant pixel over the whole rectangle.
+        fill_constant(bitmap, clipped, [color[0], color[1], color[2], 255]);
+    } else {
+        let opa = opa.min(255) as u32;
+        // Scale each RGB channel by `(channel * opa) >> 8`.
+        let src = (((color[0] as u32 * opa) >> 8) << 16)
+            | (((color[1] as u32 * opa) >> 8) << 8)
+            | ((color[2] as u32 * opa) >> 8);
+        let opa_inv = opa ^ 0xff;
+        walk_rows(bitmap, clipped, |row| {
+            for pixel in row.as_chunks_mut::<4>().0 {
+                let d = [pixel[0], pixel[1], pixel[2], pixel[3]];
+                let mut dest = (u32::from(d[3]) << 24)
+                    | (u32::from(d[0]) << 16)
+                    | (u32::from(d[1]) << 8)
+                    | u32::from(d[2]);
+                let mut dopa = dest >> 24;
+                dopa = dopa + opa - ((dopa * opa) >> 8);
+                dopa -= dopa >> 8;
+                let scaled = ((((dest & 0x00ff_00ff) * opa_inv) >> 8) & 0x00ff_00ff)
+                    + ((((dest & 0x0000_ff00) * opa_inv) >> 8) & 0x0000_ff00);
+                dest = (dopa << 24) + saturated_add(scaled, src);
+                pixel.copy_from_slice(&[
                     ((dest >> 16) & 0xff) as u8,
                     ((dest >> 8) & 0xff) as u8,
                     (dest & 0xff) as u8,
                     ((dest >> 24) & 0xff) as u8,
-                ],
-            );
-        }
+                ]);
+            }
+        });
     }
-    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    // The operation wrote the clipped rectangle alone, so the upload needs
+    // that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
 /// `FillColor`: set the RGB to `color` while **holding the destination
@@ -665,13 +725,13 @@ pub fn fill_color_hold_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 
     if !pixels_usable(bitmap, "fillColor") {
         return;
     }
-    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+    let Some(clipped) = intersect(bitmap, rect) else {
         return;
     };
     let opa = opa.min(255) as u32;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let mut d = read_pixel(bitmap, x, y);
+    walk_rows(bitmap, clipped, |row| {
+        for pixel in row.as_chunks_mut::<4>().0 {
+            let mut d = [pixel[0], pixel[1], pixel[2], pixel[3]];
             if opa == 255 {
                 d[0] = color[0];
                 d[1] = color[1];
@@ -683,10 +743,12 @@ pub fn fill_color_hold_alpha(bitmap: &mut BitmapState, rect: RectI, color: [u8; 
                         (((u32::from(d[c]) * inv + u32::from(color[c]) * opa) >> 8) & 0xff) as u8;
                 }
             }
-            write_pixel(bitmap, x, y, d);
+            pixel.copy_from_slice(&d);
         }
-    }
-    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    });
+    // The operation wrote the clipped rectangle alone, so the upload needs
+    // that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
 /// `FillMask`: replace the alpha channel with `value`, holding the RGB. In
@@ -695,17 +757,17 @@ pub fn fill_mask(bitmap: &mut BitmapState, rect: RectI, value: u8) {
     if !pixels_usable(bitmap, "fillMask") {
         return;
     }
-    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+    let Some(clipped) = intersect(bitmap, rect) else {
         return;
     };
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let mut d = read_pixel(bitmap, x, y);
-            d[3] = value;
-            write_pixel(bitmap, x, y, d);
+    walk_rows(bitmap, clipped, |row| {
+        for pixel in row.as_chunks_mut::<4>().0 {
+            pixel[3] = value;
         }
-    }
-    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    });
+    // The operation wrote the clipped rectangle alone, so the upload needs
+    // that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
 /// `RemoveConstOpacity`: multiply the alpha by `255 - level` and keep the
@@ -719,18 +781,19 @@ pub fn remove_const_opacity(bitmap: &mut BitmapState, rect: RectI, level: i32) {
     if !pixels_usable(bitmap, "removeConstOpacity") {
         return;
     }
-    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+    let Some(clipped) = intersect(bitmap, rect) else {
         return;
     };
     let strength = 255 - level.min(255) as u32;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let mut d = read_pixel(bitmap, x, y);
-            d[3] = ((u32::from(d[3]) * strength) & 0xff) as u8;
-            write_pixel(bitmap, x, y, d);
+    walk_rows(bitmap, clipped, |row| {
+        for pixel in row.as_chunks_mut::<4>().0 {
+            let alpha = (u32::from(pixel[3]) * strength) & 0xff;
+            pixel[3] = alpha as u8;
         }
-    }
-    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    });
+    // The operation wrote the clipped rectangle alone, so the upload needs
+    // that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
 /// RGB → HSL with the byte ranges used by `layerExImage` (`H`, `S`, `L`
@@ -813,16 +876,16 @@ pub fn colorize(bitmap: &mut BitmapState, rect: RectI, hue: i32, sat: i32, blend
     if !pixels_usable(bitmap, "colorize") {
         return;
     }
-    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+    let Some(clipped) = intersect(bitmap, rect) else {
         return;
     };
     let blend = blend.clamp(0.0, 1.0);
     let a0 = (256.0 * blend) as i32;
     let a1 = 256 - a0;
     let full = blend > 0.999;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let mut p = read_pixel(bitmap, x, y);
+    walk_rows(bitmap, clipped, |row| {
+        for pixel in row.as_chunks_mut::<4>().0 {
+            let mut p = [pixel[0], pixel[1], pixel[2], pixel[3]];
             if full {
                 let (_, _, l) = rgb_to_hsl(p[0], p[1], p[2]);
                 let (r, g, b) = hsl_to_rgb(hue as u8, sat as u8, l);
@@ -836,10 +899,12 @@ pub fn colorize(bitmap: &mut BitmapState, rect: RectI, hue: i32, sat: i32, blend
                 p[1] = ((i32::from(hg) * a0 + i32::from(p[1]) * a1) >> 8) as u8;
                 p[2] = ((i32::from(hb) * a0 + i32::from(p[2]) * a1) >> 8) as u8;
             }
-            write_pixel(bitmap, x, y, p);
+            pixel.copy_from_slice(&p);
         }
-    }
-    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    });
+    // The operation wrote the clipped rectangle alone, so the upload needs
+    // that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
 /// A tiny deterministic xorshift PRNG. The caller supplies the seed and owns
@@ -880,21 +945,23 @@ pub fn noise(bitmap: &mut BitmapState, rect: RectI, level: i32, seed: u64) {
     if !pixels_usable(bitmap, "noise") {
         return;
     }
-    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+    let Some(clipped) = intersect(bitmap, rect) else {
         return;
     };
     let mut rng = NoiseRng(mix64(seed));
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let mut p = read_pixel(bitmap, x, y);
+    walk_rows(bitmap, clipped, |row| {
+        for pixel in row.as_chunks_mut::<4>().0 {
+            let mut p = [pixel[0], pixel[1], pixel[2], pixel[3]];
             for channel in p.iter_mut().take(3) {
                 let n = ((rng.next_f32() - 0.5) * level as f32) as i32;
                 *channel = (i32::from(*channel) + n).clamp(0, 255) as u8;
             }
-            write_pixel(bitmap, x, y, p);
+            pixel.copy_from_slice(&p);
         }
-    }
-    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    });
+    // The operation wrote the clipped rectangle alone, so the upload needs
+    // that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
 /// `CopyRect(dx, dy, src, sx, sy, sw, sh)` — copy a source region
@@ -2005,21 +2072,22 @@ pub fn do_gray_scale(bitmap: &mut BitmapState, rect: RectI) {
     if !pixels_usable(bitmap, "doGrayScale") {
         return;
     }
-    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+    let Some(clipped) = intersect(bitmap, rect) else {
         return;
     };
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let mut d = read_pixel(bitmap, x, y);
+    walk_rows(bitmap, clipped, |row| {
+        for pixel in row.as_chunks_mut::<4>().0 {
             let gray =
-                ((19 * u32::from(d[0]) + 183 * u32::from(d[1]) + 54 * u32::from(d[2])) >> 8) as u8;
-            d[0] = gray;
-            d[1] = gray;
-            d[2] = gray;
-            write_pixel(bitmap, x, y, d);
+                ((19 * u32::from(pixel[0]) + 183 * u32::from(pixel[1]) + 54 * u32::from(pixel[2]))
+                    >> 8) as u8;
+            pixel[0] = gray;
+            pixel[1] = gray;
+            pixel[2] = gray;
         }
-    }
-    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    });
+    // The operation wrote the clipped rectangle alone, so the upload needs
+    // that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
 /// Per-channel gamma adjustment (R/G/B gamma, floor, ceil).
@@ -2081,25 +2149,25 @@ pub fn adjust_gamma(bitmap: &mut BitmapState, rect: RectI, data: GammaAdjust) {
     if !pixels_usable(bitmap, "adjustGamma") {
         return;
     }
-    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+    let Some(clipped) = intersect(bitmap, rect) else {
         return;
     };
     let r = gamma_table(data.r_gamma, data.r_floor, data.r_ceil);
     let g = gamma_table(data.g_gamma, data.g_floor, data.g_ceil);
     let b = gamma_table(data.b_gamma, data.b_floor, data.b_ceil);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let mut d = read_pixel(bitmap, x, y);
-            if d[3] == 0 {
+    walk_rows(bitmap, clipped, |row| {
+        for pixel in row.as_chunks_mut::<4>().0 {
+            if pixel[3] == 0 {
                 continue;
             }
-            d[0] = r[d[0] as usize];
-            d[1] = g[d[1] as usize];
-            d[2] = b[d[2] as usize];
-            write_pixel(bitmap, x, y, d);
+            pixel[0] = r[pixel[0] as usize];
+            pixel[1] = g[pixel[1] as usize];
+            pixel[2] = b[pixel[2] as usize];
         }
-    }
-    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    });
+    // The operation wrote the clipped rectangle alone, so the upload needs
+    // that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
 // ---------------------------------------------------------------------------
@@ -2113,7 +2181,7 @@ pub fn light_contrast(bitmap: &mut BitmapState, rect: RectI, brightness: i32, co
     if !pixels_usable(bitmap, "lightContrast") {
         return;
     }
-    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+    let Some(clipped) = intersect(bitmap, rect) else {
         return;
     };
     let c = contrast.clamp(-255, 255);
@@ -2126,18 +2194,18 @@ pub fn light_contrast(bitmap: &mut BitmapState, rect: RectI, brightness: i32, co
     } else {
         (259.0 * (c as f64 + 255.0)) / (255.0 * (259.0 - c as f64))
     };
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let mut d = read_pixel(bitmap, x, y);
-            for channel in d.iter_mut().take(3) {
+    walk_rows(bitmap, clipped, |row| {
+        for pixel in row.as_chunks_mut::<4>().0 {
+            for channel in pixel.iter_mut().take(3) {
                 let bright = (i32::from(*channel) + brightness).clamp(0, 255);
                 let out = factor * (bright as f64 - 128.0) + 128.0;
                 *channel = out.clamp(0.0, 255.0) as u8;
             }
-            write_pixel(bitmap, x, y, d);
         }
-    }
-    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    });
+    // The operation wrote the clipped rectangle alone, so the upload needs
+    // that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
 /// `ConvertAlphaToAddAlpha`: premultiply RGB by alpha (`(c * a) >> 8`),
@@ -2146,20 +2214,20 @@ pub fn convert_alpha_to_add_alpha(bitmap: &mut BitmapState, rect: RectI) {
     if !pixels_usable(bitmap, "convertAlphaToAddAlpha") {
         return;
     }
-    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+    let Some(clipped) = intersect(bitmap, rect) else {
         return;
     };
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let mut d = read_pixel(bitmap, x, y);
-            let a = u32::from(d[3]);
-            for channel in d.iter_mut().take(3) {
+    walk_rows(bitmap, clipped, |row| {
+        for pixel in row.as_chunks_mut::<4>().0 {
+            let a = u32::from(pixel[3]);
+            for channel in pixel.iter_mut().take(3) {
                 *channel = ((u32::from(*channel) * a) >> 8) as u8;
             }
-            write_pixel(bitmap, x, y, d);
         }
-    }
-    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    });
+    // The operation wrote the clipped rectangle alone, so the upload needs
+    // that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
 /// `ConvertAddAlphaToAlpha`: unpremultiply RGB (`c * 255 / a` clamped to
@@ -2168,29 +2236,29 @@ pub fn convert_add_alpha_to_alpha(bitmap: &mut BitmapState, rect: RectI) {
     if !pixels_usable(bitmap, "convertAddAlphaToAlpha") {
         return;
     }
-    let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+    let Some(clipped) = intersect(bitmap, rect) else {
         return;
     };
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let mut d = read_pixel(bitmap, x, y);
-            let a = u32::from(d[3]);
+    walk_rows(bitmap, clipped, |row| {
+        for pixel in row.as_chunks_mut::<4>().0 {
+            let a = u32::from(pixel[3]);
             if a == 0 {
-                d[0] = 0;
-                d[1] = 0;
-                d[2] = 0;
+                pixel[0] = 0;
+                pixel[1] = 0;
+                pixel[2] = 0;
             } else {
-                for channel in d.iter_mut().take(3) {
+                for channel in pixel.iter_mut().take(3) {
                     *channel = (u32::from(*channel) * 255)
                         .checked_div(a)
                         .unwrap_or(0)
                         .min(255) as u8;
                 }
             }
-            write_pixel(bitmap, x, y, d);
         }
-    }
-    bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    });
+    // The operation wrote the clipped rectangle alone, so the upload needs
+    // that rectangle and not the whole bitmap.
+    bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
 /// `Copy9Patch`: scale a source bitmap into the destination using a 9-slice
@@ -3481,8 +3549,12 @@ fn const_alpha_blend(destination: u32, source: u32, opa: u32) -> u32 {
 
 /// The constant-alpha blend on an alpha destination: the destination's alpha
 /// takes part in the mix and is written back.
-fn const_alpha_blend_on_alpha(destination: u32, source: u32, opa: u32) -> u32 {
-    let tables = blend_tables();
+fn const_alpha_blend_on_alpha(
+    destination: u32,
+    source: u32,
+    opa: u32,
+    tables: &BlendTables,
+) -> u32 {
     let index = (opa << 8) + (destination >> 24);
     let alpha = u32::from(tables.opacity_on_opacity[index as usize]);
     let mut d1 = destination & 0x00ff_00ff;
@@ -3517,8 +3589,7 @@ fn alpha_blend_keep_alpha(destination: u32, source: u32, opa: u32) -> u32 {
 
 /// The alpha blend on an alpha destination: the destination's alpha takes
 /// part in the mix and is written back.
-fn alpha_blend_on_alpha(destination: u32, source: u32, opa: u32) -> u32 {
-    let tables = blend_tables();
+fn alpha_blend_on_alpha(destination: u32, source: u32, opa: u32, tables: &BlendTables) -> u32 {
     let index = if opa == 255 {
         ((source >> 16) & 0xff00) + (destination >> 24)
     } else {
@@ -3607,29 +3678,30 @@ fn mul_faded(destination: u32, source: u32, opa: u32) -> u32 {
 
 /// The reciprocal the colour dodge reads: `65536 / i`, and 65536 at the zero
 /// index.
-fn reciprocal(index: u8) -> u32 {
-    blend_tables().reciprocal[usize::from(index)]
+fn reciprocal(tables: &BlendTables, index: u8) -> u32 {
+    tables.reciprocal[usize::from(index)]
 }
 
 /// The colour-dodge blend: the destination scaled by the reciprocal of the
 /// source's complement.
-fn dodge(destination: u32, source: u32) -> u32 {
+fn dodge(destination: u32, source: u32, tables: &BlendTables) -> u32 {
     let complement = !source;
-    let mut tmp =
-        (destination & 0x0000_00ff).wrapping_mul(reciprocal((complement & 0xff) as u8)) >> 8;
+    let mut tmp = (destination & 0x0000_00ff)
+        .wrapping_mul(reciprocal(tables, (complement & 0xff) as u8))
+        >> 8;
     let mut result = (tmp | below_limit(tmp, 0x100)) & 0x0000_00ff;
     tmp = ((destination & 0x0000_ff00) >> 8)
-        .wrapping_mul(reciprocal(((complement & 0xff00) >> 8) as u8));
+        .wrapping_mul(reciprocal(tables, ((complement & 0xff00) >> 8) as u8));
     result |= (tmp | below_limit(tmp, 0x10000)) & 0x0000_ff00;
     tmp = ((destination & 0x00ff_0000) >> 16)
-        .wrapping_mul(reciprocal(((complement & 0xff0000) >> 16) as u8));
+        .wrapping_mul(reciprocal(tables, ((complement & 0xff0000) >> 16) as u8));
     result |= ((tmp | below_limit(tmp, 0x10000)) & 0x0000_ff00) << 8;
     result
 }
 
 /// The colour-dodge blend with the source faded by the opacity.
-fn dodge_faded(destination: u32, source: u32, opa: u32) -> u32 {
-    dodge(destination, fade_colour(source, opa))
+fn dodge_faded(destination: u32, source: u32, opa: u32, tables: &BlendTables) -> u32 {
+    dodge(destination, fade_colour(source, opa), tables)
 }
 
 /// The darken blend: the smaller of the two colour lanes.
@@ -3702,9 +3774,13 @@ fn screen_faded(destination: u32, source: u32, opa: u32) -> u32 {
 ///
 /// The arithmetic is the mode's own; a row loop that runs it is
 /// monomorphized over the mode.
+///
+/// The blend tables the arithmetic reads are a pass constant: the row
+/// resolves them once and hands them to every pixel, so a pixel does not
+/// fetch them again.
 trait ModeArithmetic {
     /// Blends `source` into `pixel` in place.
-    fn blend(pixel: &mut [u8; 4], source: [u8; 4], opa: u8);
+    fn blend(pixel: &mut [u8; 4], source: [u8; 4], opa: u8, tables: &BlendTables);
 }
 
 /// One straight-alpha RGBA pixel.
@@ -3725,8 +3801,8 @@ macro_rules! mode_arithmetic {
                 pub struct $variant;
 
                 impl super::ModeArithmetic for $variant {
-                    fn blend(pixel: &mut [u8; 4], source: [u8; 4], opa: u8) {
-                        ($body)(pixel, source, opa)
+                    fn blend(pixel: &mut [u8; 4], source: [u8; 4], opa: u8, tables: &BlendTables) {
+                        ($body)(pixel, source, opa, tables)
                     }
                 }
             )*
@@ -3780,97 +3856,99 @@ macro_rules! mode_arithmetic {
 mode_arithmetic! {
     // The plain source-over works on the straight-alpha bytes, not on the
     // word, so it writes the pixel itself.
-    SourceOver => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    SourceOver => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         blend_pixel_at(pixel, source, 255, opa);
     },
     // The plain source-over with the destination's alpha held.
-    SourceOverHold => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    SourceOverHold => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         let alpha = pixel[3];
         blend_pixel_at(pixel, source, 255, opa);
         pixel[3] = alpha;
     },
-    Copy => |pixel: &mut Pixel, source: Pixel, _opa: u8| {
+    Copy => |pixel: &mut Pixel, source: Pixel, _opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(argb_word(source));
     },
-    CopyColor => |pixel: &mut Pixel, source: Pixel, _opa: u8| {
+    CopyColor => |pixel: &mut Pixel, source: Pixel, _opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(
             (argb_word(*pixel) & 0xff00_0000).wrapping_add(argb_word(source) & 0x00ff_ffff),
         );
     },
-    CopyOpaque => |pixel: &mut Pixel, source: Pixel, _opa: u8| {
+    CopyOpaque => |pixel: &mut Pixel, source: Pixel, _opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(0xff00_0000 | argb_word(source));
     },
-    ConstAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    ConstAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(const_alpha_blend(
             argb_word(*pixel),
             argb_word(source),
             u32::from(opa),
         ));
     },
-    ConstAlphaOnAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    ConstAlphaOnAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8, tables: &BlendTables| {
         *pixel = word_pixel(const_alpha_blend_on_alpha(
             argb_word(*pixel),
             argb_word(source),
             u32::from(opa),
+            tables,
         ));
     },
-    ConstAlphaOnAddAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    ConstAlphaOnAddAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(const_alpha_blend_on_add_alpha(
             argb_word(*pixel),
             argb_word(source),
             u32::from(opa),
         ));
     },
-    Alpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    Alpha => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(alpha_blend_keep_alpha(
             argb_word(*pixel),
             argb_word(source),
             u32::from(opa),
         ));
     },
-    AlphaOnAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    AlphaOnAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8, tables: &BlendTables| {
         *pixel = word_pixel(alpha_blend_on_alpha(
             argb_word(*pixel),
             argb_word(source),
             u32::from(opa),
+            tables,
         ));
     },
-    AlphaOnAddAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    AlphaOnAddAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(alpha_blend_on_add_alpha(
             argb_word(*pixel),
             argb_word(source),
             u32::from(opa),
         ));
     },
-    AddAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    AddAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(add_alpha(
             argb_word(*pixel),
             argb_word(source),
             u32::from(opa),
         ));
     },
-    AddAlphaOnAddAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    AddAlphaOnAddAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(add_alpha_on_add_alpha(
             argb_word(*pixel),
             argb_word(source),
             u32::from(opa),
         ));
     },
-    Add => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    Add => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(add(
             argb_word(*pixel),
             argb_word(source),
             u32::from(opa),
         ));
     },
-    Sub => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    Sub => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(sub(
             argb_word(*pixel),
             argb_word(source),
             u32::from(opa),
         ));
     },
-    Mul => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    Mul => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         let result = if opa == 255 {
             mul(argb_word(*pixel), argb_word(source))
         } else {
@@ -3878,7 +3956,7 @@ mode_arithmetic! {
         };
         *pixel = word_pixel(result);
     },
-    MulHoldAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    MulHoldAlpha => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         let result = if opa == 255 {
             mul(argb_word(*pixel), argb_word(source))
         } else {
@@ -3886,15 +3964,15 @@ mode_arithmetic! {
         };
         *pixel = word_pixel(hold_alpha(result, argb_word(*pixel)));
     },
-    Dodge => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    Dodge => |pixel: &mut Pixel, source: Pixel, opa: u8, tables: &BlendTables| {
         let result = if opa == 255 {
-            dodge(argb_word(*pixel), argb_word(source))
+            dodge(argb_word(*pixel), argb_word(source), tables)
         } else {
-            dodge_faded(argb_word(*pixel), argb_word(source), u32::from(opa))
+            dodge_faded(argb_word(*pixel), argb_word(source), u32::from(opa), tables)
         };
         *pixel = word_pixel(hold_alpha(result, argb_word(*pixel)));
     },
-    Darken => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    Darken => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         let result = if opa == 255 {
             darken(argb_word(*pixel), argb_word(source))
         } else {
@@ -3902,7 +3980,7 @@ mode_arithmetic! {
         };
         *pixel = word_pixel(hold_alpha(result, argb_word(*pixel)));
     },
-    Lighten => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    Lighten => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         let result = if opa == 255 {
             lighten(argb_word(*pixel), argb_word(source))
         } else {
@@ -3910,7 +3988,7 @@ mode_arithmetic! {
         };
         *pixel = word_pixel(hold_alpha(result, argb_word(*pixel)));
     },
-    Screen => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    Screen => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         let result = if opa == 255 {
             screen(argb_word(*pixel), argb_word(source))
         } else {
@@ -3920,112 +3998,112 @@ mode_arithmetic! {
     },
     // The Photoshop family keeps the destination's alpha and comes from
     // the render pipeline's shared table of per-channel functions.
-    PsNormal => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsNormal => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::NORMAL.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsAdditive => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsAdditive => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::ADDITIVE.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsSubtractive => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsSubtractive => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::SUBTRACTIVE.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsMultiplicative => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsMultiplicative => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::MULTIPLICATIVE.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsScreen => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsScreen => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::SCREEN.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsOverlay => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsOverlay => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::OVERLAY.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsHardLight => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsHardLight => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::HARD_LIGHT.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsSoftLight => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsSoftLight => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::SOFT_LIGHT.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsColorDodge => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsColorDodge => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::COLOR_DODGE.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsColorDodge5 => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsColorDodge5 => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::COLOR_DODGE5.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsColorBurn => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsColorBurn => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::COLOR_BURN.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsLighten => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsLighten => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::LIGHTEN.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsDarken => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsDarken => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::DARKEN.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsDifference => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsDifference => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::DIFFERENCE.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsDifference5 => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsDifference5 => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::DIFFERENCE5.blend_word(
             argb_word(*pixel),
             argb_word(source),
             opa,
         ));
     },
-    PsExclusion => |pixel: &mut Pixel, source: Pixel, opa: u8| {
+    PsExclusion => |pixel: &mut Pixel, source: Pixel, opa: u8, _tables: &BlendTables| {
         *pixel = word_pixel(PhotoshopBlend::EXCLUSION.blend_word(
             argb_word(*pixel),
             argb_word(source),
@@ -4044,8 +4122,11 @@ fn blend_row_pixels<K: ModeArithmetic>(
     source: &mut impl Iterator<Item = Option<[u8; 4]>>,
     destination: &mut [[u8; 4]],
 ) {
+    // The blend tables are the row's constant: the row resolves them once
+    // and every pixel reads them from there.
+    let tables = blend_tables();
     for (destination, source) in row_pairs(source, destination) {
-        K::blend(destination, source, opa);
+        K::blend(destination, source, opa, tables);
     }
 }
 
@@ -4059,8 +4140,11 @@ fn blend_row_values_pixels<K: ModeArithmetic>(
     source: &mut impl Iterator<Item = [u8; 4]>,
     destination: &mut [[u8; 4]],
 ) {
+    // The blend tables are the row's constant: the row resolves them once
+    // and every pixel reads them from there.
+    let tables = blend_tables();
     for (destination, source) in destination.iter_mut().zip(source) {
-        blend_value::<K>(destination, source, opa);
+        blend_value::<K>(destination, source, opa, tables);
     }
 }
 
@@ -4071,8 +4155,13 @@ fn blend_row_values_pixels<K: ModeArithmetic>(
 /// does, so the blend stays a call there. A row that only blends keeps the
 /// arithmetic inline.
 #[inline(never)]
-fn blend_value<K: ModeArithmetic>(pixel: &mut [u8; 4], source: [u8; 4], opa: u8) {
-    K::blend(pixel, source, opa);
+fn blend_value<K: ModeArithmetic>(
+    pixel: &mut [u8; 4],
+    source: [u8; 4],
+    opa: u8,
+    tables: &BlendTables,
+) {
+    K::blend(pixel, source, opa, tables);
 }
 
 /// The pairs of a row: each destination pixel and the source colour that
@@ -6307,9 +6396,6 @@ fn render_layer_subtree_at(scene: &mut Scene, root: u32, depth: usize) -> Option
     if !pixels_usable(content_bitmap, "renderLayerSubtree") {
         return None;
     }
-    // The window's paint order, read once: the composite and the region walk
-    // share it instead of rebuilding it for every layer.
-    let order = scene.window_layer_order(window);
     // A new content is empty, so the whole area is what has to be drawn.
     let region = if fresh {
         Some(Rect::new(0, 0, w, h))
@@ -6318,10 +6404,15 @@ fn render_layer_subtree_at(scene: &mut Scene, root: u32, depth: usize) -> Option
     };
     let Some(region) = region else {
         // The content is current: the region is empty and the cached bitmap
-        // is left untouched.
+        // is left untouched. Nothing is drawn, so the window's paint order is
+        // not read: the transition's tick asks for the same endpoints every
+        // frame, and a frame that changes nothing must cost nothing.
         let _ = scene.take_layer_content_region(root);
         return Some(content);
     };
+    // The window's paint order, read once: the composite and the region walk
+    // share it instead of rebuilding it for every layer.
+    let order = scene.window_layer_order(window);
     // The descendants whose caches are stale are completed first: a parent
     // asks the child for its cache, and the child rebuilds the stale part of
     // it and hands it over. A stale cache is never drawn live.
@@ -6991,12 +7082,16 @@ mod tests {
             ModeKernel::CopyColor => (destination & 0xff00_0000).wrapping_add(source & 0x00ff_ffff),
             ModeKernel::CopyOpaque => 0xff00_0000 | source,
             ModeKernel::ConstAlpha => const_alpha_blend(destination, source, opa),
-            ModeKernel::ConstAlphaOnAlpha => const_alpha_blend_on_alpha(destination, source, opa),
+            ModeKernel::ConstAlphaOnAlpha => {
+                const_alpha_blend_on_alpha(destination, source, opa, blend_tables())
+            }
             ModeKernel::ConstAlphaOnAddAlpha => {
                 const_alpha_blend_on_add_alpha(destination, source, opa)
             }
             ModeKernel::Alpha => alpha_blend_keep_alpha(destination, source, opa),
-            ModeKernel::AlphaOnAlpha => alpha_blend_on_alpha(destination, source, opa),
+            ModeKernel::AlphaOnAlpha => {
+                alpha_blend_on_alpha(destination, source, opa, blend_tables())
+            }
             ModeKernel::AlphaOnAddAlpha => alpha_blend_on_add_alpha(destination, source, opa),
             ModeKernel::AddAlpha => add_alpha(destination, source, opa),
             ModeKernel::AddAlphaOnAddAlpha => add_alpha_on_add_alpha(destination, source, opa),
@@ -7019,9 +7114,12 @@ mod tests {
             }
             ModeKernel::Dodge => {
                 if opa == 255 {
-                    hold_alpha(dodge(destination, source), destination)
+                    hold_alpha(dodge(destination, source, blend_tables()), destination)
                 } else {
-                    hold_alpha(dodge_faded(destination, source, opa), destination)
+                    hold_alpha(
+                        dodge_faded(destination, source, opa, blend_tables()),
+                        destination,
+                    )
                 }
             }
             ModeKernel::Darken => {
@@ -7927,5 +8025,75 @@ mod tests {
             },
         );
         assert_eq!(listed.rgba, called.rgba);
+    }
+
+    /// The per-pixel fill the row walk replaced: every pixel is read and
+    /// written through the bitmap's accessors.
+    ///
+    /// The arithmetic is the pre-change implementation, kept here as the
+    /// oracle the row walk is proved against.
+    fn fill_color_on_alpha_pixel_loop(
+        bitmap: &mut BitmapState,
+        rect: RectI,
+        color: [u8; 4],
+        opa: i32,
+    ) {
+        let Some((x0, y0, x1, y1)) = intersect(bitmap, rect) else {
+            return;
+        };
+        if opa >= 255 {
+            let rgba = [color[0], color[1], color[2], 255];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    write_pixel(bitmap, x, y, rgba);
+                }
+            }
+        } else {
+            let opa = opa as u8;
+            let tables = blend_tables();
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let d = read_pixel(bitmap, x, y);
+                    let index = (usize::from(opa) << 8) | usize::from(d[3]);
+                    let alpha = tables.opacity_on_opacity[index];
+                    let out_a = tables.negative_mul[index];
+                    let mut out = [0u8; 4];
+                    for c in 0..3 {
+                        out[c] = blend_channel(d[c], color[c], alpha);
+                    }
+                    out[3] = out_a;
+                    write_pixel(bitmap, x, y, out);
+                }
+            }
+        }
+        bitmap.mark_dirty_rect(clipped_region((x0, y0, x1, y1)));
+    }
+
+    /// The row walk writes the same pixels as the per-pixel walk.
+    ///
+    /// The rectangle hangs over the bitmap's edges, so the clipped
+    /// rectangle is exercised too, and the plain fill and the blended fill
+    /// are both covered.
+    #[test]
+    fn the_row_walk_writes_the_same_pixels_as_the_per_pixel_walk() {
+        let mut source = BitmapState::new(16, 12, vec![0u8; 16 * 12 * 4]);
+        for (index, pixel) in source.rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            pixel[0] = (index * 13 % 251) as u8;
+            pixel[1] = (index * 7 % 241) as u8;
+            pixel[2] = (index * 3 % 239) as u8;
+            pixel[3] = (index * 17 % 256) as u8;
+        }
+        let rect = (-3, -2, 11, 9);
+        for opa in [255, 128, 1] {
+            let mut walked = source.clone();
+            let mut looped = source.clone();
+            fill_color_on_alpha(&mut walked, rect, [40, 80, 120, 200], opa);
+            fill_color_on_alpha_pixel_loop(&mut looped, rect, [40, 80, 120, 200], opa);
+            assert_eq!(walked.rgba, looped.rgba, "the pixels differ at opa={opa}");
+            assert_eq!(
+                walked.dirty_region, looped.dirty_region,
+                "the dirty region differs at opa={opa}"
+            );
+        }
     }
 }
