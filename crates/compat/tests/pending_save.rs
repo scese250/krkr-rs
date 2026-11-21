@@ -68,7 +68,8 @@ enum Save {
 struct Env {
     _host: CompatHost,
     engine: Box<Tjs2Engine>,
-    scene: Box<Scene>,
+    /// Kept alive for the host raw pointer; never read directly.
+    _scene: Box<Scene>,
     /// Kept alive for the host's raw pointer; never read directly.
     _storage: Box<Storage>,
     /// Kept alive for the host's raw pointer; never read directly.
@@ -147,7 +148,7 @@ impl Env {
         Env {
             _host: host,
             engine,
-            scene,
+            _scene: scene,
             _storage: storage,
             _pool: pool,
             _game_dir: game_dir,

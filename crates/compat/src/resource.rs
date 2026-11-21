@@ -165,10 +165,10 @@ pub fn flush_pending_writes(ctx: &CompatCtx) -> Result<(), String> {
     names.sort();
     let mut failure = None;
     for name in names {
-        if let Err(error) = await_pending_write(ctx, &name) {
-            if failure.is_none() {
-                failure = Some(error);
-            }
+        if let Err(error) = await_pending_write(ctx, &name)
+            && failure.is_none()
+        {
+            failure = Some(error);
         }
     }
     match failure {
@@ -394,9 +394,7 @@ impl ResourceResolver {
     /// job. The failure of the write that is waited for is returned, so a
     /// reader of the name sees the first failure and not only the last one.
     fn await_previous_save(&mut self, name: &str) -> Option<String> {
-        let Some(pending) = self.pending_saves.remove(name) else {
-            return None;
-        };
+        let pending = self.pending_saves.remove(name)?;
         pending.job.demand();
         match pending.job.await_ready() {
             JobOutcome::Failed(message) => Some(message),
