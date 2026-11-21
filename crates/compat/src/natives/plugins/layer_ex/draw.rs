@@ -2320,7 +2320,11 @@ extern "C" fn save_record(
     match fs::write(&file_system, &FsPath::host(lookup), &encode_record(&ops)) {
         Ok(()) => set_bool(out, true),
         Err(error) => {
-            return report_error(out_error, &format!("Layer.saveRecord: {error}"));
+            // The recording could not be written: the engine names the reason
+            // in the log and answers `false`, so the script sees no
+            // exception and the game keeps running.
+            log::warn!("compat.layer: Layer.saveRecord: {error}");
+            set_bool(out, false);
         }
     }
     0
@@ -2354,11 +2358,24 @@ extern "C" fn load_record(
     let file_system = fs::FileSystem::host("");
     let bytes = match fs::read(&file_system, &FsPath::host(lookup)) {
         Ok(bytes) => bytes,
-        Err(error) => return report_error(out_error, &format!("Layer.loadRecord: {error}")),
+        Err(error) => {
+            // The recording could not be read: the engine names the reason in
+            // the log and answers `false`, so the script sees no exception
+            // and the game keeps running.
+            log::warn!("compat.layer: Layer.loadRecord: {error}");
+            set_bool(out, false);
+            return 0;
+        }
     };
     let ops = match decode_record(&bytes) {
         Ok(ops) => ops,
-        Err(error) => return report_error(out_error, &format!("Layer.loadRecord: {error}")),
+        Err(error) => {
+            // The file holds no recording this engine can read: the engine
+            // names the reason in the log and answers `false`.
+            log::warn!("compat.layer: Layer.loadRecord: {error}");
+            set_bool(out, false);
+            return 0;
+        }
     };
     {
         let mut state = draw_state(&ctx);

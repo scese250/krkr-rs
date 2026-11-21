@@ -145,9 +145,22 @@ fn value_string(v: &Value) -> String {
 // Core operations
 // ---------------------------------------------------------------------------
 
+/// The movie could not be opened.
+///
+/// The engine names the reason in the log and returns: the script sees no
+/// exception, the layer keeps the size it had, and the movie stays closed.
+/// The layer's own playback commands then skip, as they do for a movie that
+/// was never opened.
+fn movie_not_opened(reason: &str) {
+    log::warn!("compat.layer: Layer.openMovie: {reason}");
+}
+
 /// Reference `layerExMovie::openMovie`: open the stream metadata, size the
 /// layer, set its type, install the decoded audio track on the shared mixer
 /// and enter the stopped state.
+///
+/// A movie that cannot be opened is not an error the script sees: the engine
+/// names the reason in the log and returns, and the layer keeps its size.
 fn open_movie(ctx: &CompatCtx, layer_id: u32, filename: &str, alpha: bool) -> Result<(), String> {
     // SAFETY: the caller holds a live, bound context.
     let services = unsafe { ctx.services() };
@@ -156,15 +169,28 @@ fn open_movie(ctx: &CompatCtx, layer_id: u32, filename: &str, alpha: bool) -> Re
     // media name before the storage lookup; the L2 namespace takes the bare
     // name. The script spelling stays in the diagnostics.
     let lookup = strip_file_media(filename);
+    // A new open releases the movie the layer showed: the release is the
+    // first thing the open does, so a file that cannot be opened leaves the
+    // layer without a movie.
+    {
+        let mut state = services.state::<LayerExMovieState>();
+        if let Some(slot) = state.slots.get_mut(&layer_id) {
+            slot.release_audio(services);
+            slot.overlay.close();
+            slot.path.clear();
+            slot.playing = false;
+        }
+    }
     let (spec, audio) = {
         let mut state = services.state::<LayerExMovieState>();
-        let source = state
-            .source
-            .as_mut()
-            .ok_or_else(|| "Layer.openMovie: no movie source installed".to_string())?;
-        let spec = source
-            .spec(lookup)
-            .ok_or_else(|| format!("Layer.openMovie: no video metadata for {filename:?}"))?;
+        let Some(source) = state.source.as_mut() else {
+            movie_not_opened("no video source is installed");
+            return Ok(());
+        };
+        let Some(spec) = source.spec(lookup) else {
+            movie_not_opened(&format!("no video metadata for {filename:?}"));
+            return Ok(());
+        };
         let audio = decoded_audio(source.as_mut(), lookup, spec.audio_streams)
             .map_err(|error| format!("Layer.openMovie: {error}"))?;
         (spec, audio)
@@ -231,6 +257,9 @@ fn open_movie(ctx: &CompatCtx, layer_id: u32, filename: &str, alpha: bool) -> Re
 
 /// Reference `layerExMovie::startMovie`: start playback and fire
 /// `onStartMovie`.
+///
+/// A layer that shows no movie skips the command: the engine names the reason
+/// in the log and returns, and the script sees no exception.
 fn start_movie(
     ctx: &CompatCtx,
     host: &Tjs2Engine,
@@ -241,10 +270,16 @@ fn start_movie(
     let services = unsafe { ctx.services() };
     {
         let mut state = services.state::<LayerExMovieState>();
-        let slot = state
-            .slots
-            .get_mut(&layer_id)
-            .ok_or_else(|| "Layer.startMovie: no movie opened".to_string())?;
+        let Some(slot) = state.slots.get_mut(&layer_id) else {
+            log::warn!("compat.layer: Layer.startMovie: no movie is open");
+            return Ok(());
+        };
+        // The movie was stopped, so its player was released: the command
+        // skips, as it does for a movie that was never opened.
+        if !slot.overlay.is_open() {
+            log::warn!("compat.layer: Layer.startMovie: the movie is closed");
+            return Ok(());
+        }
         slot.overlay.looping = looping;
         slot.overlay
             .play()
@@ -261,7 +296,7 @@ fn start_movie(
 /// hook, and *release* the movie (`clearMovie()`, `:219`), firing
 /// `onStopMovie` only when it had been playing (`:220-226`). Releasing the
 /// overlay means a later `startMovie` without a fresh `openMovie` finds no
-/// movie — the port reports that as a typed error instead of the
+/// movie; the playback command skips, like the
 /// reference's silent `if(VideoOverlay)` skip (`:199`).
 fn stop_movie(ctx: &CompatCtx, host: &Tjs2Engine, layer_id: u32) -> Result<(), String> {
     // SAFETY: the caller holds a live, bound context.

@@ -196,20 +196,27 @@ fn movie_surface_is_attached_to_layer() {
     let env = Env::new();
     two_layers(&env);
     // The four methods are callable; `isPlayingMovie` reports false and the
-    // playback commands raise when no movie is open (D11).
+    // playback commands skip when no movie is open.
+    //
+    // The reference's `startMovie` runs its body only when a player is open
+    // (`reference/cpp/plugins/layerExMovie.cpp:198-209`), so a layer that
+    // shows no movie sees no exception.
     assert_eq!(env.eval_int("dst.isPlayingMovie()"), 0);
     env.run(
         "var caught = 0; \
          try { dst.startMovie(false); } catch (e) { caught = 1; }",
     );
-    assert_eq!(env.eval_int("caught"), 1);
-    // Without a host-installed decoded source, `openMovie` raises instead of
-    // fabricating metadata.
+    assert_eq!(env.eval_int("caught"), 0);
+    // Without a host-installed decoded source the movie cannot be opened; the
+    // reference logs the reason and returns (`reference/cpp/plugins/
+    // layerExMovie.cpp:154-166`), so the script sees no exception.
     env.run(
         "var caught = 0; \
          try { dst.openMovie('movie.mpg', false); } catch (e) { caught = 1; }",
     );
-    assert_eq!(env.eval_int("caught"), 1);
+    assert_eq!(env.eval_int("caught"), 0);
+    // The movie was not opened, so nothing plays.
+    assert_eq!(env.eval_int("dst.isPlayingMovie()"), 0);
 }
 
 #[test]
