@@ -72,7 +72,6 @@ pub use fs::xp3::normalize_in_archive_name;
 // The scene: the logical tree the projection reads.
 pub use scene::{
     BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
-    TransitionFrame, TransitionSource,
 };
 // The projection: the scene-to-render-tree conversion and the blend
 // resolution it applies.

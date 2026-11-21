@@ -1135,9 +1135,9 @@ fn with_children_reuses_the_subtree_content_between_frames() {
     );
 }
 
-/// The composited-frame host records a new frame every tick, but the frame's
-/// sources are the endpoint subtrees: their content is unchanged, so it is
-/// reused rather than recomposited. `Complete` returns the existing
+/// A whole-subtree transition reads the endpoint subtrees every tick, and
+/// their content is unchanged, so it is reused rather than recomposited.
+/// `Complete` returns the existing
 /// `CacheBitmap` while `CacheRecalcRegion` is empty
 /// (`LayerIntf.cpp:7734-7737`), and a frame change is not a source change
 /// (`LayerIntf.cpp:6305-6335`). The teardown releases the transition's cache
@@ -1152,10 +1152,9 @@ fn with_children_reuses_the_subtree_content_between_frames() {
 /// reference/cpp/core/visual/LayerIntf.cpp:6251-6257
 /// reference/cpp/core/visual/LayerIntf.cpp:7721-7723
 #[test]
-fn a_composited_whole_subtree_transition_reuses_its_content() {
+fn a_whole_subtree_transition_reuses_its_content() {
     let _lock = vm_lock();
     let mut env = Env::new();
-    env._scene.composite_transition_frames = true;
     two_layers_with_children(&env);
     env.advance(25.0);
     let dest_content = named_layer(&env, "dest")
@@ -1167,10 +1166,6 @@ fn a_composited_whole_subtree_transition_reuses_its_content() {
     env._scene.set_bitmap_clean(dest_content);
     env._scene.set_bitmap_clean(src_content);
     env.advance(25.0);
-    assert!(
-        named_layer(&env, "dest").transition_frame.is_some(),
-        "the composited frame advances"
-    );
     assert!(
         !env._scene.bitmap(dest_content).unwrap().dirty,
         "the destination subtree content is reused, not recomposited"
@@ -2259,77 +2254,9 @@ fn dirty_bitmaps(env: &Env) -> Vec<u32> {
     ids
 }
 
-/// A host that composites transition frames records the frame the projection
-/// draws — the two sources placed in the layer's frame
-/// (`reference/cpp/core/visual/TransIntf.cpp:592-600`) — instead of blending a
-/// display bitmap on the CPU every tick. Nothing is written into a bitmap, so a
-/// running transition adds no upload.
-#[test]
-fn a_composited_transition_records_its_frame_and_writes_no_bitmap() {
-    let _lock = vm_lock();
-    let mut env = Env::new();
-    env._scene.composite_transition_frames = true;
-    two_layers(&env, 2);
-    env.run("b.beginTransition('crossfade', true, a, %[time: 100]);");
-    // The engine uploads the main images the script wrote before the first
-    // frame; nothing else is pending.
-    for id in dirty_bitmaps(&env) {
-        env._scene.set_bitmap_clean(id);
-    }
-    assert!(dirty_bitmaps(&env).is_empty());
-
-    env.advance(25.0);
-    let first = named_layer(&env, "dest")
-        .transition_frame
-        .expect("a composited frame");
-    assert_eq!(first.size, (2, 2));
-    assert!(first.covers_layer, "a whole-subtree frame covers the layer");
-    assert_eq!(first.src1.alpha, 1.0);
-    assert!(
-        first.src2.alpha > 0.0 && first.src2.alpha < 1.0,
-        "the fade source carries phase/256, got {}",
-        first.src2.alpha
-    );
-    assert!(
-        cache_bitmap_of(&env, "dest").is_none(),
-        "the composited frame needs no display bitmap"
-    );
-    assert!(
-        self_image_of(&env, "dest").is_none(),
-        "the composited frame needs no self image"
-    );
-    let after_first = dirty_bitmaps(&env);
-
-    env.advance(25.0);
-    let second = named_layer(&env, "dest")
-        .transition_frame
-        .expect("a composited frame");
-    assert!(
-        second.src2.alpha > first.src2.alpha,
-        "the frame advances: {} then {}",
-        first.src2.alpha,
-        second.src2.alpha
-    );
-    assert_eq!(
-        after_first,
-        dirty_bitmaps(&env),
-        "a composited transition frame is not re-uploaded per tick"
-    );
-    assert!(
-        after_first.is_empty(),
-        "no bitmap is written while the frame runs: {after_first:?}"
-    );
-
-    env.run("b.stopTransition();");
-    assert!(
-        named_layer(&env, "dest").transition_frame.is_none(),
-        "the teardown clears the frame"
-    );
-}
-
 /// The headless CPU path blends the same frame into the destination's display
 /// bitmap every tick, which is exactly the per-tick full-frame write the
-/// composited path avoids.
+/// GPU path avoids.
 #[test]
 fn the_cpu_path_blends_the_display_bitmap_every_tick() {
     let _lock = vm_lock();
@@ -2352,10 +2279,6 @@ fn the_cpu_path_blends_the_display_bitmap_every_tick() {
     assert!(
         dirty_bitmaps(&env).contains(&frame),
         "the CPU path writes (and so uploads) the display bitmap"
-    );
-    assert!(
-        named_layer(&env, "dest").transition_frame.is_none(),
-        "the CPU path records no frame"
     );
 
     env._scene.set_bitmap_clean(frame);

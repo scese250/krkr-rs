@@ -29,7 +29,7 @@ use api::geometry::{PixelRegion, RectF};
 use render::{Clip, RenderContent, RenderEffect, RenderNode, RenderNodeId, RenderScene, Texture};
 
 use crate::hasher::{Map, Set, map, set};
-use crate::scene::{Rect, Scene, TransitionSource};
+use crate::scene::{Rect, Scene};
 
 /// Background clear colour used when a projected scene has no explicit one.
 ///
@@ -239,18 +239,6 @@ fn dim_i32(v: u32) -> i32 {
     v.min(i32::MAX as u32) as i32
 }
 
-/// One transition source placed in window space.
-struct PlacedSource {
-    /// Destination rectangle in window coordinates.
-    dst: RectF,
-    /// Source region, in frame pixels.
-    src: PixelRegion,
-    /// Composed opacity of this source.
-    opacity: f32,
-    /// Composition mode over the frame's other source.
-    blend: BlendMode,
-}
-
 /// The part of a frame rectangle that is visible, in frame pixels.
 ///
 /// `visible_src` is the visible part of the frame; the rectangle is
@@ -305,49 +293,6 @@ fn frame_rect_on_screen(
 fn place_frame_rect(dst: Rect, visible_src: PixelRegion, visible_dst: RectF) -> Option<RectF> {
     let visible = visible_frame_rect(dst, visible_src)?;
     Some(frame_rect_on_screen(visible, visible_src, visible_dst))
-}
-
-/// Places one source of a transition frame on screen.
-///
-/// `visible_src` is the visible part of the frame in frame pixels and
-/// `visible_dst` where that part lands on screen; the source's own rectangle is
-/// intersected with it and mapped through the same offset and scale. `None`
-/// when the source contributes no visible pixel.
-fn place_frame_source(
-    source: TransitionSource,
-    visible_src: PixelRegion,
-    visible_dst: RectF,
-    opacity: f32,
-    blend: BlendMode,
-) -> Option<PlacedSource> {
-    let dst = source.dst;
-    let src = source.src;
-    let (x0, y0, x1, y1) = visible_frame_rect(dst, visible_src)?;
-    let screen = frame_rect_on_screen((x0, y0, x1, y1), visible_src, visible_dst);
-    // A source region outside its bitmap would sample clamped texels.
-    let src_x = src.x.saturating_add(x0.saturating_sub(dst.x));
-    let src_y = src.y.saturating_add(y0.saturating_sub(dst.y));
-    if src_x < 0 || src_y < 0 {
-        return None;
-    }
-    Some(PlacedSource {
-        dst: screen,
-        src: PixelRegion::new(
-            src_x as u32,
-            src_y as u32,
-            (x1 - x0) as u32,
-            (y1 - y0) as u32,
-        ),
-        opacity: opacity * source.alpha.clamp(0.0, 1.0),
-        // A source fading over the one drawn before it composites
-        // source-over; a full-opacity source is an independent placement and
-        // keeps the layer's own blend.
-        blend: if source.alpha >= 1.0 {
-            blend
-        } else {
-            BlendMode::SourceOver
-        },
-    })
 }
 
 /// The dimensions a bitmap presents to the projection, at least 1×1.
@@ -454,26 +399,19 @@ fn append_window<F>(
         // its own image and descendants; a layer that merely enabled caching
         // but has no cache bitmap yet (its subtree is trivial) draws normally.
         // Any running transition takes precedence over the cached subtree:
-        // its frame or effect replaces the image the cache holds, and a frame
-        // that covers only the layer's own image leaves the children live.
+        // its effect replaces the image the cache holds, and an effect that
+        // covers only the layer's own image leaves the children live.
         let cached_bitmap = layer.cache_bitmap.filter(|_| {
             layer.cache_enabled_count != 0
                 && layer.transition_self.is_none()
-                && layer.transition_frame.is_none()
                 && layer.effect.is_none()
         });
-        // A running transition the host composites draws its two sources in
-        // place of the layer's display bitmap, at the same placement and with
-        // the same precedence. Its whole-subtree form holds the children, so
-        // it covers the subtree like a cache does.
-        let transition_frame = layer.transition_frame;
-        let transition_covers_subtree = transition_frame.is_some_and(|frame| frame.covers_layer);
         // A running transition the backend draws with a custom shader emits
         // its passes in place of the layer's image. Its whole-subtree form
         // holds the children, so it covers the subtree like a cache does.
         let effect = layer.effect.as_ref();
         let effect_covers_subtree = effect.is_some_and(|draw| draw.covers_layer);
-        if cached_bitmap.is_some() || transition_covers_subtree || effect_covers_subtree {
+        if cached_bitmap.is_some() || effect_covers_subtree {
             cache_owner.insert(layer_id, layer_id);
         }
 
@@ -511,8 +449,7 @@ fn append_window<F>(
         // Build the node(s) the layer draws. Every `break` means "skipped":
         // the layer still passes `parent_node` on to its children through
         // `nearest` below. A layer draws one image, except while a transition
-        // runs: its frame is two source draws and its custom-shader draw is
-        // one node per pass.
+        // runs: its custom-shader draw is one node per pass.
         state.nodes.clear();
         'layer: {
             if !node_composed.visible {
@@ -605,70 +542,6 @@ fn append_window<F>(
                         // The pipeline carries the blend; the node's own mode
                         // is only a diagnostic.
                         blend: BlendMode::SourceOver,
-                        hold_alpha: layer.hold_alpha,
-                        clip: composed_clip(&node_composed),
-                        ..RenderNode::default()
-                    };
-                    state.next_z = state.next_z.saturating_add(1);
-                    state.nodes.push(node);
-                }
-                if state.nodes.is_empty() {
-                    empty += 1;
-                }
-                break 'layer;
-            }
-
-            // A transition frame: the two sources are placed inside the frame
-            // and the frame where the layer's own image would be.
-            if let Some(frame) = transition_frame {
-                let (frame_w, frame_h) = frame.size;
-                let (image_left, image_top, img_w, img_h) = if frame.covers_layer {
-                    (0, 0, frame_w, frame_h)
-                } else {
-                    (
-                        layer.image_left,
-                        layer.image_top,
-                        if layer.image_width > 0 {
-                            layer.image_width
-                        } else {
-                            frame_w
-                        },
-                        if layer.image_height > 0 {
-                            layer.image_height
-                        } else {
-                            frame_h
-                        },
-                    )
-                };
-                let image = Rect::new(image_left, image_top, img_w, img_h);
-                let Some((visible_src, visible_dst)) =
-                    visible_image_region(node_composed.rect, image, (frame_w, frame_h))
-                else {
-                    clipped += 1;
-                    break 'layer;
-                };
-                for source in [frame.src1, frame.src2] {
-                    // A source at zero opacity is not part of this frame.
-                    if source.alpha <= 0.0 {
-                        continue;
-                    }
-                    let Some(resolved) = texture(source.bitmap) else {
-                        continue;
-                    };
-                    let Some(placed) =
-                        place_frame_source(source, visible_src, visible_dst, opacity, blend)
-                    else {
-                        continue;
-                    };
-                    let node = RenderNode {
-                        parent: Some(parent_node),
-                        content: RenderContent::Texture(resolved),
-                        dst: placed.dst,
-                        src: placed.src,
-                        opacity: placed.opacity,
-                        visible: true,
-                        z: state.next_z,
-                        blend: placed.blend,
                         hold_alpha: layer.hold_alpha,
                         clip: composed_clip(&node_composed),
                         ..RenderNode::default()
@@ -797,7 +670,7 @@ fn append_window<F>(
         if !state.nodes.is_empty() {
             drawn += 1;
             drawn_layers.push(layer_id);
-            if cached_bitmap.is_some() || transition_covers_subtree || effect_covers_subtree {
+            if cached_bitmap.is_some() || effect_covers_subtree {
                 emitted_cached.insert(layer_id);
             }
             let mut last = parent_node;

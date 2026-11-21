@@ -33,6 +33,7 @@ use render::{
 
 use crate::hasher::{Map, Set, map, set};
 use crate::imagedecode::{ImageOutcome, ImageSizeError, ImageState, PendingImage};
+use crate::layer_ops::RectI;
 use crate::layer_order::LayerOrderIndex;
 use crate::shader::{EffectDraw, EffectPipelines};
 use crate::trans::Trans;
@@ -238,13 +239,6 @@ pub struct LayerState {
     /// `None` until the transition first needs one; the transition clears it
     /// when it ends ([`Scene::set_transition_self_image`]).
     pub transition_self: Option<u32>,
-    /// The frame a running transition draws, when the host composites it
-    /// instead of blending [`Self::cache_bitmap`] or [`Self::transition_self`]
-    /// pixel by pixel. [`Scene::composite_transition_frames`] selects which of
-    /// the two carries the frame; the projection draws the two source images
-    /// this describes in place of the layer's image. `None` while no
-    /// composited transition runs ([`Scene::set_transition_frame`]).
-    pub transition_frame: Option<TransitionFrame>,
     /// The custom-shader draw a running transition composites, when the
     /// backend can run effect pipelines. The projection draws its passes in
     /// place of the layer's image; the layer keeps its bitmap untouched, so
@@ -353,76 +347,6 @@ struct HitEntry {
     visible: bool,
     /// Whether the point is inside every ancestor's clip rectangle.
     inside_ancestors: bool,
-}
-
-/// One source image of a [`TransitionFrame`].
-///
-/// The rectangles are in the frame's pixel space: `dst` is the rectangle the
-/// source occupies inside the frame and `src` is the sub-rectangle of
-/// `bitmap` it samples. The two have the same size.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[non_exhaustive]
-pub struct TransitionSource {
-    /// Bitmap the source samples.
-    pub bitmap: u32,
-    /// Sub-rectangle of `bitmap` to sample, in bitmap pixels.
-    pub src: Rect,
-    /// Rectangle the source occupies inside the frame, in frame pixels.
-    pub dst: Rect,
-    /// Opacity of the source inside the frame, `0.0..=1.0`. A source with
-    /// zero opacity draws nothing; a source at full opacity is an independent
-    /// placement rather than a fade over the source drawn before it.
-    pub alpha: f32,
-}
-
-impl TransitionSource {
-    /// Builds one source draw of a transition frame.
-    pub fn new(bitmap: u32, src: Rect, dst: Rect, alpha: f32) -> Self {
-        Self {
-            bitmap,
-            src,
-            dst,
-            alpha,
-        }
-    }
-}
-
-/// The current frame of a running transition, drawn by the projection in
-/// place of a display bitmap.
-///
-/// The frame composites two source images: [`Self::src1`] is drawn first and
-/// [`Self::src2`] over it at its own alpha. A whole-subtree transition covers
-/// the layer's rect; a transition without children stands in for the layer's
-/// own image at the main image's placement.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[non_exhaustive]
-pub struct TransitionFrame {
-    /// Frame size in pixels — the coordinate space of both sources' `dst`.
-    pub size: (u32, u32),
-    /// Whether the frame covers the layer's whole rect instead of being placed
-    /// like the layer's own image.
-    pub covers_layer: bool,
-    /// The image the frame starts from.
-    pub src1: TransitionSource,
-    /// The image composited over [`Self::src1`] as the transition advances.
-    pub src2: TransitionSource,
-}
-
-impl TransitionFrame {
-    /// Builds a transition frame of `size` pixels.
-    pub fn new(
-        size: (u32, u32),
-        covers_layer: bool,
-        src1: TransitionSource,
-        src2: TransitionSource,
-    ) -> Self {
-        Self {
-            size,
-            covers_layer,
-            src1,
-            src2,
-        }
-    }
 }
 
 /// One decoded bitmap (RGBA8, straight alpha).
@@ -969,11 +893,6 @@ pub struct Scene {
     /// until the scene's structure moves, so a frame that walks the layer
     /// tree many times pays for one build.
     layer_order: RefCell<LayerOrderIndex>,
-    /// Whether a running transition is drawn from
-    /// [`LayerState::transition_frame`] instead of a CPU-blended display
-    /// bitmap. A host that draws the projected scene turns it on; the
-    /// headless CPU path leaves it off and blends the display bitmap itself.
-    pub composite_transition_frames: bool,
     /// The backend handles of the programs the layers' custom-shader draws
     /// name.
     ///
@@ -1174,7 +1093,6 @@ impl Default for Scene {
             bitmap_index: crate::hasher::map(),
             font_index: crate::hasher::map(),
             layer_order: RefCell::new(LayerOrderIndex::default()),
-            composite_transition_frames: false,
             effect_pipelines: EffectPipelines::new(),
             image_cache: DecodedImageCache::default(),
             preloads: Vec::new(),
@@ -1435,7 +1353,6 @@ impl Scene {
             cache_bitmap: None,
             cache_content: None,
             transition_self: None,
-            transition_frame: None,
             effect: None,
             draws: Vec::new(),
             content_region: None,
@@ -2351,7 +2268,6 @@ impl Scene {
             cache_bitmap,
             cache_content,
             transition_self,
-            transition_frame,
             effect,
         ) = (
             layer.window,
@@ -2362,7 +2278,6 @@ impl Scene {
             layer.cache_bitmap,
             layer.cache_content,
             layer.transition_self,
-            layer.transition_frame,
             layer.effect.clone(),
         );
         let children = layer.children.clone();
@@ -2407,13 +2322,8 @@ impl Scene {
         if let Some(self_image) = transition_self {
             self.release_bitmap(self_image);
         }
-        // The transition frame names the transition's two sources; they are
-        // released when nothing else still holds them.
-        if let Some(frame) = transition_frame {
-            self.release_bitmap(frame.src1.bitmap);
-            self.release_bitmap(frame.src2.bitmap);
-        }
-        // The effect draw names the transition's sources as well.
+        // The effect draw names the transition's sources; they are released
+        // when nothing else still holds them.
         if let Some(effect) = &effect {
             for bitmap in effect.bitmaps() {
                 self.release_bitmap(bitmap);
@@ -2535,12 +2445,6 @@ impl Scene {
                     .chain(layer.cache_bitmap)
                     .chain(layer.cache_content)
                     .chain(layer.transition_self)
-                    .chain(
-                        layer
-                            .transition_frame
-                            .into_iter()
-                            .flat_map(|frame| [frame.src1.bitmap, frame.src2.bitmap]),
-                    )
             })
             .collect();
         // Drop the doomed ids from every surviving layer's child list and
@@ -3935,17 +3839,13 @@ impl Scene {
     }
 
     /// Whether any live layer still references `id` as its MainImage, its
-    /// subtree cache, its transition self image or a source of its transition
-    /// frame or effect draw.
+    /// subtree cache, its transition self image or a source of its effect draw.
     pub fn bitmap_referenced_by_layer(&self, id: u32) -> bool {
         self.layers.iter().any(|layer| {
             layer.bitmap == Some(id)
                 || layer.cache_bitmap == Some(id)
                 || layer.cache_content == Some(id)
                 || layer.transition_self == Some(id)
-                || layer
-                    .transition_frame
-                    .is_some_and(|frame| frame.src1.bitmap == id || frame.src2.bitmap == id)
                 || layer
                     .effect
                     .as_ref()
@@ -4409,46 +4309,6 @@ impl Scene {
             self.touch_structure();
             if let Some(old) = replaced {
                 self.release_bitmap(old);
-            }
-        }
-    }
-
-    /// Set (or clear) the frame a running transition draws on `id`.
-    ///
-    /// A changed frame bumps [`Scene::structure_revision`], so the
-    /// projection redraws the two source images the frame advances to. The
-    /// frame is a display of the layer's content, not the content itself:
-    /// the layer's composited subtree and every caching ancestor's stay
-    /// reusable instead of being recomposited every tick. A source the
-    /// outgoing frame named and the new one does not is released once
-    /// nothing else holds it; the transition's own sources keep their owners'
-    /// references.
-    pub fn set_transition_frame(&mut self, id: u32, frame: Option<TransitionFrame>) {
-        let mut replaced = None;
-        let changed = match self.layer_mut_untracked(id) {
-            Some(layer) if layer.transition_frame != frame => {
-                replaced = layer.transition_frame;
-                layer.transition_frame = frame;
-                true
-            }
-            _ => false,
-        };
-        if changed {
-            if frame.is_none() {
-                // The layer returns to drawing its own subtree: a cache kept
-                // from before the transition (or the one its transition ran
-                // through) is stale now, so resume from a fresh composite.
-                self.mark_layer_changed(id);
-            }
-            self.touch_structure();
-            if let Some(replaced) = replaced {
-                let kept = frame.map(|frame| [frame.src1.bitmap, frame.src2.bitmap]);
-                for bitmap in [replaced.src1.bitmap, replaced.src2.bitmap] {
-                    if kept.is_some_and(|kept| kept.contains(&bitmap)) {
-                        continue;
-                    }
-                    self.release_bitmap(bitmap);
-                }
             }
         }
     }
@@ -5133,6 +4993,151 @@ impl Scene {
         };
         self.dirty_bitmaps.insert(dst);
         Some(value)
+    }
+
+    /// Runs `f` on the destination and the source rectangle of an operation.
+    ///
+    /// The destination is borrowed mutably and the source immutably; the two
+    /// may be the same bitmap. A self-copy reads a **snapshot of the
+    /// rectangle** — the pixels of that rectangle alone — instead of a copy
+    /// of the whole image, so a self-copy does not duplicate the bitmap.
+    /// The snapshot's origin is the rectangle's origin, so the operation
+    /// places the rectangle where the caller asked for it, and the
+    /// rectangle handed to the operation is the rectangle in the snapshot's
+    /// own coordinates.
+    ///
+    /// A rectangle that reaches past the source's bounds is read from a copy
+    /// of the whole image, the way it was read before: the pixels the source
+    /// does not reach are the transparent miss value, and only the copy of
+    /// the whole image carries the source's own bounds. The rectangle handed
+    /// to the operation is then the caller's own.
+    ///
+    /// The operation writes the destination's pixels, so the destination
+    /// joins [`Scene::dirty_bitmaps`] and the frame uploads it.
+    ///
+    /// Returns `None` when a bitmap is missing.
+    pub fn with_source_rect<R>(
+        &mut self,
+        dst: u32,
+        src: u32,
+        src_rect: RectI,
+        f: impl FnOnce(&mut BitmapState, &BitmapState, RectI) -> R,
+    ) -> Option<R> {
+        let di = self.bitmap_position(dst)?;
+        let si = self.bitmap_position(src)?;
+        if di != si {
+            let value = if di < si {
+                let (left, right) = self.bitmaps.split_at_mut(si);
+                f(&mut left[di], &right[0], src_rect)
+            } else {
+                let (left, right) = self.bitmaps.split_at_mut(di);
+                f(&mut right[0], &left[si], src_rect)
+            };
+            self.dirty_bitmaps.insert(dst);
+            return Some(value);
+        }
+        // The source and the destination are the same bitmap: the operation
+        // reads the source's rectangle and writes the destination, so the
+        // rectangle's pixels are snapshotted — the rectangle alone, not the
+        // whole image — and the operation writes into the bitmap's own
+        // pixels.
+        if let Some((snapshot, rect)) = self.source_rect_snapshot(si, src_rect) {
+            let value = f(&mut self.bitmaps[di], &snapshot, rect);
+            self.dirty_bitmaps.insert(dst);
+            return Some(value);
+        }
+        // The rectangle reaches past the source: the whole image is copied,
+        // the way the operation read it before.
+        let source = self.bitmaps[si].clone();
+        let value = f(&mut self.bitmaps[di], &source, src_rect);
+        self.dirty_bitmaps.insert(dst);
+        Some(value)
+    }
+
+    /// A copy of the rectangle's pixels, in the rectangle's own coordinates.
+    ///
+    /// The snapshot holds the pixels the source holds inside the rectangle.
+    /// The rectangle must lie inside the source's bounds: the pixels the
+    /// source does not reach are the transparent miss value, and only a copy
+    /// of the whole image carries the source's own bounds.
+    ///
+    /// Returns `None` when the rectangle reaches past the source.
+    fn source_rect_snapshot(&self, index: usize, rect: RectI) -> Option<(BitmapState, RectI)> {
+        let source = self.bitmaps.get(index)?;
+        let width = i64::from(rect.2) - i64::from(rect.0);
+        let height = i64::from(rect.3) - i64::from(rect.1);
+        if width < 0 || height < 0 {
+            return None;
+        }
+        let source_width = i64::from(source.width);
+        let source_height = i64::from(source.height);
+        if rect.0 < 0
+            || rect.1 < 0
+            || i64::from(rect.2) > source_width
+            || i64::from(rect.3) > source_height
+        {
+            return None;
+        }
+        let (Ok(pixel_width), Ok(pixel_height)) = (u32::try_from(width), u32::try_from(height))
+        else {
+            return None;
+        };
+        let bytes = (pixel_width as usize)
+            .checked_mul(pixel_height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))?;
+        let mut rgba = Vec::new();
+        if rgba.try_reserve_exact(bytes).is_err() {
+            return None;
+        }
+        rgba.resize(bytes, 0);
+        // The rectangle's rows, copied out of the source. The rectangle lies
+        // inside the source, so every row of it is a row the source holds.
+        let (Some(pitch), Some(row_pitch), Some(count), Some(left)) = (
+            usize::try_from(source_width)
+                .ok()
+                .and_then(|width| width.checked_mul(4)),
+            usize::try_from(pixel_width)
+                .ok()
+                .and_then(|width| width.checked_mul(4)),
+            usize::try_from(width)
+                .ok()
+                .and_then(|width| width.checked_mul(4)),
+            usize::try_from(rect.0).ok(),
+        ) else {
+            return None;
+        };
+        for row in 0..height {
+            let (Ok(source_row), Ok(target_row)) = (
+                usize::try_from(i64::from(rect.1) + row),
+                usize::try_from(row),
+            ) else {
+                continue;
+            };
+            let Some(source_start) = source_row
+                .checked_mul(pitch)
+                .and_then(|start| start.checked_add(left.checked_mul(4)?))
+            else {
+                continue;
+            };
+            let Some(target_start) = target_row.checked_mul(row_pitch) else {
+                continue;
+            };
+            let Some(source_pixels) = source
+                .rgba
+                .get(source_start..source_start.saturating_add(count))
+            else {
+                continue;
+            };
+            let Some(target) = rgba.get_mut(target_start..target_start.saturating_add(count))
+            else {
+                continue;
+            };
+            target.copy_from_slice(source_pixels);
+        }
+        Some((
+            BitmapState::new(pixel_width, pixel_height, rgba),
+            (0, 0, rect.2 - rect.0, rect.3 - rect.1),
+        ))
     }
 
     /// The bitmap record with the given id, for mutation.

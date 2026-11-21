@@ -23,7 +23,6 @@ use std::ffi::{c_char, c_int, c_void};
 use crate::engine_api::Scene;
 use crate::engine_api::{
     DecodedImageMode, EffectDraw, RuleMask, ScrollFrom, ScrollStay, Trans, TransError, TransKind,
-    TransitionFrame,
 };
 use tjs::{DetachedValue, NativeInstanceMethodDef, TjsValue, VAL_OBJECT, VAL_VOID, Value};
 
@@ -1120,7 +1119,6 @@ fn end_transition(ctx: &crate::CompatCtx, dest: u32, source: u32, event: bool) {
         // A childless transition drew its frames in the layer's self image;
         // the teardown leaves the layer drawing its own image again.
         scene.set_transition_self_image(dest, None);
-        scene.set_transition_frame(dest, None);
         scene.set_effect(dest, None);
         exchange_layers(scene, dest, source, !entry.with_children);
     }
@@ -1458,19 +1456,6 @@ fn composite_transition(
         scene.transition_effect_draw(trans, src1, src2, (w, h), with_children);
     if let Some(effect) = effect {
         scene.set_effect(id, Some(effect));
-        scene.set_transition_frame(id, None);
-        return Ok(());
-    }
-    // A composited frame is drawn by the projection, which places the two
-    // sources itself. Kinds that need per-pixel work return no frame and are
-    // blended below on every host.
-    let frame: Option<TransitionFrame> = if scene.composite_transition_frames {
-        trans.transition_frame(src1, src2, (w, h), with_children)
-    } else {
-        None
-    };
-    if let Some(frame) = frame {
-        scene.set_transition_frame(id, Some(frame));
         return Ok(());
     }
     // The blend needs a frame of its own, distinct from the content it reads,

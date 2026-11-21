@@ -28,7 +28,6 @@
 // pixel, and the scene asks the engine, which owns the backend.
 pub(crate) use engine::{
     BitmapState, DecodedImageKey, DecodedImageMode, FontState, LayerState, Rect, Scene,
-    TransitionFrame,
 };
 
 // The hit test's candidate: the layer that hit and the point in its own

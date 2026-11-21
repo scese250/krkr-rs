@@ -570,10 +570,6 @@ impl Engine {
         } = parts;
         let surface_size = (surface_size.0.max(1), surface_size.1.max(1));
         let mut scene = Scene::default();
-        // A backend that draws the projected scene composites a running
-        // transition's frame from the projection; the headless CPU path blends
-        // the layer's display bitmap instead.
-        scene.composite_transition_frames = pipeline.backend() != BackendKind::Null;
         // The engine draws the layers' draw lists on the backend, so the
         // compatibility layer leaves them to it and the list is drawn once.
         scene.host_draws_lists = true;

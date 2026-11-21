@@ -102,12 +102,10 @@ fn the_scroll_places_the_two_sources() {
         .expect("scroll draw");
     assert_eq!(draw.passes.len(), 2, "the scroll places two sources");
 
-    // The frame the hybrid path draws uses the same placements.
-    let frame = trans
-        .transition_frame(11, 22, (4, 4), true)
-        .expect("scroll frame");
-    assert_eq!(draw.passes[0].dst, frame.src1.dst);
-    assert_eq!(draw.passes[1].dst, frame.src2.dst);
+    // The two placements are the ones the reference blits its sources at
+    // (`reference/cpp/core/visual/TransIntf.cpp:1208-1217`).
+    assert_eq!(draw.passes[0].dst, Rect::new(2, 0, 2, 4));
+    assert_eq!(draw.passes[1].dst, Rect::new(0, 0, 2, 4));
     assert_eq!(draw.passes[0].program, Program::Scroll);
     assert_eq!(draw.passes[1].program, Program::Scroll);
     assert_eq!(sampled(&draw), vec![11, 22]);

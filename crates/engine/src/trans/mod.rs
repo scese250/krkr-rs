@@ -51,7 +51,7 @@
 use std::sync::OnceLock;
 
 use crate::layer_ops::{RectI, blit_copy, blit_copy_clipped, intersect, intersect_rect};
-use crate::scene::{BitmapState, Rect, TransitionFrame, TransitionSource};
+use crate::scene::{BitmapState, Rect};
 
 mod effect;
 mod extrans_mosaic;
@@ -808,76 +808,6 @@ impl Trans {
     /// A full-image processing region for `bitmap`.
     pub fn full_region(bitmap: &BitmapState) -> RectI {
         (0, 0, dimension(bitmap.width), dimension(bitmap.height))
-    }
-
-    /// The frame `src1`/`src2` composite into at the current phase, for a host
-    /// that draws the projected scene instead of blending a display bitmap.
-    ///
-    /// Only the kinds that are a placement or a fade of the two sources return
-    /// a frame — `crossfade` and `scroll`. The rule-based and warp kinds
-    /// (`universal`, `mask`, `wave`, `mosaic`, `turn`, the `rotate*` family and
-    /// `ripple`) need a per-pixel rule or coordinate warp, so they return
-    /// `None` and [`Trans::apply`] blends them.
-    ///
-    /// `size` is the shared source size and the frame's own pixel space;
-    /// `covers_layer` records whether the frame stands in for the layer's whole
-    /// subtree (drawn over the layer's rect) rather than for its own image.
-    /// `None` also covers a zero-sized frame.
-    pub fn transition_frame(
-        &self,
-        src1: u32,
-        src2: u32,
-        size: (u32, u32),
-        covers_layer: bool,
-    ) -> Option<TransitionFrame> {
-        if size.0 == 0 || size.1 == 0 {
-            return None;
-        }
-        let full = Rect::new(0, 0, size.0, size.1);
-        match self.kind {
-            TransKind::CrossFade => {
-                // The endpoints are exact copies of one source, so the other
-                // source draws nothing there.
-                let (start, end) = if self.phase <= 0 {
-                    (1.0, 0.0)
-                } else if self.phase >= self.phase_max {
-                    (0.0, 1.0)
-                } else {
-                    // `blend_level` weights the fade by `phase >> 8`.
-                    (1.0, self.phase as f32 / 256.0)
-                };
-                Some(TransitionFrame::new(
-                    size,
-                    covers_layer,
-                    TransitionSource::new(src1, full, full, start),
-                    TransitionSource::new(src2, full, full, end),
-                ))
-            }
-            TransKind::Scroll { from, stay } => {
-                let (w, h) = (dimension(size.0), dimension(size.1));
-                let (first, second) = scroll_placements(self.progress(), (w, h), from, stay);
-                let frame = (0, 0, w, h);
-                // A source outside the frame contributes no pixel; it keeps a
-                // zero rectangle, which the projection draws nothing for.
-                let (dst1, src_rect1) = scroll_source_rects(frame, first).unwrap_or_default();
-                let (dst2, src_rect2) = scroll_source_rects(frame, second).unwrap_or_default();
-                Some(TransitionFrame::new(
-                    size,
-                    covers_layer,
-                    TransitionSource::new(src1, src_rect1, dst1, 1.0),
-                    TransitionSource::new(src2, src_rect2, dst2, 1.0),
-                ))
-            }
-            TransKind::Universal { .. }
-            | TransKind::Mask
-            | TransKind::Wave { .. }
-            | TransKind::Mosaic { .. }
-            | TransKind::Turn { .. }
-            | TransKind::RotateZoom { .. }
-            | TransKind::RotateVanish { .. }
-            | TransKind::RotateSwap { .. }
-            | TransKind::Ripple { .. } => None,
-        }
     }
 
     fn apply_cross_fade(

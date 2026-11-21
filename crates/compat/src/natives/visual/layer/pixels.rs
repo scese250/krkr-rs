@@ -240,6 +240,39 @@ pub(super) fn mark_image_modified(scene: &mut Scene, id: u32) {
     }
 }
 
+/// Borrow the destination and the source rectangle of an operation
+/// simultaneously.
+///
+/// The source and the destination may be the same bitmap: the source's
+/// rectangle is then snapshotted — the rectangle alone, not the whole image
+/// — so the operation reads stable pixels without duplicating the bitmap.
+/// The rectangle the operation reads is the one the scene hands back, which
+/// is the rectangle in the snapshot's own coordinates.
+fn with_source_rect<R>(
+    scene: &mut Scene,
+    dst_id: u32,
+    src_id: u32,
+    src_rect: RectI,
+    f: impl FnOnce(&mut BitmapState, &BitmapState, RectI) -> R,
+) -> Result<R, String> {
+    // Both images may still be decoding: an operation reads their pixels.
+    scene.resolve_bitmap(dst_id);
+    scene.resolve_bitmap(src_id);
+    let Some(dst) = scene.bitmap(dst_id) else {
+        return Err(format!(
+            "Layer: the destination bitmap {dst_id} does not exist"
+        ));
+    };
+    let Some(src) = scene.bitmap(src_id) else {
+        return Err(format!("Layer: the source bitmap {src_id} does not exist"));
+    };
+    util::bitmap_holds_pixels(dst, "destination")?;
+    util::bitmap_holds_pixels(src, "source")?;
+    scene
+        .with_source_rect(dst_id, src_id, src_rect, f)
+        .ok_or_else(|| format!("Layer: the destination bitmap {dst_id} does not exist"))
+}
+
 /// The layer's effective draw face — the port of the reference
 /// `UpdateDrawFace` (`reference/cpp/core/visual/LayerIntf.cpp:1525-1620`):
 /// when `face == dfAuto` the face is derived from the layer type, otherwise
@@ -705,16 +738,13 @@ extern "C" fn layer_operate_rect(
         if opa == 0 {
             return Ok(());
         }
-        with_two_bitmaps(scene, dst, src_id, |d, s| {
+        with_source_rect(scene, dst, src_id, src_rect, |d, s, rect| {
             layer_ops::operate_rect_on(
                 blit.dst_alpha,
                 d,
                 dx,
                 dy,
-                layer_ops::BlitSource {
-                    bitmap: s,
-                    rect: src_rect,
-                },
+                layer_ops::BlitSource { bitmap: s, rect },
                 layer_ops::BlitOptions {
                     mode: blit.mode,
                     opa,
@@ -798,6 +828,9 @@ extern "C" fn layer_operate_stretch(
         };
         let src_rect = (sx, sy, sx.saturating_add(sw), sy.saturating_add(sh));
         let src_trimmed = scale_rect(src_rect, dst_rect, dest);
+        // The stretch resamples the source rectangle onto the destination, and
+        // its sampler clamps to the source's own bounds: the rectangle is
+        // read from the whole image, not from a snapshot of the rectangle.
         with_two_bitmaps(scene, dst, src_id, |d, s| {
             layer_ops::stretch_blit_on(
                 blit.dst_alpha,
@@ -1108,6 +1141,10 @@ fn stretch_op(
                 BlitFamily::Pile
             };
             let blit = family_blit(family, face, layer_hold_alpha);
+            // The stretch resamples the source rectangle onto the
+            // destination, and its sampler clamps to the source's own
+            // bounds: the rectangle is read from the whole image, not from a
+            // snapshot of the rectangle.
             with_two_bitmaps(scene, dst, src_id, |d, s| {
                 layer_ops::stretch_blit_on(
                     blit.dst_alpha,
@@ -1309,10 +1346,17 @@ fn rect_op(
             let Some((dx, dy, src_rect)) = clip_dest_src(dx, dy, src_rect, clip) else {
                 return Ok(());
             };
-            with_two_bitmaps(scene, dst, src_id, |d, s| {
-                let Some((dx, dy, src_rect)) =
-                    clip_source_to_image(dx, dy, src_rect, s.width, s.height)
-                else {
+            // The source rectangle is clipped to the source image's own
+            // bounds: the pixels the source does not hold are the
+            // transparent miss value, the way a source pixel outside the
+            // source bitmap reads.
+            let (src_width, src_height) = scene
+                .bitmap(src_id)
+                .map_or((0, 0), |bitmap| (bitmap.width, bitmap.height));
+            let clipped = clip_source_to_image(dx, dy, src_rect, src_width, src_height);
+            let source_rect = clipped.map_or(src_rect, |(_, _, rect)| rect);
+            with_source_rect(scene, dst, src_id, source_rect, |d, s, rect| {
+                let Some((dx, dy, _)) = clipped else {
                     return;
                 };
                 layer_ops::operate_rect_on(
@@ -1320,10 +1364,7 @@ fn rect_op(
                     d,
                     dx,
                     dy,
-                    layer_ops::BlitSource {
-                        bitmap: s,
-                        rect: src_rect,
-                    },
+                    layer_ops::BlitSource { bitmap: s, rect },
                     layer_ops::BlitOptions {
                         mode: blit.blend.mode(),
                         opa,
@@ -2865,6 +2906,16 @@ extern "C" fn layer_save_layer_image(
     })();
     match result {
         Ok(()) => {
+            // The write is on its way to the disk: a listing that holds the
+            // directory's names must not hide the file from the next probe.
+            // SAFETY: `ctx` is only created for a bound, live engine, so its service pointer is valid for `layer_save_layer_image`.
+            let services = unsafe { ctx.services() };
+            if let Some(storage) = services.storage() {
+                // SAFETY: the host keeps the attached storage alive for the
+                // lifetime of the binding, and this is the storage the VM
+                // reads its names through.
+                unsafe { &*storage }.invalidate_disk_listings();
+            }
             set_void(out);
             0
         }
