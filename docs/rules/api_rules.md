@@ -397,18 +397,9 @@ objects explicitly.
 
 ## 11. What the gate enforces
 
-| check | the rule it protects |
-|---|---|
-| `surface-lock` | §2.1–§2.2 — the script surface is the committed dump |
-| `layering` | §4.1 — `engine_api.rs` is the only place compat names the engine; the `unsafe` placement and the `missing_docs` lint |
-| `error-handling` | §5 — no `#[non_exhaustive]` on a variant-matched L3 enum, no swallowed error, no `#[allow(dead_code)]`, no pointer sign test |
-| `house-style` | §8 — no glob re-export, no bean accessor, no decision number in a production comment |
-| `stateless` | §7.1 — no process-global state and no `&mut self` on an L1 service |
-| `void-getter` | §2.4 — a native getter never hands the script a raw `void` |
-| `native-arity` | §2.4 — a zero-argument reference form keeps a zero-argument branch |
-| `callback-objthis` | §2.4 — a callback receives the caller's `objthis` |
-| `native-construction` | §2.4 — the payload carries the state its members need |
-| `lifecycle-order` | §2.4 — a teardown removes or invalidates only its own records |
-| `storage-boundary` | §2.5 — a script name is stripped before it crosses the boundary |
-| `host-facts` | §7.3 — every host-fact seam is installed by production code |
-| `native-parity`, `plugin-parity` | §2.3 — reports, not gates |
+The ordered gate is in [`gates.md`](gates.md) §1, and what each step protects
+is tabulated in [`code_styles.md`](code_styles.md) §10; the rules themselves
+are the ones this page states in §2–§10 and, for the layer rules, in
+[`arch_rules.md`](arch_rules.md). Those two tables are the only listings of
+the gate's steps, and `krkr-gate doc-lists` fails when either drifts from
+the sequence the gate runs.

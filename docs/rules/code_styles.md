@@ -381,10 +381,8 @@ For each module, in order:
    changing behaviour**. A script-visible value, an error, a member name and
    the registration surface stay exactly as they are.
 4. Run `cargo fmt`. Run the compiler-free checks of
-   [`AGENTS.md`](../../AGENTS.md) §0.4 — `stateless`, `error-handling`,
-   `house-style`, `layering`, `storage-boundary`, `native-construction`,
-   `lifecycle-order`, `storage-media`, `callback-objthis`, `native-arity`,
-   `void-getter`, `host-facts`.
+   [`AGENTS.md`](../../AGENTS.md) §0.4 — the ones §10 below lists, with the
+   rule each one protects.
 5. Report: the files changed and the exact scope; the patterns fixed with the
    behaviour-preserving argument; the behaviour risk and what was deliberately
    left alone; the blockers, or a bug that belongs to another scope.
@@ -396,24 +394,34 @@ until both the static gate and the test suites are green.
 
 ## 10. What the gate enforces
 
+The ordered gate is in [`gates.md`](gates.md) §1; the table below names every
+step of it and the rule it protects. The rules themselves are the ones this
+page states in §2–§8 and in [`arch_rules.md`](arch_rules.md).
+
 | check | the rule it protects |
 |---|---|
 | `cargo fmt --all -- --check` | formatting |
 | `cargo clippy --workspace --all-targets -- -D warnings` | every lint, including the pedantic ones; no `#[allow(clippy::…)]` is possible (the `house-style` gate rejects one in any Rust file, tests included) |
-| `stateless` | §4 of [`arch_rules.md`](arch_rules.md): no process-global state in L1, no `&mut self` on an L1 service |
-| `error-handling` | §4: no parse-then-default, no discarded error, no `debug_assert!` on data integrity, no pointer sign test or narrowing, no wildcard error arm that swallows |
-| `house-style` | §2, §3.1, §6: bean accessors, `&String`/`&Vec`/`&Box` parameters, glob re-exports, decision numbers, external-engine citations and history in production comments, jargon in log text, clippy allowances |
-| `layering` | §5, §6 and [`arch_rules.md`](arch_rules.md): layer vocabulary, platform code in L3, the `engine_api` seam, `SAFETY:` notes, the file-level `unsafe` allow, `missing_docs` |
-| `storage-boundary` | a script-supplied storage name is stripped of its media prefix before it crosses into L2 or the host filesystem |
-| `storage-media` | every `scheme://` domain the reference registers is served or explicitly documented as missing |
-| `native-construction` | a native payload carries the state its members need the moment it exists |
+| `cargo clippy -p platform --features platform-android --all-targets -- -D warnings` | the Android feature resolves on the host |
+| `stateless` | no process-global state and no stateful service in L1; every evolving value is an explicit `&mut` state value |
+| `error-handling` | no silent fallback and no dropped error: no parse-then-default, no discarded error, no `debug_assert!` on data integrity, no `#[allow(dead_code)]`, no pointer sign test or narrowing, no wildcard error arm that swallows |
+| `house-style` | bean accessors, `&String`/`&Vec`/`&Box` parameters, glob re-exports, decision numbers, external-engine citations and history in production comments, jargon in log text, clippy allowances |
+| `log-format` | every log record names its subsystem |
+| `layering` | layer vocabulary, platform code in L3, the `engine_api` seam, `SAFETY:` notes, the file-level `unsafe` allow, `missing_docs` |
+| `storage-boundary` | a script storage name is stripped of its media prefix before it crosses into L2 or the host |
+| `native-construction` | the native payload carries the state its members need the moment it exists |
 | `lifecycle-order` | a native teardown removes or invalidates only the records its own script object owns |
+| `storage-media` | every `scheme://` domain the reference registers is served or explicitly documented as missing |
 | `callback-objthis` | a member that invokes a caller's callback receives the caller's `objthis` |
 | `native-arity` | a native method whose reference form takes zero arguments has a zero-argument branch |
-| `void-getter` | §8: a native getter never hands the script a raw `void` where the reference returns a value |
-| `host-facts` | every host-fact seam on the compatibility host is installed by production code |
+| `void-getter` | a native getter never hands the script a raw `void` where the reference returns a value |
+| `native-instance-lookup` | an invalidated native instance resolves by class, and the dispatch keeps the invalidation guard |
+| `android-target` | no backend-feature leak into the Android target, and the two backends are never enabled together |
 | `surface-lock` | the script-visible surface is the committed baseline |
 | `native-parity`, `plugin-parity` | reports: what the reference has that the port does not |
+| `host-facts` | every host-fact seam is installed by production code |
+| `ci` | the release workflow contract: a `v*` tag, independent Linux and Android jobs, one release |
+| `doc-lists` | the pages that list the gate's steps agree with the sequence the gate runs |
 
 ---
 

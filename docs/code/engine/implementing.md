@@ -619,6 +619,10 @@ this contract are:
 | `surface-lock` | the script surface (§6.2) |
 | `android-target` | the per-target dependency graph (§3.8) |
 
+The full list of the gate's steps is in
+[`rules/gates.md`](../../rules/gates.md) §1, and what each step protects in
+[`rules/code_styles.md`](../../rules/code_styles.md) §10.
+
 ---
 
 ## 7. A checklist

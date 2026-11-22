@@ -204,12 +204,14 @@ Unit tests live next to the code in `#[cfg(test)] mod tests` blocks
 `video.rs`, `engine.rs`). The behaviour assertions cite `reference/cpp/...:line`;
 the test rules are in [`rules/code_styles.md`](../../rules/code_styles.md) §8.
 
-The **main agent** runs the build, clippy and test gate; the compiler-free
-checks (`stateless`, `error-handling`, `house-style`, `layering`,
-`storage-boundary`, `storage-media`, `native-construction`, `lifecycle-order`,
-`native-arity`, `void-getter`, `host-facts`, `android-target`,
-`surface-lock`, `native-parity`, `plugin-parity`) run without a build and can
-be run from a worker.
+The **main agent** runs the build, clippy and test gate. Every compiler-free
+check runs without a build and can be run from a worker; the ordered gate is
+in [`rules/gates.md`](../../rules/gates.md) §1, and what each check protects
+is in [`rules/code_styles.md`](../../rules/code_styles.md) §10. Those two
+tables are the only listings of the gate's steps, and `krkr-gate doc-lists`
+fails when either drifts from the sequence the gate runs. The gate's cargo
+steps — `cargo fmt --all -- --check` and the two `cargo clippy` runs — belong
+to the main agent.
 
 ---
 

@@ -26,6 +26,7 @@ from .checks import (
     android_target,
     callback_objthis,
     ci,
+    doc_lists,
     error_handling,
     extract_xp3,
     host_facts,
@@ -68,6 +69,7 @@ CHECKS: dict[str, Callable[[list[str]], int]] = {
     "surface-lock": surface_lock.main,
     "native-parity": native_parity.main,
     "plugin-parity": plugin_parity.main,
+    "doc-lists": doc_lists.main,
 }
 
 # The gate sequence in the AGENTS §0 order. Each step is
@@ -125,6 +127,7 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
     ("plugin-parity", "check", "plugin-parity", ["--no-doc"]),
     ("host-facts", "check", "host-facts", []),
     ("ci", "check", "ci", []),
+    ("doc-lists", "check", "doc-lists", []),
 ]
 
 # The workspace and per-target test suites. These are deliberately **not** part
@@ -164,6 +167,7 @@ Checks:
   surface-lock     VM dispatch surface vs the committed baseline
   native-parity    native class surface vs the reference
   plugin-parity    plugin surface vs the reference
+  doc-lists        the doc pages list the gate's steps as the gate runs them
   extract-xp3      extract a file from an XP3 archive
   gate             the ordered static gate (fmt, guards, clippy)
                    --no-cargo   run only the compiler-free checks

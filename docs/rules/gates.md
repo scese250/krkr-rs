@@ -33,32 +33,41 @@ It runs the steps below in this order and stops at the first failure:
 | 7 | `storage-boundary` | check | script storage names do not reach L2 or the host unstripped |
 | 8 | `native-construction` | check | native instances are constructed when they are created |
 | 9 | `lifecycle-order` | check | a native teardown must not take another script object's Scene record |
-| 10 | `storage-media` | check | reference storage-media domains are served or documented |
+| 10 | `storage-media` | check | the reference's storage-media domains are served or documented; the checkout is required |
 | 11 | `callback-objthis` | check | callback-invoking native members carry objthis |
-| 12 | `native-arity` | check | reference zero-argument natives are not rejected |
+| 12 | `native-arity` | check | the reference's zero-argument natives are not rejected |
 | 13 | `void-getter` | check | a native getter does not return a raw void where the reference returns an object |
 | 14 | `native-instance-lookup` | check | invalidated instances resolve by class; dispatch keeps the invalidation guard |
 | 15 | `cargo clippy --workspace --all-targets -- -D warnings` | cargo | the host build |
 | 16 | `cargo clippy -p platform --features platform-android --all-targets -- -D warnings` | cargo | the Android feature on the host |
 | 17 | `android-target` | check | no desktop-only backend leaks into the Android graph, or vice versa |
-| 18 | `surface-lock --update` | check | regenerate the live VM dispatch dump |
-| 19 | `surface-lock` | check | the dump matches the reviewed baseline (D29) |
-| 20 | `native-parity` | check | native class surface vs the reference |
-| 21 | `plugin-parity --no-doc` | check | plugin surface vs the reference |
-| 22 | `host-facts` | check | every host seam has a production installer |
-| 23 | `ci` | check | the release workflow contract (v* → Linux + Android in parallel → one release) |
+| 18 | `surface-lock` | check | the live VM dispatch dump matches the committed baseline (D29) |
+| 19 | `native-parity --no-doc` | check | the native class surface vs the reference |
+| 20 | `plugin-parity --no-doc` | check | the plugin surface vs the reference |
+| 21 | `host-facts` | check | every host seam has a production installer |
+| 22 | `ci` | check | the release workflow contract (v* → Linux + Android in parallel → one release) |
+| 23 | `doc-lists` | check | the pages that list the gate's steps match the gate |
 
-The `cargo` steps are the main agent's; they are the reason a worker may run a
-compiler-free check but may not run the build gate. `gate --no-cargo` runs the
-checks only, and `gate --keep-going` reports every failure instead of stopping
-at the first one.
+The `cargo` steps are the integrator's, and a worker may not run cargo at all,
+so a worker may run a compiler-free check but never the build gate.
+`gate --no-cargo` runs the checks only, and `gate --keep-going` reports every
+failure instead of stopping at the first one.
 
-Steps 11, 19 and 20 read the reference checkout, which is not part of this
+Steps 10, 12, 19 and 20 — `storage-media`, `native-arity`, `native-parity` and
+`plugin-parity` — read the reference checkout, which is not part of this
 repository. It is `<repo>/reference` unless the run names another one:
 `krkr-gate --reference PATH <check>` sets `KRKR_REFERENCE` for the run, and
-`krkr-gate --reference PATH gate` hands it to every step. Those three checks
+`krkr-gate --reference PATH gate` hands it to every step. Those four checks
 fail with the paths they tried rather than scanning nothing, so a clone kept
 somewhere else needs the option (or the variable) on every run.
+
+The gate **compares**; it never rewrites the tree. `surface-lock` reads the
+live VM dispatch dump and compares it with the committed baseline, so a
+surface change fails the gate; accepting one is the integrator's separate
+action (`krkr-gate surface-lock --update`), reviewed as a diff in
+`docs/surface/`. Both parity checks run with `--no-doc`, so a gate run does
+not rewrite `docs/native_parity.md` or `docs/plugin_parity.md`; a report is
+regenerated deliberately, when the reference or the surface has moved.
 
 The gate does **not** run the test suites. A change is done only when both the
 static gate and the tests are green.

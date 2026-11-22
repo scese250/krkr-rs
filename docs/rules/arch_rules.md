@@ -426,20 +426,9 @@ so it is not cited here: the pages that state each rule in full are in
 
 ## 14. What the gate enforces
 
-| check | the rule it protects |
-|---|---|
-| `stateless` | §3.1 — no process-global state and no stateful service in L1 |
-| `layering` | §2.1 — layer vocabulary, platform code in L3, the `engine_api` seam, `SAFETY:` notes, the file-level `unsafe` allow, `missing_docs` |
-| `error-handling` | §6 and [`code_styles.md`](code_styles.md) §4 — no swallowed error, no pointer sign test, no `#[allow(dead_code)]` |
-| `house-style` | §6 — no decision number, no external-engine citation and no history in a production comment |
-| `storage-boundary` | §9 — a script storage name is stripped of its media prefix before it crosses into L2 or the host |
-| `storage-media` | §9 — every `scheme://` domain the reference registers is served or documented |
-| `native-construction` | the native payload carries the state its members need the moment it exists |
-| `lifecycle-order` | a native teardown removes or invalidates only the records its own script object owns |
-| `callback-objthis` | a member that invokes a caller's callback receives the caller's `objthis` |
-| `native-arity` | a native method whose reference form takes zero arguments has a zero-argument branch |
-| `void-getter` | a native getter never hands the script a raw `void` where the reference returns a value |
-| `host-facts` | every host-fact seam is installed by production code |
-| `surface-lock` | §10 — the script-visible surface is the committed baseline |
-| `native-parity`, `plugin-parity` | §10 — reports, not gates |
-| `android-target` | §12 — no backend-feature leak into the Android target |
+The ordered gate is in [`gates.md`](gates.md) §1, and what each step protects
+is tabulated in [`code_styles.md`](code_styles.md) §10; the rules themselves
+are the ones this page states in §1–§13 and, for the comment and error rules,
+in [`code_styles.md`](code_styles.md). Those two tables are the only listings
+of the gate's steps, and `krkr-gate doc-lists` fails when either drifts from
+the sequence the gate runs.

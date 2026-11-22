@@ -20,13 +20,14 @@ compiler-free checks. Every check also runs on its own; `android-target`
 shells out to `cargo tree`, the rest read the tree.
 
 The static gate sequence is `cargo fmt` → `stateless` → `error-handling` →
-`house-style` → `layering` → `storage-boundary` → `native-construction` →
-`lifecycle-order` → `storage-media` → `callback-objthis` → `native-arity` →
-`void-getter` → `native-instance-lookup` → `cargo clippy` → `cargo clippy platform-android` →
-`android-target` → `surface-lock --update` → `surface-lock` → `native-parity`
-→ `plugin-parity --no-doc` → `host-facts` → `ci`. The ordered gate, the test
-suites and the CI release pipeline are documented in
-[`../docs/rules/gates.md`](../docs/rules/gates.md).
+`house-style` → `log-format` → `layering` → `storage-boundary` →
+`native-construction` → `lifecycle-order` → `storage-media` →
+`callback-objthis` → `native-arity` → `void-getter` →
+`native-instance-lookup` → `cargo clippy` →
+`cargo clippy platform-android` → `android-target` → `surface-lock` →
+`native-parity --no-doc` → `plugin-parity --no-doc` → `host-facts` → `ci` →
+`doc-lists`. The ordered gate, the test suites and the CI release pipeline
+are documented in [`../docs/rules/gates.md`](../docs/rules/gates.md).
 
 ## Layout
 
@@ -89,7 +90,16 @@ lives in `fixtures/`, one directory per check:
 - three checks (`storage-boundary`, `storage-media`, `host-facts`) scan a whole
   miniature source tree under `fixtures/<check>/tree/` and compare what they
   find against an `expected.json`, so a file there is a *sample* of the code
-  the check reads, not a file it names individually.
+  the check reads, not a file it names individually;
+- `stateless` scans a miniature crate tree under `fixtures/stateless/tree/`
+  the same way, except that it has no `expected.json`: its corpus is a broken
+  sample per rule and a clean sample beside it, and the self-test asserts that
+  the broken sample trips every rule and the clean one trips none;
+- `doc-lists` compares whole trees: `fixtures/doc_lists/good/` holds a
+  registry and the two pages that agree with it, `fixtures/doc_lists/bad/`
+  holds the same registry and pages that drift from it in every way the rules
+  can see. The self-test asserts that the bad tree trips every rule and that
+  the good tree trips none.
 
 They are therefore not a reference copy of anything: they are the inputs of
 the checks' self-tests, and the gate exercises them on every run
@@ -98,11 +108,31 @@ Deleting one makes that check's self-test fail.
 
 ## Checks
 
-`stateless`, `error-handling`, `house-style`, `layering`,
+`stateless`, `error-handling`, `house-style`, `log-format`, `layering`,
 `storage-boundary`, `native-construction`, `lifecycle-order`, `storage-media`,
 `callback-objthis`, `native-arity`, `void-getter`, `native-instance-lookup`,
 `host-facts`, `android-target`, `ci`, `surface-lock`, `native-parity`,
-`plugin-parity`, the `extract-xp3` helper, and `gate`.
+`plugin-parity`, `doc-lists`, the `extract-xp3` helper, and `gate`.
+
+`stateless` fails a process-global mutable state in the bottom-core crates
+(`static mut`, `thread_local!`, `lazy_static!`, `LazyLock`, `OnceLock`,
+`OnceCell`) and a stateful (`&mut self`) method on a service object
+(`RenderPipeline`, `FileSystem`, `Media`). Its fixture corpus under
+`fixtures/stateless/tree/` holds one broken sample per rule and one clean
+sample beside it, and the self-test asserts that every rule still fires on the
+broken sample and that the clean sample trips nothing.
+
+`doc-lists` keeps the pages that list the gate's steps in step with the code:
+it reads `GATE_SEQUENCE` from `scripts/krkr_gates/cli.py` — the registry the
+gate dispatches from, and the one owner of the list — and compares it with
+the ordered table in [`../docs/rules/gates.md`](../docs/rules/gates.md) §1
+(the steps, their order and their kind) and with the table in
+[`../docs/rules/code_styles.md`](../docs/rules/code_styles.md) §10 (every
+check the gate runs). A missing, extra, reordered or mistyped entry is a
+finding with the file and the line; the check never writes, because a guard
+that rewrote the pages would hide the drift it exists to catch. Its fixture
+corpus under `fixtures/doc_lists/` holds a tree whose pages agree with the
+registry and one that drifts from it in every way the rules can see.
 
 `house-style` also enforces the AGENTS §6 comment rules: a **non-test**
 comment may not cite the external engine (`reference/cpp`, a `*.cpp:line`, a
@@ -155,19 +185,23 @@ fire.
 - `KRKR_TEST_SAVE` — a real KAG save BMP for the save-fixture test.
 - `KRKR_REPO` — the checkout root; docs use it where a command starts outside
   the repository.
-- `KRKR_REFERENCE` — the reference checkout the parity checks read (a clone
-  with a `cpp/` directory). Defaults to `<repo>/reference`;
+- `KRKR_REFERENCE` — the reference checkout `storage-media`, `native-arity`,
+  `native-parity` and `plugin-parity` read (a clone with a `cpp/` directory).
+  Defaults to `<repo>/reference`;
   `krkr-gate --reference PATH <check>` sets it for that run, and
   `krkr-gate --reference PATH gate` hands it to every check the gate runs.
-  Without it, a clone at another path makes `native-parity` and
-  `plugin-parity` fail with the paths they tried instead of scanning nothing.
+  Without it, a clone at another path makes those four checks fail with the
+  paths they tried instead of scanning nothing.
 
 ## Notes
 
 - No third-party runtime dependencies; the build backend is hatchling.
 - `native-parity` and `plugin-parity` regenerate their reports under `docs/`
-  unless `--no-doc` is given; the reports cite reference files as
-  `reference/cpp/...` whatever path the checkout actually lives at.
+  unless `--no-doc` is given; the gate passes `--no-doc` to both, so a gate
+  run never rewrites a report — regenerate one deliberately. The reports cite
+  reference files as `reference/cpp/...` whatever path the checkout actually
+  lives at.
 - `surface-lock` regenerates the VM dispatch dump by running the compat
-  surface test unless `--no-regen` is given; `--update` rewrites the committed
-  baseline and is main-agent only.
+  surface test unless `--no-regen` is given; the gate compares that dump with
+  the committed baseline and fails on a change, and `--update` rewrites the
+  committed baseline and is the integrator's separate, reviewed action.

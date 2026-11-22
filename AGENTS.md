@@ -240,8 +240,8 @@ It runs the ordered **static** gate: `cargo fmt --all -- --check`; the
 `native-instance-lookup` checks;
 `cargo clippy --workspace --all-targets -- -D warnings`;
 `cargo clippy -p platform --features platform-android --all-targets -- -D warnings`;
-`android-target`; `surface-lock --update`; `surface-lock`; `native-parity`;
-`plugin-parity --no-doc`; `host-facts`; `ci`.
+`android-target`; `surface-lock`; `native-parity --no-doc`;
+`plugin-parity --no-doc`; `host-facts`; `ci`; `doc-lists`.
 
 The static gate does **not** run the test suites. Run them separately:
 
@@ -256,9 +256,11 @@ until both the static gate and the test suites are green.
 Every check also runs on its own (`krkr-gate <check>`) and takes
 `--self-test`; `gate --no-cargo` runs only the compiler-free checks, and
 `gate --keep-going` reports every failure instead of stopping at the first
-one. `surface-lock --update` rewrites the committed baseline and is for the
-integrator only. The ordered gate, every check's contract and the CI release
-pipeline are documented once in
+one. `surface-lock` compares the live dump with the committed baseline and
+fails on a change; `--update` rewrites the committed baseline and is for the
+integrator only. The parity reports under `docs/` are regenerated
+deliberately, never by the gate. The ordered gate, every check's contract and
+the CI release pipeline are documented once in
 [`docs/rules/gates.md`](docs/rules/gates.md); the checks live in
 `scripts/krkr_gates/checks/`.
 
@@ -444,19 +446,19 @@ counts its whole `src/` — the C ABI wrapper and the Rust VM module — and its
 
 | layer | crates | total |
 |---|---|---|
-| L1 | api 2 939 · fs 3 091 · media 5 816 · psd 4 383 · render 15 120 · platform 4 029 | 35 378 |
-| L2 | engine | 34 315 |
-| L3 | compat | 102 979 |
-| L4 | tjs 22 535 · vm 857 | 23 392 |
+| L1 | api 2 939 · fs 3 093 · media 6 229 · psd 4 428 · render 16 784 · platform 4 205 | 37 678 |
+| L2 | engine | 40 308 |
+| L3 | compat | 105 240 |
+| L4 | tjs 21 886 · vm 859 | 22 745 |
 
-L3 is three times the size of L2. **That is correct and intended.** L2 is a
-small, generic, backend-agnostic engine — the layer tree, the mixer, the
-timers, the VFS namespace, the projection — and keeping it small is exactly
-what lets the backend be swapped freely: the Vulkan host, the null backend
-and the Android host all drive the same L2, and none may change it. L3 is the
-whole TVP abstraction and compatibility engine — the native classes, the KAG
-scenario, the event adapter, the plugins, the Win32 emulation — and it is
-large *because* it carries the reference's surface: every script-visible
+L3 is two and a half times the size of L2. **That is correct and intended.**
+L2 is a small, generic, backend-agnostic engine — the layer tree, the mixer,
+the timers, the VFS namespace, the projection — and keeping it small is
+exactly what lets the backend be swapped freely: the Vulkan host, the null
+backend and the Android host all drive the same L2, and none may change it.
+L3 is the whole TVP abstraction and compatibility engine — the native classes,
+the KAG scenario, the event adapter, the plugins, the Win32 emulation — and
+it is large *because* it carries the reference's surface: every script-visible
 member has to exist, and has to behave like the reference.
 
 So "L3 is bigger than L2" is a property to be proud of, not a smell to be

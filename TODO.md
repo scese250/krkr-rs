@@ -38,7 +38,7 @@ the tree.
 4. **Android device verification** (§14) — one real title run with its log
    captured is the release condition (D36).
 5. **Native plugin coverage** (§10) — 35 of 53 plugin names unemulated — and the
-   **comments-gate debt** (§15): 4126 baseline entries, four unsafe-note files.
+   **comments-gate debt** (§15): 3299 baseline entries, four unsafe-note files.
 6. **L3 behavioural audit** (§11) — the emulation lives in L3, and the current
    motion/transition defects show that surface lock, arity/parity and the
    static gates cannot see semantic loss (timeline evaluation, transition
@@ -1488,6 +1488,22 @@ every frame.
    `System.graphicCacheLimit` bounds no layers.
 2. Keep the overlay object counters (windows/layers/bitmaps/fonts/textures) as
    regression evidence; descriptor-set and `ObjectRegistry` counts are missing.
+3. **The render crate hands out three process-global ids.**
+   `crates/platform/render/src/texture.rs` (`NEXT_TEXTURE_ID`),
+   `render_target.rs` (`NEXT_TARGET_ID`) and `effect.rs`
+   (`NEXT_EFFECT_PIPELINE_ID`) are `static AtomicU64` counters that mint the
+   identity of a texture, a render target and an effect pipeline. The ids key
+   the resource maps that live in the per-state `RenderState` — `NullState`
+   (`null.rs`) and `VulkanState` (`vulkan/mod.rs`) keep `Map<u64, …>` of
+   textures and render targets — so the identity belongs to the state that owns
+   the map, and an L1 crate that holds a process-global counter breaks the
+   stateless rule (D9). A per-state counter is not the fix: a handle created
+   against one state would then alias a different resource of another state,
+   so the state's identity has to become part of the handle. That changes the
+   L1 create signatures — `create_texture` and `create_render_target` take no
+   state today, `create_effect_pipeline` already takes `&mut RenderState` — and
+   their call sites in `engine` and `app`. The gate that would notice it does
+   not yet (§15).
 
 ## 14. Android
 
@@ -1607,16 +1623,30 @@ an allowlist exemption.
 
 * **Citation and history baseline.** Pre-existing findings live in
   `scripts/allowlists/house_style_baseline.txt` — JSON Lines keyed to the
-  normalized comment line, **4044 entries over 166 files** (4321 finding sites).
+  normalized comment line, **3299 entries over 114 files** (3557 finding sites).
   The baseline is **debt**: burn it down in file batches, largest first
-  (`compat/src/natives/sound.rs` 247, `compat/.../player_members.rs` 150,
-  `engine/src/scene.rs` 145, `system.rs` 127), deleting each entry as
-  its comment is rewritten.
+  (`compat/src/natives/sound.rs` 246,
+  `compat/.../motion_player/player_members.rs` 150,
+  `compat/.../visual/timer.rs` 124, `compat/.../system.rs` 118), deleting each
+  entry as its comment is rewritten.
+* **Four production comments name the reference engine's constants.**
+  `crates/engine/src/layer_ops.rs` lines 436 and 439 (the `COPY_MAIN` /
+  `COPY_MASK` constants) and lines 1469–1470 (the `blit_plane` doc comment)
+  name `TVP_BB_COPY_MAIN` and `TVP_BB_COPY_MASK`. The house-style rule
+  matches `\bTVP\b`, so an underscore-joined name is not a finding and these
+  four are not in the baseline. A change is landing in that file, so the
+  comments are rewritten there and not in a separate edit.
 * **`unsafe` blocks with no `// SAFETY:` note.**
   `scripts/allowlists/layering_allow.txt` now baselines four files; each still
   carries the debt: `compat/.../motion_player/{emote,helpers,player_members}.rs`
   and `natives/scripts.rs`. Write a real safety argument per block (AGENTS §5;
   `docs.old/audits/unsafe-inventory.md` §2.6).
+* **A process-global counter is not in the `stateless` rule list.** The check's
+  patterns cover `static mut`, `thread_local!`, `lazy_static!`, `LazyLock`,
+  `OnceLock` and `OnceCell` only, so the three `AtomicU64` id counters of the
+  render crate (§13) are reported as clean. Add the rule when the counters are
+  gone, and not before: a rule that fires on a known, recorded defect would
+  turn the gate red for it.
 
 ## 16. Deferred design work
 

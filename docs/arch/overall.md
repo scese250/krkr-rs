@@ -213,17 +213,11 @@ uv run --project scripts krkr-gate gate     # the ordered static gate
 uv run --project scripts krkr-gate test     # the test suites
 ```
 
-| check | what it holds |
-|---|---|
-| `stateless` | L1 has no mutable statics, no `thread_local!`, no lazy statics, no id-keyed registries, no `&mut self` on an L1 service. |
-| `layering` | L1/L2 vocabulary rules, no platform code in L3, the `l3-engine-api` seam rule, `unsafe` placement and `SAFETY:` notes, the `missing_docs` lint. |
-| `error-handling` | no silent fallback: no `unwrap_or` on a real error, no dropped `Result`, no pointer-sign tests on a script-visible handle. |
-| `house-style` | comments describe the code as it is; no external-engine citation or history narration outside tests; no `#[allow(clippy::…)]`. |
-| `storage-boundary` / `storage-media` | the storage/media boundary between L1, L2 and L3. |
-| `native-construction` / `native-arity` / `callback-objthis` / `void-getter` / `lifecycle-order` | the shape of the L3 native surface. |
-| `surface-lock` | the live VM dispatch surface equals the committed baseline — any added or removed member fails the gate. |
-| `native-parity` / `plugin-parity` | coverage *reports* against the reference; presence, not correctness. |
-| `host-facts` / `android-target` | the host/platform contract, and the per-target dependency graph. |
+The ordered gate is in [`../rules/gates.md`](../rules/gates.md) §1, and what
+each step protects is tabulated in
+[`../rules/code_styles.md`](../rules/code_styles.md) §10. Those two tables are
+the only listings of the gate's steps, and `krkr-gate doc-lists` fails when
+either drifts from the sequence the gate runs.
 
 The **surface lock** is the contract for L3's dispatch surface; behaviour is
 constrained separately, by citing the reference in every behaviour test.
