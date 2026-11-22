@@ -1475,22 +1475,32 @@ page.
   or `++`/`--` statement. `docs.old/audits/bytecode-scripts.md` §5,
   `docs.old/vm-defects.md` BLK-3.
 
-* **A rare SIGSEGV in the compat crate's unit test binary is not attributed.**
-  Running the workspace suite (`cargo test --workspace --no-fail-fast`, what
-  `krkr-gate test` runs) died once on 2026-11-22 with `error: test failed, to
-  rerun pass -p compat --lib` and `process didn't exit successfully:
-  .../compat-6577376d1b259496 (signal: 11, SIGSEGV: invalid memory
-  reference)`. The last line the binary printed before it died was the movie
-  plugin's test log (`Member "openMovie" does not exist` — the VM's own
-  message, `crates/tjs/cpp/tjs2/tjsError.h:264`), and a signal prints no Rust
-  backtrace. It is rare: the same suite run again immediately afterwards
-  passed (exit 0), and the compat lib binary alone ran 600+ times without a
-  crash (200 runs of the plain build, 200 of the workspace build, plus
-  single-threaded runs). It is not deterministic: with `--test-threads=1` the
-  same binary runs all 190 tests green. It is not a stack overflow: the binary
-  ran 20 times with a 1 MB stack and 10 times with a 512 KB stack (the default
-  is 8 MB) with no crash. Cleared so far: the SIMD kernel
-  (`crates/engine/src/simd.rs`) is safe Rust throughout (slices,
+* **A rare SIGSEGV in the compat crate's unit test binary: the core dump named
+  the defect, and the fix is in flight.** Running the workspace suite
+  (`cargo test --workspace --no-fail-fast`, what `krkr-gate test` runs) died
+  once on 2026-11-22 with `error: test failed, to rerun pass -p compat --lib`
+  and `process didn't exit successfully: .../compat-6577376d1b259496 (signal:
+  11, SIGSEGV: invalid memory reference)`. The last line the binary printed
+  before it died was the movie plugin's test log (`Member "openMovie" does not
+  exist` — the VM's own message, `crates/tjs/cpp/tjs2/tjsError.h:264`), and a
+  signal prints no Rust backtrace. The core dump the host keeps gave the
+  backtrace: the crash is a defect in the vendored VM's debug-only object hash
+  map, in the additional order list of
+  `crates/tjs/cpp/tjs2/tjsHashSearch.h` — not a race between the unit tests
+  that share the process. The committed file is the reference's own, so the
+  defect predates the recent changes: it is byte-identical to
+  `reference/cpp/core/tjs2/tjsHashSearch.h` (sha256 `40a5427e`), and the map
+  is created only under `_DEBUG` (`TJSEnableDebugMode`,
+  `crates/tjs/cpp/tjs2/tjs.cpp:64`), so the reference's release build never
+  creates it. The fix is being made in the vendored tree; the item stays until
+  it lands and the suite is green again. It is rare: the same suite run again
+  immediately afterwards passed (exit 0), and the compat lib binary alone ran
+  600+ times without a crash (200 runs of the plain build, 200 of the
+  workspace build, plus single-threaded runs). It is not deterministic: with
+  `--test-threads=1` the same binary runs all 190 tests green. It is not a
+  stack overflow: the binary ran 20 times with a 1 MB stack and 10 times with
+  a 512 KB stack (the default is 8 MB) with no crash. Cleared so far: the SIMD
+  kernel (`crates/engine/src/simd.rs`) is safe Rust throughout (slices,
   `as_chunks_mut`; no unchecked access) and a partial row falls back before
   writing; the engine's host font scan thread (`crates/engine/src/text.rs`)
   owns an `Arc` to its state and never touches the engine; the engine's decode
@@ -1499,12 +1509,31 @@ page.
   rely on the caller owning the id's liveness. **Next step:** the host pipes
   cores to `systemd-coredump`, so the next occurrence leaves a backtrace —
   `coredumpctl list` shows the entry, `coredumpctl debug <entry>` gives the
-  backtrace. The crash has not been reproduced on demand, and guessing is not
-  the way to close it: the same discipline §3 item 1 asks for. **Open
-  question:** whether the crash is in the vendored C++ VM's own teardown or in
-  a race between the unit tests that share one process, and whether it
-  predates the recent changes — not answered yet, because the crash has not
-  been reproduced.
+  backtrace.
+* **The game-dependent and font-dependent tests still skip invisibly.** The
+  reference-dependent ones no longer do: the resolver and the gate agree on
+  where the checkout is (`crates/testkit/src/reference.rs`), the silent-skip
+  entry point is gone, and a test that cannot find its fixture fails with the
+  resolver's message - the fixture, the variable, the directory the variable
+  must point at, and the gate's `--reference` option. The game-dependent ones
+  cannot fail, because their fixture is optional (a game directory and a
+  system font are not part of the repository), so their skip has to be made
+  **visible** instead: the suite should say how many tests did not run and
+  why, rather than report a pass for a test that ran no assertion. The shape
+  is up to the implementer; the requirement is that a reader of the test
+  output learns what did not run. The sites are the same let-else shape:
+  `crates/app/tests/real_game.rs` 2 (lines 38 and 57),
+  `crates/app/tests/boot_game.rs` 1 (line 25),
+  `crates/compat/tests/font.rs` 21 and `crates/compat/tests/add_font.rs` 6.
+  What a reader is misled about today: the suite's output says the tests
+  passed. The font tests are not `#[ignore]`d, so they run in every suite and
+  report `ok` having asserted nothing; the game-dependent tests are
+  `#[ignore]`d, so a default run lists them as ignored and the silent skip
+  happens in the documented `--ignored` run. The game-dependent helpers print
+  their note to stderr (`crates/app/tests/real_game.rs:22`,
+  `crates/app/tests/boot_game.rs:26`), and cargo captures stderr for a
+  passing test, so the note never reaches the output; the font helpers print
+  nothing at all. A run that covered nothing looks like a run that passed.
 * **The scratch space fills up.** A worker that builds the tree keeps a
   target directory of its own, and several of them fill `/tmp` - which is a
   tmpfs of sixteen gigabytes - until a write fails with an I/O error and the
