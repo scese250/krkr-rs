@@ -973,6 +973,14 @@ pub struct Scene {
     draw_sources: crate::layer_ops::DrawSources,
     /// The id the next registered source receives.
     next_draw_source: u32,
+    /// The revision of each draw source's pixels, and the revision its
+    /// texture was filled at, by source id.
+    ///
+    /// A source's pixels do not change while the source lives: the scene
+    /// owns them, a draw list reads them and the backend samples them. The
+    /// revision says which pixels the texture holds, so a source whose
+    /// pixels did not change is not sent to the backend again.
+    draw_source_revisions: Map<u32, DrawSourceRevision>,
     /// The surfaces the layers' poses are drawn into, by the bitmap the
     /// pose is composed onto.
     ///
@@ -1006,10 +1014,10 @@ pub struct Scene {
     draw_textures: Map<u32, Texture>,
     /// The textures of the draw sources that were released.
     ///
-    /// A source is per-frame content: the pose that registered it replaces
-    /// the one before it, and the source goes with it. The scene cannot free
-    /// a texture — the engine owns the device — so it hands the released
-    /// ones over and the engine drops them.
+    /// The sources a pose registers are the tinted icons a cache holds and
+    /// the surfaces the pose composited. The scene cannot free a texture —
+    /// the engine owns the device — so the released ones are handed over
+    /// and the engine drops them.
     released_draw_textures: Vec<Texture>,
     /// The device work the compatibility layer asked for.
     ///
@@ -1138,6 +1146,26 @@ impl std::fmt::Debug for PoseSurface {
     }
 }
 
+/// The revision of a draw source's pixels, and the revision its texture was
+/// filled at.
+///
+/// The scene owns a source's pixels: a draw list reads them and the backend
+/// samples them, and nothing writes them while the source lives. The
+/// revision says which pixels the texture holds, so a source whose pixels
+/// did not change is not sent to the backend again.
+#[derive(Clone, Copy, Debug)]
+struct DrawSourceRevision {
+    /// The revision of the source's pixels.
+    ///
+    /// The revision is the scene's content revision at the moment the scene
+    /// took the pixels; it moves when the scene takes new pixels for the
+    /// source.
+    content: u64,
+    /// The revision the source's texture was filled at, or `None` when the
+    /// texture holds none of the source's pixels.
+    filled: Option<u64>,
+}
+
 impl Default for Scene {
     fn default() -> Self {
         Self {
@@ -1165,6 +1193,7 @@ impl Default for Scene {
             removed_bitmaps: BTreeSet::new(),
             draw_sources: crate::hasher::map(),
             next_draw_source: 0,
+            draw_source_revisions: crate::hasher::map(),
             pose_surfaces: crate::hasher::map(),
             pose_sync: None,
             pose_revisions: crate::hasher::map(),
@@ -4439,10 +4468,21 @@ impl Scene {
     /// alive, and a backend that draws the list has them to draw from. The
     /// source is not a layer image, so the frame does not upload it; a
     /// backend that draws a list uploads the sources it draws from.
+    ///
+    /// The pixels are taken at the scene's current content revision, and
+    /// that revision is what tells the upload whether the source's texture
+    /// holds them.
     pub fn add_draw_source(&mut self, pixels: std::sync::Arc<BitmapState>) -> u32 {
         let id = self.next_draw_source;
         self.next_draw_source += 1;
         self.draw_sources.insert(id, pixels);
+        self.draw_source_revisions.insert(
+            id,
+            DrawSourceRevision {
+                content: self.content_revision,
+                filled: None,
+            },
+        );
         id
     }
 
@@ -4455,6 +4495,7 @@ impl Scene {
     /// Returns whether the source was there.
     pub fn release_draw_source(&mut self, id: u32) -> bool {
         let released = self.draw_sources.remove(&id).is_some();
+        self.draw_source_revisions.remove(&id);
         if let Some(texture) = self.draw_textures.remove(&id) {
             self.released_draw_textures.push(texture);
         }
@@ -4463,9 +4504,9 @@ impl Scene {
 
     /// Releases every source the `keep` list does not name.
     ///
-    /// The sources a pose registers are per-frame content: the tinted icons
-    /// the cache holds and the surfaces the pose composited. The caller
-    /// passes the ids that are still live, and the rest of the table goes.
+    /// The sources a pose registers are the tinted icons a cache holds and
+    /// the surfaces the pose composited. The caller passes the ids that are
+    /// still live, and the rest of the table goes.
     ///
     /// The textures of the released sources go with them: a copy of pixels
     /// no draw list reads any more is not needed, and the descriptor set it
@@ -4474,6 +4515,7 @@ impl Scene {
     /// handed over with [`Self::take_released_draw_textures`].
     pub fn prune_draw_sources(&mut self, keep: &[u32]) {
         self.draw_sources.retain(|id, _| keep.contains(id));
+        self.draw_source_revisions.retain(|id, _| keep.contains(id));
         let released: Vec<u32> = self
             .draw_textures
             .keys()
@@ -4641,8 +4683,11 @@ impl Scene {
     ///
     /// A source that already has a texture of its own size keeps it; a
     /// source whose texture is missing or has another size gets a new one.
-    /// The pixels are uploaded every time, because a source is per-frame
-    /// content: the surfaces a pose composited hold the frame's own pixels.
+    ///
+    /// The pixels are sent when the source's content revision moved past
+    /// the revision its texture was filled at. A source whose pixels did not
+    /// change keeps the texture it has, so the picture the backend draws is
+    /// the same and the pixels are not sent again.
     fn draw_source_textures(
         &mut self,
         pipeline: &RenderPipeline,
@@ -4666,26 +4711,46 @@ impl Scene {
                 continue;
             }
             let existing = self.draw_textures.get(&id).cloned();
-            let texture = match existing {
+            let (texture, created) = match existing {
                 Some(texture)
                     if texture.width() == source.width && texture.height() == source.height =>
                 {
-                    texture
+                    (texture, false)
                 }
                 _ => {
                     let texture =
                         create_texture(pipeline, TextureDesc::new(source.width, source.height))?;
                     self.draw_textures.insert(id, texture.clone());
-                    texture
+                    (texture, true)
                 }
             };
-            upload_texture(
-                pipeline,
-                state,
-                &texture,
-                PixelRegion::new(0, 0, source.width, source.height),
-                source.rgba.as_slice(),
-            )?;
+            // A texture that was just created holds none of the source's
+            // pixels, so it is filled whatever the revisions say. The
+            // revision is cleared before the upload, so a failed upload is
+            // sent again.
+            if created && let Some(revision) = self.draw_source_revisions.get_mut(&id) {
+                revision.filled = None;
+            }
+            let revision = self.draw_source_revisions.get(&id).copied();
+            let stale = match revision {
+                Some(revision) => revision.filled != Some(revision.content),
+                // A source the revisions do not name was never registered,
+                // and its pixels are sent: that is the safe direction.
+                None => true,
+            };
+            if stale {
+                upload_texture(
+                    pipeline,
+                    state,
+                    &texture,
+                    PixelRegion::new(0, 0, source.width, source.height),
+                    source.rgba.as_slice(),
+                )?;
+                if let Some(mut revision) = revision {
+                    revision.filled = Some(revision.content);
+                    self.draw_source_revisions.insert(id, revision);
+                }
+            }
             textures.insert(id, texture);
         }
         Ok(textures)

@@ -564,6 +564,34 @@ The port's behaviour is pinned by `crates/compat/tests/layer.rs`
 region"), so the change is a behaviour change and not a cleanup: it needs its
 own decision and its own test.
 
+### 4.5 The motion pose still allocates and uploads an offscreen per frame
+
+Landed: the pose reads the target image through the non-mutating accessor, so
+it no longer invalidates the target layer's cached subtree composite every
+frame, and a draw source's texture is filled once and not re-sent while its
+pixels do not change. What is left is the surface the pose is composed in:
+the motion player still creates, fills, uploads and destroys a group and a
+clip surface per frame
+(`crates/compat/src/natives/plugins/motion_player/player.rs`: the group's
+surface is created at 2190-2194, filled at 2252 and handed to the scene at
+2305; the clip's at 2443-2459; the sources are pruned at 1773).
+
+* **The next step is reusable offscreen buffers with stable source ids**, so
+  that a frame allocates nothing and uploads nothing that did not change. Two
+  hazards come with it: a reused offscreen needs the dirty story the layer
+  bitmaps already have (`crates/engine/src/scene.rs`, `BitmapState.dirty` at
+  391 and `dirty_region` at 398), and the number of live groups is the
+  constraint — a 1920×1080 RGBA8 surface is about 8 MB against the decode
+  pool's 256 MiB budget (`crates/engine/src/jobpool.rs:327`), so the buffers
+  that stay alive are what bound the frame's memory.
+* **The replacement path must take the pixels at a later content revision.**
+  Two facts make it an obligation on that step: a draw source's pixels do not
+  change while the source lives, and the scene's content revision is the
+  record of which pixels a source's texture holds. The step replaces a
+  source's pixels, so it must do that at a later revision than the one the
+  texture was filled at; if it does not, the texture keeps the old pixels and
+  the pose draws a stale picture with no error.
+
 
 ## 5. Dialogs and popups
 
@@ -1934,6 +1962,15 @@ Remaining:
   GL path is the tree's live one. The hold flag has no effect below the full
   opacity, because the cache's below-full-opacity spelling is the same with
   and without it; the compat passes it at the full opacity alone.
+* The decoded-image cache copies the pixels it holds instead of lending them
+  (`crates/engine/src/scene.rs`: the cache is at 776-857, `take_copy` at 807
+  clones the entry out, and the callers clone the pixels again at 4142 and
+  3471; a `DecodedImage` owns a `Vec<u8>` of RGBA8, so every clone copies
+  them). Lending the pixels means that every in-place pixel write becomes a
+  whole-image copy while the cache still holds a reference, because the
+  `Arc<BitmapState>` alias is fixed by `layer_ops::DrawSources`
+  (`crates/engine/src/layer_ops.rs:164`). The cache's key and its byte
+  accounting must not change.
 
 ## 19. Pixel-translation wiring decision
 

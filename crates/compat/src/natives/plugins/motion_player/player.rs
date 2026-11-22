@@ -1691,7 +1691,12 @@ impl PlayerInst {
         {
             scene.layer_size_changed(layer_id);
         }
-        let Some(bitmap) = scene.bitmap_mut(bitmap_id) else {
+        // The target's image is read, not written: the pose is drawn on the
+        // backend, and the image keeps the pixels the earlier frames left
+        // there. A mutable borrow of the image would mark the layer's
+        // cached content stale on every frame, and the cache would be
+        // rebuilt for a picture that did not change.
+        let Some(bitmap) = scene.bitmap(bitmap_id) else {
             return;
         };
         if bitmap.width == 0 || bitmap.height == 0 {
@@ -1763,9 +1768,8 @@ impl PlayerInst {
         if !scene.host_draws_lists {
             scene.draw_layer_draws(layer_id);
         }
-        // The sources the pose registered are per-frame content: the tinted
-        // icons the cache holds and the surfaces this pose composited. The
-        // rest of the table goes.
+        // The sources the pose reads are the tinted icons the cache holds
+        // and the surfaces this pose composited. The rest of the table goes.
         scene.prune_draw_sources(&live);
         // The pose changed the target's pixels, not the layer tree: setting
         // `imageModified` must not invalidate the cached layer subtree or the
