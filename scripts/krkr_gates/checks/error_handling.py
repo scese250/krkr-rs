@@ -44,12 +44,20 @@ DEAD_CODE_EXCEPTION = "crates/compat/tests/common/mod.rs"
 # error path); a fallback on them is a candidate §4 violation.  `format.i32`
 # (MediaFormat) and `str::strip_prefix` are `Option` and are handled by the
 # allowlist rather than removed from the list, so nothing is silently ignored.
+#
+# The L1 storage seam is one owner of its own: `write_at`, `flush` and
+# `append` return a `Result`, and a discarded result of one of them loses the
+# difference between "the write happened" and "it did not".  They are named
+# as the `fs` module's free functions, so the qualified call and a re-exported
+# path (`crate::platform::fs::write_at`) are both covered.
+FALLIBLE_STORAGE = r"\bfs::(?:write_at|flush|append)\("
 FALLIBLE = re.compile(
     r"(metadata\(|read_dir\(|CString::new\(|\.status\(|\.send_eof\("
     r"|\.poll\(|decode|inflate|\.lock\(|\.wait\(|\.strip_prefix\(|\.absolute\("
     r"|\.i32\(|\.i16\(|\.u8\(|\.u16\(|\.u32\(|\.u64\(|\.unicode_string\("
     r"|\.key4\(|\btry_from\(|\btry_into\(|\.integer\(|\.take\("
-    r"|\.read\(|\.write\(|\.parse\()"
+    r"|\.read\(|\.write\(|\.parse\("
+    r"|" + FALLIBLE_STORAGE + r")"
 )
 # `.ok()?` on a `try_from`/`try_into` is the out-of-range => `None` contract
 # (AGENTS §4 list calls this legitimate), so those two are not in the `.ok()`
@@ -63,7 +71,8 @@ FALLIBLE_OK = re.compile(
 # Fallible calls whose discarded result is worth flagging under `let _ =`.
 FALLIBLE_LET = re.compile(
     r"(set_member|set_call_missing|set_default_member|resolve_face"
-    r"|update_layer|\.poll\(|\.stop\(|delete_member|send_eof|call_member)"
+    r"|update_layer|\.poll\(|\.stop\(|delete_member|send_eof|call_member"
+    r"|" + FALLIBLE_STORAGE + r")"
 )
 
 UNWRAP = re.compile(r"\.unwrap_or")
@@ -960,6 +969,11 @@ SELF_TEST_GROUPS = (
         "scripts/fixtures/guard/bad_error_swallow.rs",
         ("error-swallow",),
         ("scripts/fixtures/guard/good_error_swallow.rs",),
+    ),
+    FixtureRules(
+        "scripts/fixtures/guard/bad_let_underscore.rs",
+        ("let-underscore",),
+        ("scripts/fixtures/guard/good_let_underscore.rs",),
     ),
 )
 
