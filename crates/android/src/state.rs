@@ -39,6 +39,12 @@
 //! (it logs nothing and touches no file). [`write_state_at`] is the direct,
 //! testable form used by the unit tests and works anywhere.
 //!
+//! ## The shared removal helper
+//!
+//! [`remove_path`] removes a path and reports a failure that is not a
+//! missing path. The log sink shares it ([`crate::log_file`]), so both
+//! diagnostics files report a failed removal the same way.
+//!
 //! ## What needs a device
 //!
 //! The JSON writer, the atomic replace and the missing-directory path are all
@@ -152,7 +158,9 @@ static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// same process cannot redirect the file.
 #[cfg(target_os = "android")]
 pub fn set_state_dir(dir: impl Into<PathBuf>) {
-    let _ = STATE_DIR.set(dir.into());
+    // A later call is ignored on purpose: the directory that lost the race
+    // is dropped, and the first one keeps the file.
+    drop(STATE_DIR.set(dir.into()));
 }
 
 /// The configured state directory, or `None` on a host build.
@@ -220,7 +228,9 @@ pub fn write_state_at(dir: &Path, state: State, message: Option<&str>) -> std::i
 /// failure it records.
 ///
 /// This is the direct form of the writer the tests exercise; it works
-/// anywhere, with or without a configured state directory.
+/// anywhere, with or without a configured state directory. The error of the
+/// write itself is returned; a temp file that cannot be removed after a
+/// failed write is reported to stderr.
 pub fn write_state_at_kind(
     dir: &Path,
     state: State,
@@ -243,18 +253,18 @@ pub fn write_state_at_kind(
     let mut file = std::fs::File::create(&temp)?;
     if let Err(e) = file.write_all(json.as_bytes()) {
         drop(file);
-        let _ = std::fs::remove_file(&temp);
+        remove_path(&temp);
         return Err(e);
     }
     if let Err(e) = file.sync_all() {
         drop(file);
-        let _ = std::fs::remove_file(&temp);
+        remove_path(&temp);
         return Err(e);
     }
     drop(file);
     if let Err(e) = std::fs::rename(&temp, &destination) {
         // Leave no temp file behind if the replace failed.
-        let _ = std::fs::remove_file(&temp);
+        remove_path(&temp);
         return Err(e);
     }
     Ok(())
@@ -312,7 +322,6 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 /// Escape a string for embedding in a JSON string literal.
 fn escape_json(s: &str) -> String {
-    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -322,12 +331,50 @@ fn escape_json(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if c.is_control() => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
+                out.push_str(&format!("\\u{:04x}", c as u32));
             }
             c => out.push(c),
         }
     }
     out
+}
+
+/// What a removal did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Removal {
+    /// The path was removed.
+    Removed,
+    /// The path was not there; there was nothing to remove.
+    Missing,
+    /// The removal failed and the failure was reported to stderr.
+    Failed,
+}
+
+/// Removes `path`, whether it is a file or a directory tree.
+///
+/// A path that is not there is not a failure: the log's rotation slots fill
+/// in as the rotations accumulate, and a temp file that was never created
+/// needs no report. Any other failure is reported to stderr, the way a
+/// failed rotation is reported: the log file is the only diagnostic a device
+/// crash leaves behind, so a removal that did not happen cannot pass
+/// unnoticed.
+///
+/// The result says what the removal did; the failure itself is already
+/// reported, so a caller has nothing left to do with it.
+pub(crate) fn remove_path(path: &Path) -> Removal {
+    let result = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match result {
+        Ok(()) => Removal::Removed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Removal::Missing,
+        Err(error) => {
+            eprintln!("krkr-rs: cannot remove {}: {error}", path.display());
+            Removal::Failed
+        }
+    }
 }
 
 #[cfg(test)]
@@ -373,7 +420,7 @@ mod tests {
         assert!(json.contains("\"at\": \""), "json: {json}");
         assert!(json.trim_end().ends_with('}'), "json: {json}");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_path(&dir);
     }
 
     #[test]
@@ -392,8 +439,13 @@ mod tests {
         // The replace must leave exactly one state file and no temp file.
         let leftovers: Vec<String> = std::fs::read_dir(&dir)
             .expect("read dir")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .map(|entry| {
+                entry
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .filter(|name| name.starts_with(STATE_FILE_NAME))
             .collect();
         assert_eq!(
@@ -402,7 +454,7 @@ mod tests {
             "only the destination may remain"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_path(&dir);
     }
 
     #[test]
@@ -487,7 +539,7 @@ mod tests {
         assert!(json.contains("\"state\": \"failed\""), "json: {json}");
         assert!(json.contains("cannot open the game"), "json: {json}");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_path(&dir);
     }
 
     /// A failure carries the kind of failure it is, so the launcher can tell a
@@ -518,6 +570,46 @@ mod tests {
         let json = std::fs::read_to_string(dir.join(STATE_FILE_NAME)).expect("read state file");
         assert!(json.contains("\"kind\": null"), "json: {json}");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_path(&dir);
+    }
+
+    /// A removal that fails for a reason other than a missing path is
+    /// reported; a missing path is not a failure and is not reported.
+    #[test]
+    fn a_failed_removal_is_reported_and_a_missing_path_is_not() {
+        let dir = scratch_dir("remove");
+        // A path with an interior NUL byte cannot be handed to the operating
+        // system, so the removal fails with `InvalidInput`: a failure and not
+        // a missing path, on every host.
+        let unusable = dir.join("unusable\0name");
+        assert_eq!(
+            remove_path(&unusable),
+            Removal::Failed,
+            "a removal that fails for another reason must be reported"
+        );
+
+        // A path that is not there is not a failure: the rotation slots fill
+        // in as the rotations accumulate.
+        let missing = dir.join("never-written");
+        assert_eq!(
+            remove_path(&missing),
+            Removal::Missing,
+            "a missing path must not be reported"
+        );
+
+        // A file that is there is removed.
+        let present = dir.join("present");
+        std::fs::write(&present, "record").expect("write scratch file");
+        assert_eq!(remove_path(&present), Removal::Removed);
+        assert!(!present.exists(), "the file must be gone");
+
+        // A directory is removed as well.
+        let tree = dir.join("tree");
+        std::fs::create_dir(&tree).expect("create scratch tree");
+        std::fs::write(tree.join("record"), "record").expect("write scratch file");
+        assert_eq!(remove_path(&tree), Removal::Removed);
+        assert!(!tree.exists(), "the tree must be gone");
+
+        remove_path(&dir);
     }
 }

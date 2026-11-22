@@ -28,6 +28,11 @@
 //!   failure cascade therefore cannot fill the device's storage and cannot
 //!   push the start of the session out of the retained history.
 //!
+//! A failure that is not a missing path is reported to stderr: a failed
+//! write, a failed flush, a failed rename and a failed removal. A missing
+//! path is not a failure: the rotation slots fill in as the rotations
+//! accumulate, and a path that is not there needs no report.
+//!
 //! The line format is `"<rfc3339> <LEVEL> <message>"` ([`format_record`]).
 //!
 //! ## What needs a device
@@ -74,9 +79,9 @@ pub(crate) struct FileSink {
     max_bytes: u64,
     file: Option<File>,
     written: u64,
-    /// Set after the first failure to (re)open the file so a broken sink does
-    /// not print on every record. The logger cannot log its own failure
-    /// without recursing, so stderr is used once and then kept quiet.
+    /// Set after the first failure of the sink, so a broken sink does not
+    /// print on every record. The logger cannot log its own failure without
+    /// recursing, so stderr is used once and then kept quiet.
     reported_error: bool,
 }
 
@@ -121,26 +126,56 @@ impl FileSink {
     /// Rotation happens before the write when it would push the file past the
     /// cap. A line larger than the whole cap is still written once, so the
     /// file is bracketed by `2 * max_bytes` rather than truncated mid-record.
+    ///
+    /// A write that fails is reported to stderr and the record is lost: the
+    /// file is the only place the record can go.
     pub(crate) fn write_line(&mut self, line: &str) {
         // One `usize`-to-`u64` widening; a line cannot be larger than memory.
         let line_len = line.len() as u64 + 1;
         if self.written.saturating_add(line_len) > self.max_bytes {
             self.rotate();
         }
-        let written = match self.ensure_open() {
-            Some(file) => file.write_all(line.as_bytes()).is_ok() && file.write_all(b"\n").is_ok(),
-            None => false,
+        let Some(file) = self.ensure_open() else {
+            // The open failure was reported already.
+            return;
         };
-        if written {
-            self.written = self.written.saturating_add(line_len);
+        let outcome = file
+            .write_all(line.as_bytes())
+            .and_then(|()| file.write_all(b"\n"));
+        if let Err(error) = outcome {
+            let message = format!("cannot write log file {}: {error}", self.path.display());
+            self.report_failure(&message);
+            return;
+        }
+        self.written = self.written.saturating_add(line_len);
+    }
+
+    /// Flush the current file.
+    ///
+    /// A flush failure is reported to stderr every time it happens: the
+    /// flush is not part of the per-record path, and the file is the only
+    /// diagnostic a device crash leaves behind.
+    pub(crate) fn flush(&mut self) {
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if let Err(error) = file.flush() {
+            eprintln!(
+                "krkr-rs: cannot flush log file {}: {error}",
+                self.path.display()
+            );
         }
     }
 
-    /// Flush the current file, ignoring a flush failure (the sink reports its
-    /// own errors once in [`Self::ensure_open`]).
-    pub(crate) fn flush(&mut self) {
-        if let Some(file) = self.file.as_mut() {
-            let _ = file.flush();
+    /// Reports a failure of the sink to stderr, once.
+    ///
+    /// The logger cannot log its own failure without recursing, so stderr is
+    /// the channel; a broken sink reports once and then stays quiet, so a
+    /// failing disk does not print on every record.
+    fn report_failure(&mut self, message: &str) {
+        if !self.reported_error {
+            self.reported_error = true;
+            eprintln!("krkr-rs: {message}");
         }
     }
 
@@ -151,11 +186,12 @@ impl FileSink {
     ///
     /// A failed rename is reported to stderr and the next slot is still
     /// shifted, so one unreadable file cannot stop the current log from being
-    /// preserved. A rotation that could not move `path` leaves it in place;
-    /// the next write reopens it and continues, so no record is invented.
+    /// preserved. A failed removal is reported the same way. A rotation that
+    /// could not move `path` leaves it in place; the next write reopens it
+    /// and continues, so no record is invented.
     fn rotate(&mut self) {
         self.file = None;
-        let _ = std::fs::remove_file(rotated_path(&self.path, self.keep));
+        crate::state::remove_path(&rotated_path(&self.path, self.keep));
         for index in (1..self.keep).rev() {
             let from = rotated_path(&self.path, index);
             let to = rotated_path(&self.path, index + 1);
@@ -198,24 +234,15 @@ impl FileSink {
                         self.file = Some(file);
                     }
                     Err(error) => {
-                        if !self.reported_error {
-                            self.reported_error = true;
-                            eprintln!(
-                                "krkr-rs: cannot stat log file {}: {error}",
-                                self.path.display()
-                            );
-                        }
+                        let message =
+                            format!("cannot stat log file {}: {error}", self.path.display());
+                        self.report_failure(&message);
                         return None;
                     }
                 },
                 Err(error) => {
-                    if !self.reported_error {
-                        self.reported_error = true;
-                        eprintln!(
-                            "krkr-rs: cannot open log file {}: {error}",
-                            self.path.display()
-                        );
-                    }
+                    let message = format!("cannot open log file {}: {error}", self.path.display());
+                    self.report_failure(&message);
                     return None;
                 }
             }
@@ -296,7 +323,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).expect("read log");
         assert!(content.contains("first\n"), "content: {content}");
         assert!(content.contains("second\n"), "content: {content}");
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::state::remove_path(&dir);
     }
 
     /// Flushing an open sink must not panic and must not lose the line.
@@ -310,7 +337,7 @@ mod tests {
         sink.flush();
         let content = std::fs::read_to_string(&path).expect("read log");
         assert!(content.contains("line\n"), "content: {content}");
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::state::remove_path(&dir);
     }
 
     /// One rotation moves the current file into the first slot and the new
@@ -333,7 +360,7 @@ mod tests {
         assert!(!previous.contains("third line"), "previous: {previous}");
         assert!(current.contains("third line"), "current: {current}");
         assert!(current.contains("fourth line"), "current: {current}");
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::state::remove_path(&dir);
     }
 
     /// Each rotation shifts the existing slots up one and moves the current
@@ -358,7 +385,7 @@ mod tests {
         assert!(slot1.contains("new batch a"), "slot 1: {slot1}");
         assert!(slot2.contains("old batch b"), "slot 2: {slot2}");
         assert!(slot3.contains("old batch a"), "slot 3: {slot3}");
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::state::remove_path(&dir);
     }
 
     /// The sink keeps exactly [`LOG_ROTATED_FILES`] rotations: every configured
@@ -383,7 +410,7 @@ mod tests {
                 .exists(),
             "the sink must not keep a slot past LOG_ROTATED_FILES"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::state::remove_path(&dir);
     }
 
     /// Once the slots are full the oldest is dropped rather than kept in a
@@ -411,7 +438,7 @@ mod tests {
             assert!(!text.contains("line-1"), "oldest dropped: {name}: {text}");
             assert!(!text.contains("line-2"), "oldest dropped: {name}: {text}");
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::state::remove_path(&dir);
     }
 
     /// A file left by a previous process is rotated into the first slot on the
@@ -432,7 +459,7 @@ mod tests {
         assert!(!slot1.contains("after"), "slot 1: {slot1}");
         assert!(current.contains("after"), "current: {current}");
         assert!(!current.contains("before"), "current: {current}");
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::state::remove_path(&dir);
     }
 
     /// No file grows past the cap: the byte accounting holds for the current
@@ -458,7 +485,7 @@ mod tests {
             let len = file.metadata().expect("metadata").len();
             assert!(len <= cap, "slot {slot} is {len} bytes, cap {cap}");
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::state::remove_path(&dir);
     }
 
     /// A missing directory is a returned error, never a panic and never an

@@ -176,7 +176,8 @@ the destination. The rename is what makes the replace atomic; without the
 fsync, a power loss could leave the previous `starting`/`running` visible
 after the new state was reported, which the launcher would read as a crash. A
 failed create/write/sync/rename leaves the previous state intact and never
-panics.
+panics. A temp file that cannot be removed after a failed write is reported
+to stderr; a temp file that is not there is not a failure.
 
 A failure to write the state file is logged and swallowed: the state file is
 a debugging aid and must not itself become a startup failure. On a host
@@ -209,6 +210,14 @@ a leading partial line.
 * A failed rename during the rotation is reported to stderr and the next slot
   is still shifted, so one unreadable file cannot stop the current log from
   being preserved.
+* Every other failure of the sink is reported to stderr as well: a failed
+  write, a failed flush and a failed removal are never silent. The write
+  path reports once, so a failing disk does not print on every record; the
+  flush and the removals report every time they happen.
+* A missing path is not a failure: the rotation slots fill in as the
+  rotations accumulate, and a path that is not there needs no report. The
+  state file's temp file and the log's rotations share one removal helper
+  (`state::remove_path`), so both report a failed removal the same way.
 
 ---
 
@@ -254,6 +263,8 @@ Android-only.
 | a panic unwinds out of the entry point | the panic hook writes `failed` with the kind `panic`, the panic's payload and its location; the panic itself continues |
 | the state file cannot be written | logged and swallowed (the file is a debugging aid) |
 | the log file cannot be opened or written | reported to stderr once (the logger cannot log its own failure without recursing) |
+| the log file cannot be flushed | reported to stderr; the records are not on disk |
+| a rotated file or the state file's temp file cannot be removed | reported to stderr; a missing path is not a failure |
 
 A fatal error is **reported**, never swallowed and never replaced by a
 fallback.
@@ -264,7 +275,9 @@ fallback.
 
 * `crates/android/src/state.rs` `mod tests` — the JSON shape, the RFC 3339
   timestamp, the atomic replace, the missing-directory path, the kind a
-  failure records and the `RunOutcome` precedence (a failure is terminal).
+  failure records, the `RunOutcome` precedence (a failure is terminal) and
+  the removal helper (a removal that fails for another reason is reported, a
+  missing path is not).
 * `crates/android/src/log_file.rs` `mod tests` — the record format, the byte
   accounting, the multi-step rotation (the slot order, the dropped oldest, a
   previous process's file rotated rather than appended, and the cap holding
