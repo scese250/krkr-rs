@@ -95,6 +95,45 @@ residuals:
      save was refused. The port now creates those folders; the residual
      question is the `G//G/` spelling in the original log, which this title
      does not produce.
+4. **The title screen's motion paid two full-canvas operations every frame.**
+   A device run of the game "LimeLight Lemonade Jam" showed slow frames of
+   262-567 ms with `host.sync_upload` up to 318 ms, and another title of the
+   same engine family showed the same signature. Two per-frame items in the
+   motion's pose path explained it, and both are landed:
+   * the pose cleared the target layer's **image** on the CPU, which dirtied
+     the canvas and put 1920x1080x4 bytes into every frame's upload - while
+     the pose itself is drawn on the GPU and never travels back to the host.
+     The clear now rides with the pose onto the pose surface, the port's
+     counterpart of the reference's own render target
+     (`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:135-152`);
+   * a node whose paint box was trimmed by its shape's viewport was rendered
+     into a fresh offscreen bitmap every frame - an allocation, a CPU
+     rasterization, a GPU upload and a destroy - because the draw list could
+     not express a clip. The clip is now a rectangle of the draw list, and
+     the node's pixels are the icon's texture, which the device holds
+     already.
+   **Not verified on a device.** The host figures are the desktop's: this
+   title's motion is 11-14 ms of CPU per frame in a release run (the figure
+   in section 11 for the sibling title), and a desktop Vulkan run of this
+   title is smooth. No phone was connected when the change was made, so
+   "the phone's title animation is now smooth" is NOT established - only
+   "the two per-frame operations that made it slow are gone". The device
+   run that would establish it is owed.
+5. **The title's movie raises in the game's own `onFrameUpdate` handler.**
+   The same device run logged 250 `onFrameUpdate` exceptions in about two
+   seconds on the title screen. The port's video event dispatch is not the
+   raiser - it calls the owner's member only when the owner has one
+   (`reference/cpp/core/base/EventIntf.cpp:97-111`,
+   `reference/cpp/core/tjs2/tjsObject.cpp:1214-1226`) - and this game's
+   owner does define `onFrameUpdate`; the raise is inside the game's own
+   handler (`system/movie.tjs` in the game's data). Which call raises -
+   `Layer.stretchCopy`, `assignImages`, `fillRect` or `setSize` - is not
+   established: the device log that named it is gone, and the title cannot
+   be reached from a headless run on this host (the game waits for a click on
+   its warning screen, and the host has no virtual display and no way to
+   click). The port writes the reason verbatim
+   (`compat.video: onFrameUpdate handler failed: ...`), so the next device
+   log names the raiser without further work.
 
 ## 4. Rendering and layers
 
