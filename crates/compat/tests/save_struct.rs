@@ -9,6 +9,9 @@
 //! the textual `saveStruct` form and the UTF-16LE files the `save*` members
 //! write.
 //!
+//! The plugin has a second text form, and `Scripts.toStructString` writes it:
+//! the tests at the end of this file drive that member and pin its text.
+//!
 //! Every test serializes on the shared VM lock, since the process-wide
 //! engine → context binding is single.
 
@@ -598,4 +601,278 @@ fn empty_array_serializes_to_brackets() {
     let env = Env::new();
 
     assert_eq!(env.string("[].toStructString()"), "[]");
+}
+
+// ---------------------------------------------------------------------------
+// `Scripts.toStructString` — the plugin's second text form
+// ---------------------------------------------------------------------------
+
+// The upstream attaches `Scripts.toStructString(target [, newline [, option]])`
+// to the `Scripts` class object as a static member (`Main.cpp:381-383`), and
+// the member serializes the target into the plugin's structural text form
+// (`Main.cpp:184-208`). A dictionary is written as `%[` … `]`
+// (`Main.cpp:150-159`) with the entries separated by `,` and the newline
+// (`Main.cpp:118-119`), and the member order is the VM's own enumeration
+// order.
+//
+// The dictionary literal of this engine spells an entry `name: value`
+// (`%[a: 1]`); the upstream's own literal spelling does not parse here, and
+// the members it names are the same.
+#[test]
+fn scripts_to_struct_string_writes_the_dictionary_form() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    env.run("var empty = Scripts.toStructString(%[]);");
+    assert_eq!(env.string("empty"), "%[]");
+
+    env.run("var pair = Scripts.toStructString(%[a: 1, b: \"x\"]);");
+    assert_eq!(env.string("pair"), "%[\"a\"=>int 1,\n\"b\"=>\"x\"]");
+}
+
+// The indent bit (`Main.cpp:116`, `Main.cpp:144`; the writer
+// `json/Writer.hpp:30-45`) breaks a container across lines: the first entry
+// starts on a new line one space deeper than the container, the entries
+// stay separated by `,` and the newline, and the closing bracket stands
+// alone at the container's own level.
+#[test]
+fn scripts_to_struct_string_indents_the_containers() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    env.run("var flat = Scripts.toStructString(%[a: 1, b: \"x\"], 1, 1);");
+    assert_eq!(env.string("flat"), "%[\n \"a\"=>int 1,\n \"b\"=>\"x\"\n]");
+
+    env.run("var nested = Scripts.toStructString(%[a: %[b: 1]], 1, 1);");
+    assert_eq!(
+        env.string("nested"),
+        "%[\n \"a\"=>%[\n  \"b\"=>int 1\n ]\n]"
+    );
+}
+
+// An array is written as `[` … `]` (`Main.cpp:162-182`): the elements are
+// separated by `,` (`Main.cpp:171-174`), and the indent breaks the array
+// across lines unless the array-ignores-indent bit is set
+// (`Main.cpp:168`, `Main.cpp:180`). An empty container is never broken
+// across lines (`Main.cpp:144`, `Main.cpp:168`).
+#[test]
+fn scripts_to_struct_string_writes_the_array_form() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    env.run("var flat = Scripts.toStructString([1, 2]);");
+    assert_eq!(env.string("flat"), "[int 1,int 2]");
+
+    env.run("var indented = Scripts.toStructString([1, 2], 1, 1);");
+    assert_eq!(env.string("indented"), "[\n int 1,\n int 2\n]");
+
+    env.run("var one_line = Scripts.toStructString([1, 2], 1, 1 | 2048);");
+    assert_eq!(env.string("one_line"), "[int 1,int 2]");
+
+    env.run("var empty = Scripts.toStructString([]);");
+    assert_eq!(env.string("empty"), "[]");
+}
+
+// The const bit (`Main.cpp:202`, `Main.cpp:150`, `Main.cpp:164`) writes
+// `(const)` in front of every container and drops the `int ` and `real `
+// type prefixes at every depth; the type-prefix bit (`Main.cpp:202`) drops
+// the prefixes without the `(const)`.
+#[test]
+fn scripts_to_struct_string_writes_the_const_form() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    env.run("var constant = Scripts.toStructString(%[a: 1], 1, 2);");
+    assert_eq!(env.string("constant"), "(const)%[\"a\"=>1]");
+
+    env.run("var no_prefix = Scripts.toStructString([1, 2], 1, 1024);");
+    assert_eq!(env.string("no_prefix"), "[1,2]");
+}
+
+// The sort bit (`Main.cpp:99-101`, `Main.cpp:130-143`) writes a
+// dictionary's entries in ascending name order; without it the entries keep
+// the VM's own member order, which for `%[b: 2, a: 1, c: 3]` puts `c`
+// first.
+#[test]
+fn scripts_to_struct_string_sorts_the_entries() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    env.run("var sorted = Scripts.toStructString(%[b: 1, a: \"x\"], 1, 4);");
+    assert_eq!(env.string("sorted"), "%[\"a\"=>\"x\",\n\"b\"=>int 1]");
+
+    env.run("var unsorted = Scripts.toStructString(%[b: 2, a: 1, c: 3]);");
+    assert_eq!(
+        env.string("unsorted"),
+        "%[\"c\"=>int 3,\n\"a\"=>int 1,\n\"b\"=>int 2]"
+    );
+
+    env.run("var ordered = Scripts.toStructString(%[b: 2, a: 1, c: 3], 1, 4);");
+    assert_eq!(
+        env.string("ordered"),
+        "%[\"a\"=>int 1,\n\"b\"=>int 2,\n\"c\"=>int 3]"
+    );
+}
+
+// The option argument defaults to `0` when it is absent (`Main.cpp:374`):
+// the default form is neither indented nor sorted. The upstream's manual
+// declares the default as `ssoIndent|ssoSort` (`manual.tjs:57`), but the
+// implementation passes `0`, so the entries keep the VM's member order.
+#[test]
+fn scripts_to_struct_string_defaults_to_no_options() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    env.run("var text = Scripts.toStructString(%[b: 2, a: 1, c: 3]);");
+    assert_eq!(
+        env.string("text"),
+        "%[\"c\"=>int 3,\n\"a\"=>int 1,\n\"b\"=>int 2]"
+    );
+}
+
+// The value texts (`Main.cpp:200-207`): the type prefix is `int ` or `real `
+// (`Main.cpp:203-204`) and the expression text is the VM's own
+// (`Main.cpp:206`; the engine's VM
+// `crates/tjs/cpp/tjs2/tjsUtils.cpp:174-232`). A `null` value is `null`
+// (`Main.cpp:192-193`) and a `void` value is `void`. The real's text is the
+// hexadecimal form and the decimal form in a comment (the engine's VM
+// `crates/tjs/cpp/tjs2/tjsVariant.cpp:219-297`), the string's text is the
+// C-escaped content (the engine's VM
+// `crates/tjs/cpp/tjs2/tjsString.cpp:164-231`) and the octet's text is the
+// uppercase hexadecimal bytes (the engine's VM
+// `crates/tjs/cpp/tjs2/tjsVariant.cpp:114-140`).
+#[test]
+fn scripts_to_struct_string_writes_the_value_texts() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    env.run("var realValue = Scripts.toStructString(1.5);");
+    assert_eq!(
+        env.string("realValue"),
+        "real 0x1.8000000000000p0 /* 1.5 */"
+    );
+
+    env.run("var one = Scripts.toStructString(1.0);");
+    assert_eq!(env.string("one"), "real 0x1.0000000000000p0 /* 1 */");
+
+    env.run("var quote = Scripts.toStructString(\"a\\\"b\");");
+    assert_eq!(env.string("quote"), "\"a\\\"b\"");
+
+    env.run("var line = Scripts.toStructString(\"a\\nb\");");
+    assert_eq!(env.string("line"), "\"a\\nb\"");
+
+    env.run("var octetValue = Scripts.toStructString(<% 00 ff %>);");
+    assert_eq!(env.string("octetValue"), "<% 00 FF %>");
+
+    env.run("var nothing = Scripts.toStructString(null);");
+    assert_eq!(env.string("nothing"), "null");
+
+    env.run("var voided = Scripts.toStructString(void);");
+    assert_eq!(env.string("voided"), "void");
+
+    env.run("var negative = Scripts.toStructString(-42);");
+    assert_eq!(env.string("negative"), "int -42");
+}
+
+// The newline selector (`Main.cpp:372`; the writer `json/Writer.hpp:12-23`):
+// the selector `1` is LF and every other value is CRLF. The selector
+// defaults to `1` when the argument is absent (`Main.cpp:372`).
+#[test]
+fn scripts_to_struct_string_selects_the_newline() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    env.run("var lf = Scripts.toStructString(%[a: 1, b: 2]);");
+    assert_eq!(env.string("lf"), "%[\"a\"=>int 1,\n\"b\"=>int 2]");
+
+    env.run("var crlf = Scripts.toStructString(%[a: 1, b: 2], 0);");
+    assert_eq!(env.string("crlf"), "%[\"a\"=>int 1,\r\n\"b\"=>int 2]");
+
+    env.run("var other = Scripts.toStructString(%[a: 1, b: 2], 2);");
+    assert_eq!(env.string("other"), "%[\"a\"=>int 1,\r\n\"b\"=>int 2]");
+}
+
+// The member needs a target (`Main.cpp:370`).
+#[test]
+fn scripts_to_struct_string_requires_a_target() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    let error = env
+        .engine
+        .eval("Scripts.toStructString()", "save-struct-test")
+        .expect_err("the call without a target must raise");
+    assert!(
+        error.to_string().contains("requires 1 argument"),
+        "unexpected error: {error}"
+    );
+}
+
+// The newline and the option are read as integers (`Main.cpp:372`,
+// `Main.cpp:374`); the VM's integer conversion raises for an object and for
+// an octet (the engine's VM
+// `crates/tjs/cpp/tjs2/tjsVariant.h:864-884`).
+#[test]
+fn scripts_to_struct_string_rejects_a_non_numeric_argument() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    for call in [
+        "Scripts.toStructString(%[a: 1], %[])",
+        "Scripts.toStructString(%[a: 1], 1, %[])",
+    ] {
+        let error = env
+            .engine
+            .eval(call, "save-struct-test")
+            .err()
+            .unwrap_or_else(|| panic!("{call} should have raised"));
+        assert!(!error.to_string().is_empty(), "{call}: empty error");
+    }
+}
+
+// The hidden-member bit (`Main.cpp:98`) asks for the members a class marks
+// hidden. The engine's member enumeration does not report them, so the
+// member raises on the bit instead of accepting it and writing the same
+// text as without it.
+#[test]
+fn scripts_to_struct_string_rejects_the_hidden_option() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    let error = env
+        .engine
+        .eval("Scripts.toStructString(%[a: 1], 1, 8)", "save-struct-test")
+        .expect_err("the hidden-member bit must raise");
+    assert!(
+        error.to_string().contains("hidden"),
+        "unexpected error: {error}"
+    );
+}
+
+// The upstream attaches the member to the `Scripts` class object
+// (`Main.cpp:381-383`), so the class carries it. The traversal helper lives
+// on a namespace the plugin removes from the global object
+// (`Main.cpp:411-421`), so the script sees no helper function.
+#[test]
+fn the_scripts_member_is_a_static_member_without_leaking_helpers() {
+    let _lock = vm_lock();
+    let env = Env::new();
+
+    assert_eq!(env.string("typeof Scripts.toStructString"), "Object");
+
+    for name in [
+        "__krkr_save_struct_scripts_ns",
+        "__krkr_save_struct_scripts_kind",
+        "__krkr_save_struct_scripts_push_node",
+        "__krkr_save_struct_scripts_push_array",
+        "__krkr_save_struct_scripts_push_dict",
+        "__krkr_save_struct_scripts_tree",
+        "__krkr_save_struct_scripts_is_array",
+    ] {
+        assert_eq!(
+            env.string(&format!("typeof global.{name}")),
+            "undefined",
+            "{name} must not be a global"
+        );
+    }
 }

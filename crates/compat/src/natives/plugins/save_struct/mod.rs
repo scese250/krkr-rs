@@ -11,6 +11,7 @@
 //! | `Array`      | `toStructString`  | return the `saveStruct` form as a string               |
 //! | `Dictionary` | `saveStruct2`     | write the `saveStruct` form to a file                  |
 //! | `Dictionary` | `toStructString`  | return the `saveStruct` form as a string               |
+//! | `Scripts`    | `toStructString`  | return the second text form as a string                |
 //!
 //! The reference attaches these with `NCB_ATTACH_CLASS`. Its `ArrayAdd`
 //! members use no static flag (`reference/cpp/plugins/saveStruct.cpp:310-313`),
@@ -47,6 +48,22 @@
 //! `%["k"=>v]`, `<% xx %>`), and member enumeration must run through the
 //! VM (`Array.assign`), so the serializer stays the reference's TJS script.
 //!
+//! # The two text forms
+//!
+//! The plugin has two revisions, and the engine carries the members of both.
+//! The `Array` and `Dictionary` members above write the form of the first
+//! revision — the one those members follow — and `Scripts.toStructString`
+//! writes the form of the second revision, the one that added the `Scripts`
+//! member and the formatting flags. The two forms read differently (a
+//! `null` value, a real, an octet and a string have their own text in each)
+//! and lay out differently (the newline default and the formatting flags),
+//! so each member keeps the form of the revision it belongs to and the two
+//! are never mixed.
+//!
+//! The second form lives in [`scripts_member`]: its traversal runs in the VM
+//! (the builtin `Array.assign` walk, as above) and its text is written in
+//! Rust.
+//!
 //! # Files
 //!
 //! `save2`/`saveStruct2` resolve a relative name against the attached L2
@@ -54,6 +71,8 @@
 //! raw `tjs_char` stream the reference's `tTVPStringStream` produces: UTF-16LE
 //! with no BOM or crypt container.
 #![allow(unsafe_code)]
+
+mod scripts_member;
 
 use std::ffi::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -603,6 +622,10 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
         &[],
     )
     .map_err(CompatError::Register)?;
+
+    // The `Scripts` member writes the second text form; its own module
+    // installs the traversal helper and the member.
+    scripts_member::register(ctx)?;
 
     Ok(())
 }
