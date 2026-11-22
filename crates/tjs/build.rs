@@ -34,6 +34,11 @@
 //! * `CXX` — C++ compiler for the TJS2 sources (default: `zig c++`).
 //! * `AR` — archiver used for `libonig.a` and `libtjs2_core.a` (default:
 //!   `ar`).
+//! * `KRKR_CHECK_HASH_ORDER` — set it to `1` to compile the hash table's
+//!   additional order list check into the build. The check walks the whole
+//!   table on every operation and aborts the process on the first violation
+//!   of the list's bookkeeping, so it is a diagnostic to switch on while the
+//!   bookkeeping is investigated, never a setting to leave on.
 //!
 //! When `CC` is not set the original `zig build` path is used unchanged.
 //!
@@ -526,6 +531,20 @@ fn main() {
         flags.push("-DDEBUG".into());
     }
 
+    // `KRKR_CHECK_HASH_ORDER=1` compiles the hash table's additional order
+    // list check into the build: the check walks the whole table on every
+    // operation and aborts the process on the first violation, so it is a
+    // diagnostic to switch on while the list's bookkeeping is investigated,
+    // not a build setting to leave on.
+    println!("cargo:rerun-if-env-changed=KRKR_CHECK_HASH_ORDER");
+    let check_hash_order = env::var("KRKR_CHECK_HASH_ORDER").is_ok_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true")
+    });
+    if check_hash_order {
+        flags.push("-DTJS_HS_CHECK_ORDER".into());
+    }
+
     // krkr-rs: optimisation level for the vendored C++ VM.
     //
     // The vendored sources may be optimised because a member call on a null
@@ -558,6 +577,9 @@ fn main() {
     }
     sources.push(manifest_dir.join("cpp/tjs2_abi.cpp"));
     sources.push(manifest_dir.join("cpp/streams.cpp"));
+    // The hash table's order-list helper: it is only called from the crate's
+    // tests, so the linker leaves it out of every other binary.
+    sources.push(manifest_dir.join("cpp/hash_order_test.cpp"));
 
     let failed = std::sync::Arc::new(AtomicUsize::new(0));
     let lock = std::sync::Arc::new(Mutex::new(()));

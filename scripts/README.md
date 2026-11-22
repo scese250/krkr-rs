@@ -208,6 +208,14 @@ fire.
 
   The variable must point at the clone root that holds `tests/test_files`
   (and the `cpp/` directory that marks a clone as the checkout).
+- `KRKR_CHECK_HASH_ORDER` — set it to `1` (or `true`) to compile the TJS2 hash
+  table's additional order list check into the build
+  (`KRKR_CHECK_HASH_ORDER=1 cargo build`). The check walks the whole table on
+  every operation and aborts the process on the first violation of the list's
+  bookkeeping, naming the operation that broke it and the operations that led
+  to it. It is off unless the variable is set, and it is a diagnostic to
+  switch on while the bookkeeping is investigated, never a setting to leave
+  on.
 
 ## Notes
 

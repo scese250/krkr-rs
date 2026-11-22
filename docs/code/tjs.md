@@ -23,7 +23,7 @@ instance and drives it; see [vm.md](vm.md) and
 | the vendored C++ sources | `crates/tjs/cpp/tjs2/` — 32 `.cpp` and 37 `.h` |
 | the bison grammar | `crates/tjs/cpp/tjs2/bison/` (`tjsdate.y`) |
 | the C ABI shim | `crates/tjs/cpp/tjs2_abi.cpp` and `tjs2_abi.h` |
-| the port-authored C++ | `crates/tjs/cpp/streams.cpp` — the TJS stream IO |
+| the port-authored C++ | `crates/tjs/cpp/streams.cpp` (the TJS stream IO) and `crates/tjs/cpp/hash_order_test.cpp` (the hash table's order-list harness) |
 | the Rust binding | `crates/tjs/src/lib.rs` — the `tjs2_*` `extern "C"` surface and the safe wrapper |
 | the build script | `crates/tjs/build.rs` |
 | the Rust script columns | `crates/tjs/src/vm/` — the lexer, the parser and the code generator |
@@ -67,6 +67,17 @@ and the VM's own allocations are checked too.
 TJS2_EXTRA_CXXFLAGS='-fsanitize=address -fno-omit-frame-pointer' \
 RUSTFLAGS='-Zsanitizer=address' \
 cargo +nightly build -p app --bin krkr --target x86_64-unknown-linux-gnu
+```
+
+`KRKR_CHECK_HASH_ORDER=1` compiles the hash table's additional order list
+check into the build: the check walks the whole table on every operation and
+aborts the process on the first violation of the list's bookkeeping, naming
+the operation that broke it and the operations that led to it. It is off
+unless the variable is set, and it is a diagnostic to switch on while the
+bookkeeping is investigated, never a setting to leave on.
+
+```sh
+KRKR_CHECK_HASH_ORDER=1 cargo build
 ```
 
 After the compile, the produced objects are checked against the Cargo

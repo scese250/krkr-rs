@@ -20,8 +20,19 @@
 #define TJS_HS_DEFAULT_HASH_SIZE 64
 #define TJS_HS_HASH_USING 0x1
 #define TJS_HS_HASH_LV1 0x2
+#ifdef TJS_HS_CHECK_ORDER
+#define TJS_HS_HASH_INORDER 0x4 // the element is in the additional order list
+#endif
 
 // #define TJS_HS_DEBUG_CHAIN  // to debug chain algorithm
+
+// #define TJS_HS_CHECK_ORDER  // to check the additional order list invariants
+
+#ifdef TJS_HS_CHECK_ORDER
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#endif
 
 namespace TJS {
     //---------------------------------------------------------------------------
@@ -250,6 +261,7 @@ namespace TJS {
                         // are same
                         CheckUpdateElementOrder(elm);
                         *(ValueT *)elm->Value = value;
+                        OrderOp("add-existing", elm, &key);
                         return;
                     }
                 }
@@ -264,6 +276,7 @@ namespace TJS {
                 lv1->Prev = nullptr;
                 // not initialize lv1->Next here
                 CheckAddingElementOrder(lv1);
+                OrderOp("add-lv1", lv1, &key);
                 return;
             }
 
@@ -275,6 +288,7 @@ namespace TJS {
                     // same
                     CheckUpdateElementOrder(lv1);
                     *(ValueT *)lv1->Value = value;
+                    OrderOp("add-existing-lv1", lv1, &key);
                     return;
                 }
             }
@@ -290,6 +304,7 @@ namespace TJS {
             newelm->Prev = lv1;
             lv1->Next = newelm;
             CheckAddingElementOrder(newelm);
+            OrderOp("add-chain", newelm, &key);
         }
 
         [[nodiscard]] ValueT *Find(const KeyT &key) const {
@@ -344,6 +359,7 @@ namespace TJS {
             if(!elm)
                 return nullptr;
             CheckUpdateElementOrder((element *)elm);
+            OrderOp("touch", elm, &key);
             return (ValueT *)elm->Value;
         }
 
@@ -364,6 +380,7 @@ namespace TJS {
             if(!elm)
                 return nullptr;
             CheckUpdateElementOrder((element *)elm); // force casting
+            OrderOp("touch-with-hash", elm, &key);
             return (ValueT *)elm->Value;
         }
 
@@ -374,6 +391,7 @@ namespace TJS {
             const element *elm = InternalFindWithHash(key, hash);
             if(elm) {
                 CheckUpdateElementOrder((element *)elm);
+                OrderOp("touch-with-hash", elm, &key);
                 value = (ValueT *)elm->Value;
                 keyout = (const KeyT *)elm->Key;
                 return true;
@@ -395,8 +413,9 @@ namespace TJS {
             if(lv1->Flags & TJS_HS_HASH_USING && hash == lv1->Hash) {
                 if(key == *(KeyT *)lv1->Key) {
                     // delete lv1
-                    CheckDeletingElementOrder(lv1);
                     Destruct(*lv1);
+                    CheckDeletingElementOrder(lv1);
+                    OrderOp("delete-lv1", lv1, &key);
                     return true;
                 }
             }
@@ -406,12 +425,14 @@ namespace TJS {
             while(elm) {
                 if(hash == elm->Hash) {
                     if(key == *(KeyT *)elm->Key) {
-                        CheckDeletingElementOrder(elm);
                         Destruct(*elm);
+                        CheckDeletingElementOrder(elm);
                         prev->Next = elm->Next; // sever from the chain
                         if(elm->Next)
                             elm->Next->Prev = prev;
+                        const void *removed = elm;
                         delete elm;
+                        OrderOp("delete-chain", removed, &key);
                         return true;
                     }
                 }
@@ -436,6 +457,128 @@ namespace TJS {
         tjs_uint GetCount() { return Count; }
 
     private:
+#ifdef TJS_HS_CHECK_ORDER
+        // Debug-only check of the additional order list: the list must be a
+        // consistent doubly linked list whose length is the element count, and
+        // every live element of the table must be a member of it. The check
+        // aborts the process on the first violation, names the operation
+        // that broke it and dumps the operations that led to it.
+        struct OrderTraceEntry {
+            const char *op;
+            const void *elm;
+            unsigned long long key;
+        };
+
+        // The traced operations and the position in that trace. The trace
+        // and the report share them, so the report shows the operations
+        // that led to the violation.
+        inline static OrderTraceEntry TraceBuf[64];
+        inline static int TracePos = 0;
+
+        static void TraceOperation(const char *op, const void *elm,
+                                   const void *key) {
+            TraceBuf[TracePos].op = op;
+            TraceBuf[TracePos].elm = elm;
+            TraceBuf[TracePos].key = 0;
+            if(key)
+                std::memcpy(&TraceBuf[TracePos].key, key,
+                            sizeof(TraceBuf[TracePos].key) < sizeof(KeyT)
+                                ? sizeof(TraceBuf[TracePos].key)
+                                : sizeof(KeyT));
+            TracePos = (TracePos + 1) % 64;
+        }
+
+        static void OrderCheckFailed(const char *op, const void *elm,
+                                     const char *what) {
+            std::fprintf(stderr,
+                         "tTJSHashTable: additional order list broken at "
+                         "operation '%s' (element %p): %s\n",
+                         op, elm, what);
+            std::fprintf(stderr, "--- last operations on this table ---\n");
+            for(int i = 0; i < 64; i++) {
+                int idx = (TracePos + i) % 64;
+                if(!TraceBuf[idx].op)
+                    continue;
+                std::fprintf(stderr, "  %-20s element %p key 0x%llx\n",
+                             TraceBuf[idx].op, TraceBuf[idx].elm,
+                             TraceBuf[idx].key);
+            }
+            std::fflush(stderr);
+            std::abort();
+        }
+
+        void OrderOp(const char *op, const void *elm, const void *key) {
+            TraceOperation(op, elm, key);
+            CheckOrderInvariant(op, elm, key);
+        }
+
+        void CheckOrderInvariant(const char *op, const void *elm,
+                                 const void *key) {
+            // the order list must be a consistent doubly linked list
+            tjs_uint listCount = 0;
+            element *prev = nullptr;
+            for(element *e = NFirst; e; e = e->NNext) {
+                if(e->NPrev != prev) {
+                    OrderCheckFailed(op, elm,
+                                     "an order list element does not point "
+                                     "back at its predecessor");
+                    return;
+                }
+                e->Flags |= TJS_HS_HASH_INORDER;
+                prev = e;
+                if(++listCount > Count + 1) {
+                    OrderCheckFailed(op, elm, "the order list has a cycle");
+                    return;
+                }
+            }
+            if(listCount != Count) {
+                OrderCheckFailed(op, elm,
+                                 "the order list length differs from the "
+                                 "element count");
+                return;
+            }
+            if(NLast != prev) {
+                OrderCheckFailed(op, elm,
+                                 "the last order list element is not NLast");
+                return;
+            }
+            // every live element must be a member of the order list, and
+            // every bucket chain must be consistent
+            for(tjs_int i = 0; i < HashSize; i++) {
+                element *lv1 = Elms + i;
+                element *chainPrev = lv1;
+                for(element *c = lv1->Next; c; c = c->Next) {
+                    if(c->Prev != chainPrev) {
+                        OrderCheckFailed(op, elm,
+                                         "a bucket chain does not point back "
+                                         "at its predecessor");
+                        return;
+                    }
+                    if((c->Flags & TJS_HS_HASH_USING) &&
+                       !(c->Flags & TJS_HS_HASH_INORDER)) {
+                        OrderCheckFailed(op, elm,
+                                         "a live element is missing from the "
+                                         "order list");
+                        return;
+                    }
+                    c->Flags &= ~TJS_HS_HASH_INORDER;
+                    chainPrev = c;
+                }
+                if((lv1->Flags & TJS_HS_HASH_USING) &&
+                   !(lv1->Flags & TJS_HS_HASH_INORDER)) {
+                    OrderCheckFailed(op, elm,
+                                     "a live element is missing from the "
+                                     "order list");
+                    return;
+                }
+                lv1->Flags &= ~TJS_HS_HASH_INORDER;
+            }
+        }
+#else
+        void OrderOp(const char *, const void *, const void *) {}
+        void CheckOrderInvariant(const char *, const void *, const void *) {}
+#endif
+
         void InternalClear() {
             for(tjs_int i = 0; i < HashSize; i++) {
                 // delete all items
@@ -451,6 +594,9 @@ namespace TJS {
                 }
             }
             InternalInit();
+#ifdef TJS_HS_CHECK_ORDER
+            OrderOp("clear", nullptr, nullptr);
+#endif
         }
 
         void InternalInit() {
@@ -465,8 +611,8 @@ namespace TJS {
         }
 
         void DeleteByElement(element *elm) {
-            CheckDeletingElementOrder(elm);
             Destruct(*elm);
+            CheckDeletingElementOrder(elm);
             if(elm->Flags & TJS_HS_HASH_LV1) {
                 // lv1 element
                 // nothing to do
@@ -517,6 +663,29 @@ namespace TJS {
             Count++;
         }
 
+        // Rebuild the additional order list from the table's live set. The
+        // list holds the live elements of the table and the count is the
+        // number of elements in it; when the count has fallen out of step
+        // with the list, the list is repaired from the table itself, so the
+        // elements that fell out of it are linked back into it.
+        void RebuildOrderList() {
+            NFirst = nullptr;
+            NLast = nullptr;
+            Count = 0;
+            for(tjs_int i = 0; i < HashSize; i++) {
+                element *lv1 = Elms + i;
+                if(lv1->Flags & TJS_HS_HASH_USING)
+                    CheckAddingElementOrder(lv1);
+                for(element *elm = lv1->Next; elm; elm = elm->Next) {
+                    if(elm->Flags & TJS_HS_HASH_USING)
+                        CheckAddingElementOrder(elm);
+                }
+            }
+        }
+
+        // The element is destructed before it is unlinked from the order
+        // list, so it is no longer a live element of the table when the
+        // list is rebuilt.
         void CheckDeletingElementOrder(element *elm) {
             Count--;
             if(Count > 0) {
@@ -534,8 +703,12 @@ namespace TJS {
                     elm->NNext->NPrev = elm->NPrev;
                 }
             } else {
-                // when the count becomes zero...
-                NFirst = NLast = nullptr;
+                // when the count becomes zero the table is expected to hold
+                // no live element; the order list is rebuilt from the table
+                // instead of being emptied, so that a count that has fallen
+                // out of step with the list cannot orphan the elements that
+                // are still in it
+                RebuildOrderList();
             }
         }
 

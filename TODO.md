@@ -1476,7 +1476,8 @@ page.
   `docs.old/vm-defects.md` BLK-3.
 
 * **A rare SIGSEGV in the compat crate's unit test binary: the core dump named
-  the defect, and the fix is in flight.** Running the workspace suite
+  the defect, the repair has landed, and the first divergence is still
+  unknown.** Running the workspace suite
   (`cargo test --workspace --no-fail-fast`, what `krkr-gate test` runs) died
   once on 2026-11-22 with `error: test failed, to rerun pass -p compat --lib`
   and `process didn't exit successfully: .../compat-6577376d1b259496 (signal:
@@ -1487,20 +1488,30 @@ page.
   backtrace: the crash is a defect in the vendored VM's debug-only object hash
   map, in the additional order list of
   `crates/tjs/cpp/tjs2/tjsHashSearch.h` — not a race between the unit tests
-  that share the process. The committed file is the reference's own, so the
-  defect predates the recent changes: it is byte-identical to
+  that share the process. The defect is inherited from the reference: the
+  committed file was byte-identical to
   `reference/cpp/core/tjs2/tjsHashSearch.h` (sha256 `40a5427e`), and the map
-  is created only under `_DEBUG` (`TJSEnableDebugMode`,
-  `crates/tjs/cpp/tjs2/tjs.cpp:64`), so the reference's release build never
-  creates it. The fix is being made in the vendored tree; the item stays until
-  it lands and the suite is green again. It is rare: the same suite run again
-  immediately afterwards passed (exit 0), and the compat lib binary alone ran
-  600+ times without a crash (200 runs of the plain build, 200 of the
-  workspace build, plus single-threaded runs). It is not deterministic: with
-  `--test-threads=1` the same binary runs all 190 tests green. It is not a
-  stack overflow: the binary ran 20 times with a 1 MB stack and 10 times with
-  a 512 KB stack (the default is 8 MB) with no crash. Cleared so far: the SIMD
-  kernel (`crates/engine/src/simd.rs`) is safe Rust throughout (slices,
+  that crashed exists only under `_DEBUG` (`TJSEnableDebugMode`,
+  `crates/tjs/cpp/tjs2/tjs.cpp:64`), so the shipped release build never
+  creates it. The repair has landed: when the bookkeeping's count reaches
+  zero, the order list is rebuilt from the table's live set instead of being
+  emptied, so a count that has fallen out of step with the list is repaired
+  rather than orphaning the elements that are still in it
+  (`crates/tjs/cpp/tjs2/tjsHashSearch.h`, `RebuildOrderList`); the crate's
+  regression test drives that path
+  (`crates/tjs/cpp/hash_order_test.cpp`). **Open question:** the FIRST
+  divergence — the operation that made the bookkeeping under-count the list —
+  is still unknown, so the item stays. The diagnostic names it when it next
+  happens: built with `KRKR_CHECK_HASH_ORDER=1`, the check aborts on the
+  first violation and names the operation that broke it and the operations
+  that led to it. It is rare: the same suite run again immediately afterwards
+  passed (exit 0), and the compat lib binary alone ran 600+ times without a
+  crash (200 runs of the plain build, 200 of the workspace build, plus
+  single-threaded runs). It is not deterministic: with `--test-threads=1` the
+  same binary runs all 190 tests green. It is not a stack overflow: the binary
+  ran 20 times with a 1 MB stack and 10 times with a 512 KB stack (the default
+  is 8 MB) with no crash. Cleared so far: the SIMD kernel
+  (`crates/engine/src/simd.rs`) is safe Rust throughout (slices,
   `as_chunks_mut`; no unchecked access) and a partial row falls back before
   writing; the engine's host font scan thread (`crates/engine/src/text.rs`)
   owns an `Arc` to its state and never touches the engine; the engine's decode

@@ -727,6 +727,11 @@ unsafe extern "C" {
         out_access: *mut *const c_char,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// The hash table's additional order list: put the bookkeeping out of
+    /// step, delete the elements, and report whether the delete path
+    /// repaired it. Returns an empty string when the bookkeeping is
+    /// consistent, and a message naming the broken invariant otherwise.
+    fn tjs2_test_hash_order_repair() -> *const c_char;
 }
 
 /// Opaque per-engine id of a retained script value (mirror of the C
@@ -7035,5 +7040,94 @@ var ra = a.get(); var rb = b.get();",
         assert!(failed.1.contains("access=TJS_BS_READ"), "{}", failed.1);
         assert!(failed.1.contains("failed:"), "{}", failed.1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- the hash table's additional order list --------------------------
+
+    /// A native method for the churn below. The script never calls it; the
+    /// class carries it so that the registration is a real one.
+    extern "C" fn churn_ping(
+        _engine: *mut c_void,
+        _argc: c_int,
+        _argv: *const Value,
+        out: *mut Value,
+        _out_error: *mut *mut c_char,
+    ) -> c_int {
+        // SAFETY: out is a valid return slot.
+        unsafe {
+            out.write(Value {
+                ty: VAL_VOID,
+                integer: 0,
+                real: 0.0,
+                string: ptr::null(),
+                array: ptr::null(),
+                array_count: 0,
+                retained: 0,
+            })
+        };
+        0
+    }
+
+    /// The VM registers every object it creates in the object hash map
+    /// (`crates/tjs/cpp/tjs2/tjsObject.cpp:329-330`) and removes it again
+    /// when the object is destroyed (`crates/tjs/cpp/tjs2/tjsObject.cpp:372-373`,
+    /// `reference/cpp/core/tjs2/tjsObject.cpp:377-399`). The map's delete
+    /// path maintains the table's additional order list
+    /// (`reference/cpp/core/tjs2/tjsHashSearch.h:520-540`).
+    ///
+    /// A churn of native classes and script objects in one VM drives that
+    /// add and remove path over and over: every script object is released
+    /// inside the loop, and the classes are destroyed with the VM.
+    #[test]
+    fn the_object_hash_map_survives_a_native_class_and_object_churn() {
+        let _vm_lock = vm_lock();
+        let engine = Tjs2Engine::new().unwrap();
+        for round in 0..64 {
+            let name = format!("ChurnClass{round}");
+            engine
+                .register_native_class(&NativeClassBuilder {
+                    name: &name,
+                    methods: vec![NativeMethodDef {
+                        name: "ping",
+                        f: churn_ping,
+                    }],
+                    properties: Vec::new(),
+                })
+                .unwrap();
+            // 32 script objects per round: each one is registered in the
+            // object hash map when it is created, and removed from it when
+            // the array that holds it is released. `%[...]` is the
+            // dictionary literal, so every member is a script object.
+            let members: Vec<String> = (0..32).map(|i| format!("%[index:{i}]")).collect();
+            let source = format!("[{}]", members.join(","));
+            let objects = engine
+                .eval_retained(&source, "hash_order_churn")
+                .expect("create the script objects");
+            drop(objects);
+        }
+        engine.do_gc().expect("collect the churned objects");
+    }
+
+    /// The additional order list holds the table's live elements, and the
+    /// count is the number of elements in it. The reference empties the list
+    /// when the count reaches zero (`reference/cpp/core/tjs2/tjsHashSearch.h:520-540`),
+    /// which orphans the live elements the list still holds when the count
+    /// has fallen out of step with it: the next delete of one of them walks
+    /// off the list. The port rebuilds the list from the table's live set
+    /// instead, so the bookkeeping is consistent again.
+    ///
+    /// The helper puts the bookkeeping out of step - two live elements fall
+    /// out of the order list while the count stays in step with the list -
+    /// and deletes the elements. The count reaches zero at the first
+    /// delete, and the list must mirror the table's live set by then.
+    #[test]
+    fn the_hash_order_delete_path_repairs_the_bookkeeping() {
+        // SAFETY: the helper returns a static NUL-terminated string.
+        let message = unsafe { CStr::from_ptr(tjs2_test_hash_order_repair()) };
+        let message = message.to_string_lossy();
+        assert!(
+            message.is_empty(),
+            "the hash table's order list bookkeeping is broken: {message}"
+        );
     }
 }
