@@ -72,6 +72,15 @@ CHECKS: dict[str, Callable[[list[str]], int]] = {
 
 # The gate sequence in the AGENTS §0 order. Each step is
 # ``(label, kind, name, argv)`` where ``kind`` is ``"cargo"`` or ``"check"``.
+#
+# The sequence **compares**; it never rewrites the tree.  ``surface-lock``
+# reads the live dump and compares it with the committed baseline, and the
+# parity checks read the reference.  The two steps that would write into the
+# repository — ``surface-lock --update`` (the committed baseline) and the
+# parity reports under ``docs/`` — are the integrator's explicit actions, run
+# on their own and reviewed as a diff; a gate that rewrote the baseline before
+# comparing it could not fail on a surface change (D29), and a gate that
+# rewrote a report while checking it made the tree depend on the run.
 GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
     ("cargo fmt", "cargo", "cargo", ["cargo", "fmt", "--all", "--", "--check"]),
     ("stateless", "check", "stateless", []),
@@ -111,9 +120,8 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
         ],
     ),
     ("android-target", "check", "android-target", []),
-    ("surface-lock --update", "check", "surface-lock", ["--update"]),
     ("surface-lock", "check", "surface-lock", []),
-    ("native-parity", "check", "native-parity", []),
+    ("native-parity", "check", "native-parity", ["--no-doc"]),
     ("plugin-parity", "check", "plugin-parity", ["--no-doc"]),
     ("host-facts", "check", "host-facts", []),
     ("ci", "check", "ci", []),
@@ -250,8 +258,6 @@ def run_gate(
     failures: list[str] = []
     for label, kind, name, step_argv in GATE_SEQUENCE:
         if no_cargo and kind == "cargo":
-            continue
-        if no_cargo and name == "surface-lock" and "--update" in step_argv:
             continue
         effective = list(step_argv)
         if no_cargo and name == "surface-lock":

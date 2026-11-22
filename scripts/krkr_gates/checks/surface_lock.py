@@ -20,6 +20,12 @@ Usage:
     uv run --project scripts krkr-gate surface-lock --no-regen   # check the existing dump
     uv run --project scripts krkr-gate surface-lock --update     # accept the current surface
 
+`--update` is **not** part of the gate sequence: it rewrites the committed
+baseline, so running it before the comparison would make the comparison
+compare the dump with the file the same run had just written, and the gate
+could not fail on a surface change. The gate runs the comparison; accepting a
+surface is the integrator's separate, reviewed action.
+
 An intentional surface change therefore has to be committed *with* a new
 baseline in `docs/surface/`, where it is reviewable as a diff — that is the
 hard constraint. A bare `--update` with an unexplained diff is a rejected
@@ -125,7 +131,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--update",
         action="store_true",
-        help="write the current dump as the new committed baseline",
+        help="write the current dump as the new committed baseline "
+        "(integrator-only: the gate compares, it never rewrites the baseline)",
     )
     parser.add_argument(
         "--no-regen",
