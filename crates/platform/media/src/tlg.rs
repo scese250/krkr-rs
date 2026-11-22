@@ -44,6 +44,9 @@ const TLG6_H_BLOCK_SIZE: usize = 8;
 const TLG6_GOLOMB_N_COUNT: usize = 4;
 /// Number of entries in the Golomb bit-length table (4 × 2 × 128).
 const TLG6_GOLOMB_TABLE_LEN: usize = 1024;
+/// The message a block whose filter code is not one of the 16 filters the
+/// block codec defines reports.
+const UNKNOWN_COLOR_FILTER: &str = "TLG6: unknown color filter";
 
 /// Decode TLG5/TLG6 bytes into an RGBA8 image plus whether the file stores
 /// an alpha plane (the color count byte: 3 = opaque, 4 = alpha). The
@@ -581,13 +584,13 @@ fn decode_line(row: &mut BlockRow<'_>, pass: LinePass) -> Result<(), String> {
             .ok_or("TLG6: filter map out of range")?;
         let code = ft >> 1;
         if code >= 16 {
-            return Err("TLG6: unknown color filter".into());
+            return Err(UNKNOWN_COLOR_FILTER.into());
         }
         let avg_mode = ft & 1 == 1;
         for x in (i * TLG6_W_BLOCK_SIZE..).take(w) {
             let idx = usize::try_from(inpos).map_err(|_| "TLG6: block index out of range")?;
             let err = *pixelbuf.get(idx).ok_or("TLG6: block data out of range")?;
-            let (eb, eg, er) = color_filter(code, err[0] as i8, err[1] as i8, err[2] as i8);
+            let (eb, eg, er) = color_filter(code, err[0] as i8, err[1] as i8, err[2] as i8)?;
             let ea = err[3] as i8;
             let u = prevline[x];
             let pb = p.to_le_bytes();
@@ -625,26 +628,31 @@ fn decode_line(row: &mut BlockRow<'_>, pass: LinePass) -> Result<(), String> {
 
 /// Apply one of the 16 color-correlation filters to the residual bytes (all
 /// arithmetic is wrapping 8-bit signed). Returns the (B, G, R) corrections.
-fn color_filter(code: u8, ib: i8, ig: i8, ir: i8) -> (i8, i8, i8) {
+///
+/// # Errors
+///
+/// The error when `code` is not one of the 16 filter codes the block codec
+/// defines.
+fn color_filter(code: u8, ib: i8, ig: i8, ir: i8) -> Result<(i8, i8, i8), String> {
     let a = |x: i8, y: i8| x.wrapping_add(y);
     match code {
-        0 => (ib, ig, ir),
-        1 => (a(ib, ig), ig, a(ir, ig)),
-        2 => (ib, a(ig, ib), a(a(ir, ib), ig)),
-        3 => (a(a(ib, ir), ig), a(ig, ir), ir),
-        4 => (a(ib, ir), a(a(ig, ib), ir), a(a(a(ir, ib), ir), ig)),
-        5 => (a(ib, ir), a(a(ig, ib), ir), ir),
-        6 => (a(ib, ig), ig, ir),
-        7 => (ib, a(ig, ib), ir),
-        8 => (ib, ig, a(ir, ig)),
-        9 => (a(a(a(ib, ig), ir), ib), a(a(ig, ir), ib), a(ir, ib)),
-        10 => (a(ib, ir), a(ig, ir), ir),
-        11 => (ib, a(ig, ib), a(ir, ib)),
-        12 => (ib, a(a(ig, ir), ib), a(ir, ib)),
-        13 => (a(ib, ig), a(a(a(ig, ir), ib), ig), a(a(ir, ib), ig)),
-        14 => (a(a(ib, ig), ir), a(ig, ir), a(a(a(ir, ib), ig), ir)),
-        15 => (ib, a(ig, ib.wrapping_mul(2)), a(ir, ib.wrapping_mul(2))),
-        _ => unreachable!("filter code checked by caller"),
+        0 => Ok((ib, ig, ir)),
+        1 => Ok((a(ib, ig), ig, a(ir, ig))),
+        2 => Ok((ib, a(ig, ib), a(a(ir, ib), ig))),
+        3 => Ok((a(a(ib, ir), ig), a(ig, ir), ir)),
+        4 => Ok((a(ib, ir), a(a(ig, ib), ir), a(a(a(ir, ib), ir), ig))),
+        5 => Ok((a(ib, ir), a(a(ig, ib), ir), ir)),
+        6 => Ok((a(ib, ig), ig, ir)),
+        7 => Ok((ib, a(ig, ib), ir)),
+        8 => Ok((ib, ig, a(ir, ig))),
+        9 => Ok((a(a(a(ib, ig), ir), ib), a(a(ig, ir), ib), a(ir, ib))),
+        10 => Ok((a(ib, ir), a(ig, ir), ir)),
+        11 => Ok((ib, a(ig, ib), a(ir, ib))),
+        12 => Ok((ib, a(a(ig, ir), ib), a(ir, ib))),
+        13 => Ok((a(ib, ig), a(a(a(ig, ir), ib), ig), a(a(ir, ib), ig))),
+        14 => Ok((a(a(ib, ig), ir), a(ig, ir), a(a(a(ir, ib), ig), ir))),
+        15 => Ok((ib, a(ig, ib.wrapping_mul(2)), a(ir, ib.wrapping_mul(2)))),
+        _ => Err(UNKNOWN_COLOR_FILTER.into()),
     }
 }
 

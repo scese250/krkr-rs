@@ -2777,8 +2777,7 @@ impl Storage {
     /// Storage names are case-insensitive even when the host filesystem is
     /// not. Only the storage-relative part is normalized; the mount prefix
     /// keeps the real filesystem spelling. A `..` component that escapes the
-    /// mount is [`StorageReadError::InvalidPathName`] (`TVPInvalidPathName`),
-    /// not a miss.
+    /// mount is [`StorageReadError::InvalidPathName`], not a miss.
     ///
     /// # Errors
     ///

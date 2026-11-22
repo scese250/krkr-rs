@@ -48,10 +48,6 @@ crates/platform/media/src/video/mediacodec.rs:1100:result-fallback — MediaForm
 crates/platform/media/src/video/mediacodec.rs:1119:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
 crates/platform/media/src/video/mediacodec.rs:1131:result-fallback — MediaFormat::i32 returns Option; absent key => documented default
 
-# --- u64::try_from(bytes.len()) cannot overflow on the 64-bit host
-#     (audit §3.1) --------------------------------------------------------
-crates/platform/fs/src/ops.rs:63:u64::try_from(bytes.len()) — usize -> u64 cannot overflow on the 64-bit host
-
 # --- existence probe whose failure surfaces at the real I/O call
 #     (audit §4.1) --------------------------------------------------------
 crates/platform/fs/src/host.rs:29:std::fs::metadata — metadata only rejects directories; the open below reports the real error
@@ -88,10 +84,6 @@ crates/compat/src/natives/visual/layer/mod.rs:342:let _ = scene.update_layer(id,
 #     filter intentionally skips those keys (audit §3.3) --------------------
 crates/platform/fs/src/ops.rs:341:ok-discard — Path::strip_prefix's error is exactly "not under src"; the rename filter skips keys outside the moved directory
 crates/platform/fs/src/ops.rs:350:ok-discard — Path::strip_prefix's error is exactly "not under src"; the rename filter skips keys outside the moved directory
-
-# --- usize -> u64 cannot overflow (audit §3.1) -----------------------------
-crates/platform/fs/src/ops.rs:426:u64::try_from(v.len()) — usize -> u64 cannot overflow on any supported target
-crates/platform/fs/src/ops.rs:455:u64::try_from(n) — usize -> u64 cannot overflow on any supported target
 
 # --- reference Option defaults (audit §3.3) --------------------------------
 crates/compat/src/natives/storages.rs:163:normalize_storage_name(name) — TVPGetPlacedPath returns the normalized input when the placement is outside the game directory (reference/cpp/core/base/StorageIntf.cpp:1061-1097)

@@ -81,7 +81,7 @@ pub fn stat(fs: &FileSystem, path: &FsPath) -> Result<FileStat, FsError> {
                 })
             } else if let Some(bytes) = guard.files.get(&key) {
                 Ok(FileStat {
-                    size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    size: bytes.len() as u64,
                     is_dir: false,
                     modified_ms: None,
                 })
@@ -505,7 +505,7 @@ pub fn file_size(fs: &FileSystem, file: &FileState) -> Result<u64, FsError> {
             guard
                 .files
                 .get(key)
-                .map(|v| u64::try_from(v.len()).unwrap_or(u64::MAX))
+                .map(|v| v.len() as u64)
                 .ok_or_else(|| FsError::NotFound {
                     path: file.path.clone(),
                 })
@@ -544,7 +544,7 @@ pub fn flush(fs: &FileSystem, file: &FileState) -> Result<(), FsError> {
 /// belong to `fs`.
 pub fn read_seq(fs: &FileSystem, file: &mut FileState, buf: &mut [u8]) -> Result<usize, FsError> {
     let n = read_at(fs, file, file.cursor, buf)?;
-    file.cursor += u64::try_from(n).unwrap_or(u64::MAX);
+    file.cursor += n as u64;
     Ok(n)
 }
 

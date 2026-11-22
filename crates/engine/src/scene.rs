@@ -135,8 +135,9 @@ pub struct LayerState {
     pub opacity: f32,
     /// Generic blend behaviour ([`BlendMode::SourceOver`] by default). This is
     /// the render pipeline's complete blend vocabulary, so the `RenderScene`
-    /// projection does not lose `Layer.type` updates. L3 owns the native
-    /// `tTVPLayerType` numbering and maps it onto these modes.
+    /// projection does not lose `Layer.type` updates. The compatibility layer
+    /// owns the script-facing `Layer.type` numbering and maps it onto these
+    /// modes.
     pub blend: BlendMode,
     /// Sibling sort key: the sibling position in relative order mode, or the
     /// stored absolute index while the parent is in absolute order mode.
@@ -2025,7 +2026,7 @@ impl Scene {
     // Layer MainImage / ProvinceImage raw-pixel access
     //
     // The layer's MainImage and ProvinceImage scan-line pointers are exposed
-    // as `tTVInteger` addresses. The buffers are heap allocations replaced
+    // as integer addresses. The buffers are heap allocations replaced
     // wholesale on a resize, so a returned address stays valid until the
     // next resize of the same image (or until the layer/bitmap is dropped).
     // The VM is single-threaded, so a raw pointer stays usable for that
