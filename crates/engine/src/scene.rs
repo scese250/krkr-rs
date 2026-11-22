@@ -255,6 +255,13 @@ pub struct LayerState {
     ///
     /// The list is empty while the layer shows only its own image.
     pub draws: Vec<crate::layer_ops::DrawOp>,
+    /// The colour the pose surface is cleared with before the list is drawn.
+    ///
+    /// The pose lives on the surface, and the surface is what the list is
+    /// composited onto, so the clear belongs to the surface: the layer's own
+    /// image keeps the content the pose is drawn over. `None` clears nothing,
+    /// and the pose accumulates on the surface the way the frames left it.
+    pub pose_clear: Option<[u8; 4]>,
     /// The region of the layer's own composited content that must be
     /// reconstructed, in the layer's own coordinate space.
     ///
@@ -553,6 +560,21 @@ fn unpremultiply_region(pixels: &mut [u8]) {
             *channel = value.min(255) as u8;
         }
     }
+}
+
+/// A colour in the form a pose surface holds.
+///
+/// The surface holds premultiplied pixels, so the colour's channels are
+/// scaled by its alpha: the read-back divides them by it again, and the
+/// colour a script reads is the one the clear named.
+fn premultiplied(colour: [u8; 4]) -> [u8; 4] {
+    let alpha = u32::from(colour[3]);
+    [
+        (u32::from(colour[0]) * alpha / 255) as u8,
+        (u32::from(colour[1]) * alpha / 255) as u8,
+        (u32::from(colour[2]) * alpha / 255) as u8,
+        colour[3],
+    ]
 }
 
 /// Composites the pose over the image's pixels.
@@ -1448,6 +1470,7 @@ impl Scene {
             transition_self: None,
             effect: None,
             draws: Vec::new(),
+            pose_clear: None,
             content_region: None,
             hint: String::new(),
             show_parent_hint: false,
@@ -4547,6 +4570,22 @@ impl Scene {
         }
     }
 
+    /// States the colour the layer's pose surface is cleared with.
+    ///
+    /// The pose lives on the surface, and the surface is what the pose is
+    /// composited onto, so the clear belongs to the surface: the layer's own
+    /// image keeps the content the pose is drawn over. `None` clears nothing,
+    /// and the pose accumulates on the surface the way the earlier frames
+    /// left it.
+    ///
+    /// The caller states the clear whenever it states a pose, so the surface
+    /// never carries the clear of an earlier pose.
+    pub fn set_layer_pose_clear(&mut self, layer_id: u32, clear: Option<[u8; 4]>) {
+        if let Some(layer) = self.layer_mut_untracked(layer_id) {
+            layer.pose_clear = clear;
+        }
+    }
+
     /// The draw list the layer's image is composed from.
     pub fn layer_draws(&self, layer_id: u32) -> &[crate::layer_ops::DrawOp] {
         match self.layer_position(layer_id) {
@@ -4597,7 +4636,8 @@ impl Scene {
         // The list is taken out for the call, because the call writes the
         // scene's own fields while the list is read.
         let ops = std::mem::take(&mut self.layers[layer_index].draws);
-        let drawn = self.draw_ops_gpu(pipeline, state, &ops, bitmap_id);
+        let clear = self.layers[layer_index].pose_clear;
+        let drawn = self.draw_ops_gpu(pipeline, state, &ops, bitmap_id, clear);
         self.layers[layer_index].draws = ops;
         drawn
     }
@@ -4620,16 +4660,19 @@ impl Scene {
     /// render tree samples.
     ///
     /// The surface holds the pose the earlier frames left there, so the pose
-    /// accumulates on it exactly as it accumulates on the CPU. The layer's
-    /// own image is not written: the render tree draws the pose over the
-    /// image, and a script that reads the pixels brings the two together on
-    /// demand.
+    /// accumulates on it exactly as it accumulates on the CPU. A clear fills
+    /// the surface with its colour before the pose is drawn, so the pose
+    /// does not accumulate on what the earlier frames left there. The
+    /// layer's own image is not written: the render tree draws the pose over
+    /// the image, and a script that reads the pixels brings the two
+    /// together on demand.
     fn draw_ops_gpu(
         &mut self,
         pipeline: &RenderPipeline,
         state: &mut RenderState,
         ops: &[crate::layer_ops::DrawOp],
         bitmap_id: u32,
+        clear: Option<[u8; 4]>,
     ) -> Result<bool, RenderError> {
         if ops.is_empty() {
             return Ok(false);
@@ -4651,12 +4694,25 @@ impl Scene {
         // The tree the backend draws: the pose's own draws, in the layer's
         // own coordinates, over the pose the earlier frames left there.
         let mut tree = crate::layer_ops::draw_ops_scene(ops, &textures);
-        // The surface holds undefined pixels until something is drawn into
-        // it, so the first draw starts it transparent: the surface then
-        // holds the pose and nothing else.
-        if !self.surface_drawn(bitmap_id) {
+        // The clear: the surface is filled with the colour before the pose
+        // is drawn, so the pose does not accumulate on the pixels the
+        // earlier frames left there. A surface that was never drawn into
+        // holds undefined pixels, so the first draw starts it transparent:
+        // the surface then holds the pose and nothing else.
+        let fill = match clear {
+            Some(colour) => Some(colour),
+            None if !self.surface_drawn(bitmap_id) => Some([0, 0, 0, 0]),
+            None => None,
+        };
+        if let Some(colour) = fill {
+            let colour = premultiplied(colour);
             let start = RenderNode {
-                content: RenderContent::Solid([0.0, 0.0, 0.0, 0.0]),
+                content: RenderContent::Solid([
+                    f32::from(colour[0]) / 255.0,
+                    f32::from(colour[1]) / 255.0,
+                    f32::from(colour[2]) / 255.0,
+                    f32::from(colour[3]) / 255.0,
+                ]),
                 dst: RectF::new(0.0, 0.0, bitmap_width as f32, bitmap_height as f32),
                 blend: BlendMode::Replace,
                 ..RenderNode::default()
@@ -5063,8 +5119,10 @@ impl Scene {
     ///
     /// The list is the pose the layer shows, and the image is what the pose
     /// is composited onto: the image keeps the pixels the earlier frames
-    /// left there, so the pose accumulates frame to frame. Returns whether
-    /// the list was drawn.
+    /// left there, so the pose accumulates frame to frame. A list that names
+    /// a clear fills the image with that colour first, so the pose does not
+    /// accumulate on the pixels the earlier frames left there. Returns
+    /// whether the list was drawn.
     pub fn draw_layer_draws(&mut self, layer_id: u32) -> bool {
         let Some(bitmap) = self.layer(layer_id).and_then(|layer| layer.bitmap) else {
             return false;
@@ -5082,6 +5140,12 @@ impl Scene {
         let destination = &mut self.bitmaps[index];
         let ops = &self.layers[layer_index].draws;
         let sources = &self.draw_sources;
+        // The clear: the image is what the pose is composited onto, so the
+        // colour fills it before the pose is drawn.
+        if let Some(colour) = self.layers[layer_index].pose_clear {
+            let (width, height) = (destination.width, destination.height);
+            crate::raster::fill_rect_replace(destination, 0, 0, width, height, colour);
+        }
         crate::layer_ops::draw_ops(destination, ops, sources);
         true
     }
@@ -6102,5 +6166,238 @@ mod tests {
         assert_eq!(scene.focused_in(win, a_domain), None);
         assert_eq!(scene.window_input_root(win), Some(b_domain));
         assert_eq!(scene.focused_in(win, b_domain), Some(b));
+    }
+
+    /// The Vulkan pipeline and its render state, or `None` when the host has
+    /// no device.
+    ///
+    /// The pose is drawn on the backend, so the comparison runs on the
+    /// Vulkan backend. A host without a device skips the comparison: the
+    /// null backend is the CPU fallback, and it is not what the pose is
+    /// drawn on.
+    fn vulkan_device() -> Option<(RenderPipeline, RenderState)> {
+        let pipeline = render::create_render_pipeline(render::PipelineConfig::vulkan()).ok()?;
+        let state = render::begin_offscreen_render_state(&pipeline).ok()?;
+        Some((pipeline, state))
+    }
+
+    /// A source of `size` pixels in one colour.
+    fn uniform_source(size: u32, colour: [u8; 4]) -> BitmapState {
+        let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+        for _ in 0..size * size {
+            rgba.extend_from_slice(&colour);
+        }
+        BitmapState::new(size, size, rgba)
+    }
+
+    /// A scene with a layer whose image is the target, and the layer's and
+    /// the bitmap's ids.
+    fn scene_with_target(size: (u32, u32)) -> (Scene, u32, u32) {
+        let mut scene = Scene::default();
+        let window = scene.add_window("pose", size);
+        let layer = scene.add_layer(window, None);
+        let bitmap = scene.add_bitmap(size.0, size.1, vec![0u8; (size.0 * size.1 * 4) as usize]);
+        if let Some(layer) = scene.layer_mut(layer) {
+            layer.bitmap = Some(bitmap);
+        }
+        (scene, layer, bitmap)
+    }
+
+    /// The pixel of a pixel buffer at `(x, y)`.
+    fn pixel_at(pixels: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
+        let offset = (y * width + x) * 4;
+        pixels[offset..offset + 4].try_into().expect("one pixel")
+    }
+
+    /// A clipped draw is confined to its rectangle on the backend too.
+    ///
+    /// The pose is drawn on the backend, and the pixels a script reads are
+    /// the image's pixels with the pose composited over them, so the read
+    /// is the way a script sees the pose. The rectangle is the one the
+    /// item's paint box and the viewport of the shape that encloses it meet
+    /// at (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:48-80`).
+    #[test]
+    fn a_clipped_draw_is_confined_to_its_rectangle_on_the_backend() {
+        let (mut scene, layer, bitmap) = scene_with_target((64, 48));
+        let source = scene.add_draw_source(Arc::new(uniform_source(64, [255, 255, 255, 255])));
+        let ops = vec![crate::layer_ops::DrawOp::Clipped {
+            clip: (8, 8, 40, 32),
+            draw: Box::new(crate::layer_ops::DrawOp::Image(
+                crate::layer_ops::ImageDraw {
+                    source,
+                    rect: (0, 0, 64, 64),
+                    corners: [(0.0, 0.0), (64.0, 0.0), (0.0, 64.0)],
+                    opacity: 255,
+                    mode: 2,
+                    source_over: true,
+                },
+            )),
+        }];
+
+        // The CPU path: the oracle.
+        let mut cpu = scene.bitmap(bitmap).expect("the target bitmap").clone();
+        scene.draw_ops_into(&mut cpu, &ops);
+
+        let Some((pipeline, mut state)) = vulkan_device() else {
+            eprintln!("the host has no Vulkan device: the backend path is not checked");
+            return;
+        };
+        scene.set_layer_draws(layer, ops);
+        scene
+            .draw_layer_draws_gpu(&pipeline, &mut state, layer)
+            .expect("the list is drawn");
+        let pose = scene
+            .read_pose_pixels(&pipeline, &mut state, bitmap)
+            .expect("the pose is read back")
+            .expect("the layer shows a pose");
+        let gpu = scene
+            .compose_pose_pixels(bitmap, &pose)
+            .expect("the pose is composited")
+            .expect("the layer shows a pose");
+
+        for y in 0..48usize {
+            for x in 0..64usize {
+                let inside = (8..40).contains(&x) && (8..32).contains(&y);
+                let expected = if inside {
+                    [255, 255, 255, 255]
+                } else {
+                    [0, 0, 0, 0]
+                };
+                assert_eq!(
+                    pixel_at(&cpu.rgba, 64, x, y),
+                    expected,
+                    "the CPU path draws the pixel ({x},{y})"
+                );
+                assert_eq!(
+                    pixel_at(&gpu, 64, x, y),
+                    expected,
+                    "the backend draws the pixel ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// The clear fills the pose surface and leaves the layer's image alone.
+    ///
+    /// The adaptor owns its render target and clears it before every pose
+    /// (`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:135-152`), so the
+    /// surface the pose is drawn into carries the clear colour where the
+    /// pose does not reach. The layer's own image is not where the pose
+    /// lives, so the clear does not write it: a written image is uploaded
+    /// again, and the upload of a whole canvas is the frame's largest cost.
+    #[test]
+    fn the_pose_clear_fills_the_surface_and_leaves_the_image_alone() {
+        let (mut scene, layer, bitmap) = scene_with_target((64, 48));
+        let source = scene.add_draw_source(Arc::new(uniform_source(16, [0, 0, 255, 255])));
+        let ops = vec![crate::layer_ops::DrawOp::Image(
+            crate::layer_ops::ImageDraw {
+                source,
+                rect: (0, 0, 16, 16),
+                corners: [(8.0, 8.0), (24.0, 8.0), (8.0, 24.0)],
+                opacity: 255,
+                mode: 2,
+                source_over: true,
+            },
+        )];
+
+        let Some((pipeline, mut state)) = vulkan_device() else {
+            eprintln!("the host has no Vulkan device: the backend path is not checked");
+            return;
+        };
+        // The image is uploaded once, when it is created. The clear must not
+        // make it dirty again.
+        scene.bitmap_mut(bitmap).expect("the target bitmap").dirty = false;
+        let revision = scene.content_revision();
+        scene.set_layer_pose_clear(layer, Some([255, 0, 0, 255]));
+        scene.set_layer_draws(layer, ops);
+        scene
+            .draw_layer_draws_gpu(&pipeline, &mut state, layer)
+            .expect("the list is drawn");
+
+        // The image is not written: the clear belongs to the surface.
+        assert_eq!(
+            scene.content_revision(),
+            revision,
+            "the layer's image is not changed by the clear"
+        );
+        let image = scene.bitmap(bitmap).expect("the target bitmap");
+        assert!(
+            image
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [0, 0, 0, 0]),
+            "the layer's image keeps its own pixels"
+        );
+        assert!(!image.dirty, "the layer's image is not uploaded again");
+
+        // The surface holds the clear colour where the pose does not reach.
+        let pose = scene
+            .read_pose_pixels(&pipeline, &mut state, bitmap)
+            .expect("the pose is read back")
+            .expect("the layer shows a pose");
+        assert_eq!(
+            pixel_at(&pose, 64, 0, 0),
+            [255, 0, 0, 255],
+            "the surface is cleared with the clear colour"
+        );
+        assert_eq!(
+            pixel_at(&pose, 64, 10, 10),
+            [0, 0, 255, 255],
+            "the pose is drawn over the clear colour"
+        );
+
+        // The pixels a script reads carry the pose and the clear.
+        let read = scene
+            .compose_pose_pixels(bitmap, &pose)
+            .expect("the pose is composited")
+            .expect("the layer shows a pose");
+        assert_eq!(
+            pixel_at(&read, 64, 0, 0),
+            [255, 0, 0, 255],
+            "a script reads the clear colour"
+        );
+        assert_eq!(
+            pixel_at(&read, 64, 10, 10),
+            [0, 0, 255, 255],
+            "a script reads the pose"
+        );
+    }
+
+    /// The clear fills the layer's image on the CPU path.
+    ///
+    /// The CPU path composites the pose onto the image itself, so the image
+    /// is what the clear fills
+    /// (`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:135-152`).
+    #[test]
+    fn the_pose_clear_fills_the_image_on_the_cpu_path() {
+        let (mut scene, layer, bitmap) = scene_with_target((64, 48));
+        let source = scene.add_draw_source(Arc::new(uniform_source(16, [0, 0, 255, 255])));
+        let ops = vec![crate::layer_ops::DrawOp::Image(
+            crate::layer_ops::ImageDraw {
+                source,
+                rect: (0, 0, 16, 16),
+                corners: [(8.0, 8.0), (24.0, 8.0), (8.0, 24.0)],
+                opacity: 255,
+                mode: 2,
+                source_over: true,
+            },
+        )];
+        scene.set_layer_pose_clear(layer, Some([255, 0, 0, 255]));
+        scene.set_layer_draws(layer, ops);
+        assert!(scene.draw_layer_draws(layer), "the list is drawn");
+
+        let image = scene.bitmap(bitmap).expect("the target bitmap");
+        assert_eq!(
+            pixel_at(&image.rgba, 64, 0, 0),
+            [255, 0, 0, 255],
+            "the image is cleared with the clear colour"
+        );
+        assert_eq!(
+            pixel_at(&image.rgba, 64, 10, 10),
+            [0, 0, 255, 255],
+            "the pose is drawn over the clear colour"
+        );
     }
 }

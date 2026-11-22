@@ -245,10 +245,37 @@ fn bounds(pts: &[(f64, f64)]) -> Option<(i32, i32, i32, i32)> {
 /// 4×4 supersampling. `pts` is treated as closed; open paths are closed
 /// implicitly for filling, matching GDI+ `FillPath`.
 pub fn fill_polygon(bitmap: &mut BitmapState, pts: &[(f64, f64)], color: [u8; 4]) {
+    fill_polygon_clipped(bitmap, pts, color, None);
+}
+
+/// [`fill_polygon`] confined to a rectangle of the destination.
+///
+/// The rectangle holds the pixels the fill writes: the pixels outside it
+/// keep what they hold. The coverage of a pixel is the polygon's own
+/// coverage, so a pixel the polygon only partly covers keeps that part.
+pub fn fill_polygon_clipped(
+    bitmap: &mut BitmapState,
+    pts: &[(f64, f64)],
+    color: [u8; 4],
+    clip: Option<crate::layer_ops::RectI>,
+) {
     let Some((min_x, min_y, max_x, max_y)) = bounds(pts) else {
         return;
     };
     let (min_x, min_y, max_x, max_y) = clamp_bounds(bitmap, min_x, min_y, max_x, max_y);
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+    // The fill writes inside the clip alone.
+    let (min_x, min_y, max_x, max_y) = match clip {
+        Some((x0, y0, x1, y1)) => (
+            min_x.max(x0),
+            min_y.max(y0),
+            max_x.min(x1 - 1),
+            max_y.min(y1 - 1),
+        ),
+        None => (min_x, min_y, max_x, max_y),
+    };
     if min_x > max_x || min_y > max_y {
         return;
     }

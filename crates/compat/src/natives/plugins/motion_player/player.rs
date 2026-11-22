@@ -1745,16 +1745,12 @@ impl PlayerInst {
             bounds,
         );
         self.tinted = tinted;
-        // A draw leaves the destination's image in place unless the route
-        // asked for a clear; the pixels outside the drawn items survive.
-        if let Some(clear) = clear
-            && let Some(bitmap) = scene.bitmap_mut(bitmap_id)
-        {
-            for pixel in bitmap.rgba.as_chunks_mut::<4>().0.iter_mut() {
-                pixel.copy_from_slice(&clear);
-            }
-            bitmap.mark_dirty();
-        }
+        // The clear belongs to the surface the pose lives on: the pose is
+        // drawn on the backend and the surface is what it is composited
+        // onto, so the layer's own image is left alone. Clearing the image
+        // would write every pixel of it and put the whole canvas into the
+        // next upload, and the image is not where the pose lives.
+        scene.set_layer_pose_clear(layer_id, clear);
         // The list is the pose the layer shows, and the layer's image is what
         // the pose is composited onto: the image keeps the pixels the
         // earlier frames left there, so the pose accumulates frame to frame.
@@ -1918,6 +1914,22 @@ const SOURCE_OVER: NodeBlend = NodeBlend {
     mode: 2,
     source_over: true,
 };
+
+/// How one node's draw is composited onto the destination.
+///
+/// The opacity and the blend are the node's own; the clip is the rectangle
+/// of the destination the draw is confined to, which is the node's paint box
+/// intersected with the viewport of the shape that encloses it.
+#[derive(Clone, Copy)]
+struct NodeDraw {
+    /// The opacity the node's pixels are composited with, `0..=1`.
+    opacity: f64,
+    /// The blend the node's pixels are composited with.
+    blend: NodeBlend,
+    /// The rectangle of the destination the draw is confined to, or `None`
+    /// when the draw reaches every pixel it covers.
+    clip: Option<RectI>,
+}
 
 /// The blend a node's blend mode resolves to.
 fn node_blend(raw: i32) -> NodeBlend {
@@ -2206,8 +2218,11 @@ fn draw_group(
             scene,
             group,
             frame,
-            1.0,
-            SOURCE_OVER,
+            NodeDraw {
+                opacity: 1.0,
+                blend: SOURCE_OVER,
+                clip: None,
+            },
             offset,
         );
     }
@@ -2274,8 +2289,11 @@ fn draw_group(
                 scene,
                 mask_index,
                 frame,
-                1.0,
-                SOURCE_OVER,
+                NodeDraw {
+                    opacity: 1.0,
+                    blend: SOURCE_OVER,
+                    clip: None,
+                },
                 offset,
             );
             scene.draw_ops_into(&mut mask_bitmap, &mask_ops);
@@ -2390,8 +2408,8 @@ fn apply_alpha_mask(
 }
 
 /// Draw one item, clipped to its paint box intersected with the viewport of
-/// the nearest enclosing shape. A clip that trims the item renders it into an
-/// offscreen the size of the clip and composites that once.
+/// the nearest enclosing shape. A clip that trims the item confines the draw
+/// to the rectangle of the clip.
 fn draw_clipped_item(
     ops: &mut Vec<DrawOp>,
     scene: &mut Scene,
@@ -2405,7 +2423,18 @@ fn draw_clipped_item(
     let offset = (-out_origin.0, -out_origin.1);
     let node = &nodes[index];
     let Some(viewport) = node_viewport(nodes, node, frame) else {
-        draw_node(ops, scene, index, frame, opacity, blend, offset);
+        draw_node(
+            ops,
+            scene,
+            index,
+            frame,
+            NodeDraw {
+                opacity,
+                blend,
+                clip: None,
+            },
+            offset,
+        );
         return;
     };
     let Some(paint) = node_paint_box(node, frame) else {
@@ -2425,47 +2454,61 @@ fn draw_clipped_item(
         return;
     }
     if paint.0 >= clip.0 && paint.1 >= clip.1 && paint.2 <= clip.2 && paint.3 <= clip.3 {
-        draw_node(ops, scene, index, frame, opacity, blend, offset);
+        draw_node(
+            ops,
+            scene,
+            index,
+            frame,
+            NodeDraw {
+                opacity,
+                blend,
+                clip: None,
+            },
+            offset,
+        );
         return;
     }
-    let Ok(width) = u32::try_from(right - left) else {
-        return;
-    };
-    let Ok(height) = u32::try_from(bottom - top) else {
-        return;
-    };
     let opa = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
     if opa == 0 {
         return;
     }
-    // The clipped item is rendered into a leaf the size of the clip and
-    // composited once: the leaf is a transparent surface of its own.
-    let mut offscreen = BitmapState::new(
-        width,
-        height,
-        vec![0u8; width as usize * height as usize * 4],
+    // The item is drawn where it lies and confined to the clip: the clip is
+    // a rectangle of the destination, so the draw list carries it and the
+    // pixels outside it keep what they hold. The item's own pixels are the
+    // icon's texture, which the device holds already, so nothing is
+    // rendered into a surface of its own.
+    let clip = (
+        left - out_origin.0,
+        top - out_origin.1,
+        right - out_origin.0,
+        bottom - out_origin.1,
     );
-    let mut leaf_ops = Vec::new();
     draw_node(
-        &mut leaf_ops,
+        ops,
         scene,
         index,
         frame,
-        1.0,
-        SOURCE_OVER,
-        (-left, -top),
+        NodeDraw {
+            opacity,
+            blend,
+            clip: Some(clip),
+        },
+        offset,
     );
-    scene.draw_ops_into(&mut offscreen, &leaf_ops);
-    let source = scene.add_draw_source(Arc::new(offscreen));
-    ops.push(DrawOp::Composite(CompositeDraw {
-        source,
-        rect: (0, 0, right - left, bottom - top),
-        x: left - out_origin.0,
-        y: top - out_origin.1,
-        opacity: opa,
-        mode: blend.mode,
-        source_over: blend.source_over,
-    }));
+}
+
+/// A draw confined to a rectangle of the destination.
+///
+/// The rectangle holds the pixels the draw reaches: the pixels outside it
+/// keep what they hold.
+fn confined(clip: Option<RectI>, draw: DrawOp) -> DrawOp {
+    match clip {
+        Some(clip) => DrawOp::Clipped {
+            clip,
+            draw: Box::new(draw),
+        },
+        None => draw,
+    }
 }
 
 /// The world-space top-left corner of the icon quad a node draws.
@@ -2543,10 +2586,10 @@ fn draw_node(
     scene: &mut Scene,
     index: usize,
     frame: &mut DrawFrame<'_>,
-    opacity: f64,
-    blend: NodeBlend,
+    draw: NodeDraw,
     offset: (i32, i32),
 ) {
+    let (opacity, blend, clip) = (draw.opacity, draw.blend, draw.clip);
     let nodes = frame.nodes;
     let node = &nodes[index];
     let icon = frame
@@ -2554,13 +2597,16 @@ fn draw_node(
         .and_then(|snapshot| snapshot.icons.get(&node.local.src));
     let (Some(icon), Some(_)) = (icon, frame.storage) else {
         if node.shape > 0 {
-            ops.push(DrawOp::Fill(fill_placeholder_quad(
-                node,
-                compose_tint(node.accumulated.colors, frame.settings.color)[0],
-                frame.settings.affine,
-                opacity,
-                offset,
-            )));
+            ops.push(confined(
+                clip,
+                DrawOp::Fill(fill_placeholder_quad(
+                    node,
+                    compose_tint(node.accumulated.colors, frame.settings.color)[0],
+                    frame.settings.affine,
+                    opacity,
+                    offset,
+                )),
+            ));
         } else if node.local.src.starts_with("src/") {
             // Only a `src/<group>/<name>` source names an icon; the layout and
             // blank sources of container and mask nodes draw nothing.
@@ -2630,30 +2676,36 @@ fn draw_node(
             for gx in 0..div_x - 1 {
                 let left = source_edge(gx, width, div_x - 1);
                 let right = source_edge(gx + 1, width, div_x - 1).max(left + 1);
-                ops.push(DrawOp::Image(ImageDraw {
-                    source,
-                    rect: (left, top, right.min(width), bottom.min(height)),
-                    corners: [point(gx, gy), point(gx + 1, gy), point(gx, gy + 1)],
-                    opacity: opa,
-                    mode: blend.mode,
-                    source_over: blend.source_over,
-                }));
+                ops.push(confined(
+                    clip,
+                    DrawOp::Image(ImageDraw {
+                        source,
+                        rect: (left, top, right.min(width), bottom.min(height)),
+                        corners: [point(gx, gy), point(gx + 1, gy), point(gx, gy + 1)],
+                        opacity: opa,
+                        mode: blend.mode,
+                        source_over: blend.source_over,
+                    }),
+                ));
             }
         }
         return;
     }
-    ops.push(DrawOp::Image(ImageDraw {
-        source,
-        rect: (0, 0, width, height),
-        corners: [
-            corner(0.0, 0.0),
-            corner(f64::from(width), 0.0),
-            corner(0.0, f64::from(height)),
-        ],
-        opacity: opa,
-        mode: blend.mode,
-        source_over: blend.source_over,
-    }));
+    ops.push(confined(
+        clip,
+        DrawOp::Image(ImageDraw {
+            source,
+            rect: (0, 0, width, height),
+            corners: [
+                corner(0.0, 0.0),
+                corner(f64::from(width), 0.0),
+                corner(0.0, f64::from(height)),
+            ],
+            opacity: opa,
+            mode: blend.mode,
+            source_over: blend.source_over,
+        }),
+    ));
 }
 
 /// The node's four vertex colours composed with the player's diffuse colour.
@@ -4339,10 +4391,10 @@ mod tests {
     use super::color_bytes;
     use super::local_matrix;
     use super::{
-        BitmapState, DEFAULT_NODE_COLORS, DrawFrame, DrawSettings, MotionNode, MotionSnapshot,
-        PlayerInst, RetainedValue, TimelineState, TjsValue, build_node_tree, composite_pose,
-        draw_point, evaluate_frames, inherited_parent, inherited_transform, node_drawable,
-        prime_timelines,
+        BitmapState, DEFAULT_NODE_COLORS, DrawFrame, DrawOp, DrawSettings, MotionNode,
+        MotionSnapshot, PlayerInst, RetainedValue, TimelineState, TjsValue, build_node_tree,
+        composite_pose, draw_point, evaluate_frames, inherited_parent, inherited_transform,
+        node_drawable, prime_timelines,
     };
     use crate::engine_api::Storage;
     use crate::natives::plugins::psb_file::container::{PsbDocument, PsbValue};
@@ -7112,5 +7164,94 @@ mod tests {
             }
         }
         rgba
+    }
+
+    /// A clipped item is confined to its rectangle and holds no surface of
+    /// its own.
+    ///
+    /// The reference renders the item into a work layer the size of the
+    /// clip and composites that layer onto the target
+    /// (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:416-421`),
+    /// so the pixels outside the clip keep the target's own. The pose names
+    /// the clip instead: the item's own pixels are the icon's texture, which
+    /// the device holds already, so the pose allocates no surface and no
+    /// texture of its own.
+    #[test]
+    fn a_clipped_item_is_confined_to_its_rectangle() {
+        let (snapshot, storage) = icon_snapshot(0xFFFF_FFFF);
+        let mut player = PlayerInst {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
+            motion_key: "intro".to_string(),
+            ..PlayerInst::default()
+        };
+        prime_timelines(&snapshot, &mut player.timelines);
+        player.nodes = build_node_tree(&snapshot, snapshot.clip("intro"));
+        player.update_layers();
+        // The shape that clips the icon: its box reaches into the icon's own,
+        // so the clip trims the icon's right half.
+        let mut clip_shape = MotionNode::new(0, "clip".to_string());
+        clip_shape.shape = 3;
+        clip_shape.draw_flag = false;
+        clip_shape.shape_aabb = [96.0, 96.0, 102.0, 104.0];
+        let clip_index = player.nodes.len();
+        player.nodes.push(clip_shape);
+        let icon = player
+            .nodes
+            .iter()
+            .position(|node| node.local.src == "src/group/art")
+            .expect("the icon node");
+        player.nodes[icon].parent_clip = Some(clip_index);
+
+        let mut scene = Scene::default();
+        let mut ops = Vec::new();
+        let held = player.snapshot.clone();
+        let missing = composite_pose(
+            &mut ops,
+            &mut scene,
+            DrawFrame {
+                nodes: &player.nodes,
+                snapshot: held.as_deref(),
+                storage: Some(&storage),
+                settings: DrawSettings {
+                    color: color_bytes(player.color.bytes),
+                    affine: player.affine,
+                    preview: player.preview,
+                    mask_mode: player.mask_mode,
+                },
+                tinted: &mut player.tinted,
+                missing: Vec::new(),
+                pool: None,
+            },
+            (0, 0, 800, 1080),
+        );
+        assert!(missing.is_empty(), "the synthetic icon needs no texture");
+
+        // The pose holds no surface of its own: it names the icon's own
+        // source and confines it to the rectangle of the clip.
+        assert!(
+            ops.iter().all(|op| !matches!(op, DrawOp::Composite(_))),
+            "the pose composites no surface of its own: {ops:?}"
+        );
+        let clips: Vec<_> = ops.iter().filter_map(|op| op.clip()).collect();
+        assert_eq!(
+            clips,
+            vec![(100, 100, 102, 104)],
+            "the item is confined to the viewport's part of its paint box"
+        );
+        // Every source the pose reads is a tinted icon the cache holds, so
+        // the pose allocates no source of its own.
+        for op in &ops {
+            if let Some(source) = op.source() {
+                assert!(
+                    player.tinted.values().any(|id| *id == source),
+                    "the pose reads a source of its own: {source}"
+                );
+            }
+        }
+        // The pixels outside the clip keep the target's own.
+        let mut bitmap = BitmapState::new(800, 1080, vec![0u8; 800 * 1080 * 4]);
+        scene.draw_ops_into(&mut bitmap, &ops);
+        assert_eq!(alpha(&bitmap, 101, 101), 200, "the pixel inside the clip");
+        assert_eq!(alpha(&bitmap, 103, 101), 0, "the pixel outside the clip");
     }
 }

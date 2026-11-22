@@ -30,7 +30,7 @@ use api::error::RenderError;
 use api::geometry::{Affine2, PixelRegion, RectF};
 use render::Texture;
 use render::blend::PhotoshopBlend;
-use render::scene::{RenderContent, RenderNode, RenderScene};
+use render::scene::{Clip, RenderContent, RenderNode, RenderScene};
 use render::{
     RenderPipeline, RenderState, RenderTarget, read_render_target, render_to_target,
     unpremultiply_rgba8,
@@ -147,6 +147,17 @@ pub enum DrawOp {
     Composite(CompositeDraw),
     /// A polygon filled with one colour.
     Fill(FillDraw),
+    /// A draw confined to a rectangle of the destination.
+    ///
+    /// The rectangle is a half-open `[x0, x1) x [y0, y1)` region in the
+    /// destination's own pixels, and the draw reaches the pixels inside it
+    /// alone. The pixels outside keep what they hold.
+    Clipped {
+        /// The rectangle of the destination the draw is confined to.
+        clip: RectI,
+        /// The draw the rectangle confines.
+        draw: Box<DrawOp>,
+    },
 }
 
 impl DrawOp {
@@ -156,6 +167,16 @@ impl DrawOp {
             Self::Image(draw) => Some(draw.source),
             Self::Composite(draw) => Some(draw.source),
             Self::Fill(_) => None,
+            Self::Clipped { draw, .. } => draw.source(),
+        }
+    }
+
+    /// The rectangle of the destination the draw is confined to, or `None`
+    /// when the draw reaches every pixel it covers.
+    pub fn clip(&self) -> Option<RectI> {
+        match self {
+            Self::Image(_) | Self::Composite(_) | Self::Fill(_) => None,
+            Self::Clipped { clip, .. } => Some(*clip),
         }
     }
 }
@@ -203,6 +224,56 @@ pub fn draw_ops(dst: &mut BitmapState, ops: &[DrawOp], sources: &DrawSources) {
             DrawOp::Fill(draw) => {
                 crate::raster::fill_polygon(dst, &draw.points, draw.color);
             }
+            DrawOp::Clipped { clip, draw } => {
+                draw_clipped_op(dst, *clip, draw, sources);
+            }
+        }
+    }
+}
+
+/// Draws one draw confined to a rectangle of the destination.
+///
+/// The rectangle holds the pixels the draw reaches: the pixels outside it
+/// keep what they hold. A draw that is already confined is drawn inside the
+/// narrower of the two rectangles.
+fn draw_clipped_op(dst: &mut BitmapState, clip: RectI, op: &DrawOp, sources: &DrawSources) {
+    match op {
+        DrawOp::Image(draw) => {
+            let Some(source) = sources.get(&draw.source) else {
+                return;
+            };
+            draw_image_clipped(dst, draw, source, Some(clip));
+        }
+        DrawOp::Composite(draw) => {
+            let Some(source) = sources.get(&draw.source) else {
+                return;
+            };
+            operate_rect_clipped(
+                dst,
+                draw.x,
+                draw.y,
+                BlitSource {
+                    bitmap: source,
+                    rect: draw.rect,
+                },
+                BlitOptions {
+                    mode: draw.mode,
+                    opa: draw.opacity,
+                    treat_as_opaque: false,
+                    hold_alpha: false,
+                    source_over: draw.source_over,
+                },
+                Some(clip),
+            );
+        }
+        DrawOp::Fill(draw) => {
+            crate::raster::fill_polygon_clipped(dst, &draw.points, draw.color, Some(clip));
+        }
+        DrawOp::Clipped { clip: inner, draw } => {
+            let Some(narrower) = intersect_rect(clip, *inner) else {
+                return;
+            };
+            draw_clipped_op(dst, narrower, draw, sources);
         }
     }
 }
@@ -213,12 +284,25 @@ pub fn draw_ops(dst: &mut BitmapState, ops: &[DrawOp], sources: &DrawSources) {
 /// destination pixels one to one, so it takes the direct blit path. Every
 /// other placement keeps the inverse-mapped affine resampler.
 pub fn draw_image(dst: &mut BitmapState, draw: &ImageDraw, source: &BitmapState) {
+    draw_image_clipped(dst, draw, source, None);
+}
+
+/// [`draw_image`] confined to a rectangle of the destination.
+///
+/// The rectangle holds the pixels the draw reaches: the pixels outside it
+/// keep what they hold.
+fn draw_image_clipped(
+    dst: &mut BitmapState,
+    draw: &ImageDraw,
+    source: &BitmapState,
+    clip: Option<RectI>,
+) {
     let width = draw.rect.2 - draw.rect.0;
     let height = draw.rect.3 - draw.rect.1;
     if let Some((x, y)) = unit_axis_aligned_origin(draw.corners, width, height) {
         // The unit axis-aligned placement blends with the draw's operation
         // mode, so the same kernel as the affine pass applies.
-        operate_rect(
+        operate_rect_clipped(
             dst,
             x,
             y,
@@ -233,10 +317,11 @@ pub fn draw_image(dst: &mut BitmapState, draw: &ImageDraw, source: &BitmapState)
                 hold_alpha: false,
                 source_over: draw.source_over,
             },
+            clip,
         );
         return;
     }
-    affine_blit(
+    affine_blit_clipped(
         dst,
         AffineBlit {
             corners: draw.corners,
@@ -256,7 +341,16 @@ pub fn draw_image(dst: &mut BitmapState, draw: &ImageDraw, source: &BitmapState)
             hold_alpha: false,
             source_over: draw.source_over,
         },
+        clip_bounds(clip),
     );
+}
+
+/// The rectangle a draw is confined to, as the half-open pixel rectangle the
+/// operations take. `None` means the whole destination, expressed as the
+/// full `i32` range so the operation still clips to the bitmap's own
+/// bounds.
+fn clip_bounds(clip: Option<RectI>) -> RectI {
+    clip.unwrap_or((i32::MIN, i32::MIN, i32::MAX, i32::MAX))
 }
 
 /// The destination origin of a unit-scale, axis-aligned, whole-pixel
@@ -298,6 +392,11 @@ fn unit_axis_aligned_origin(
 /// is a solid quad. The tree carries no layer properties, so a backend that
 /// draws it draws the same picture the CPU pass draws.
 ///
+/// A draw confined to a rectangle of the destination is a node that carries
+/// the rectangle and holds the draw as its child: the rectangle is in the
+/// node's own space, and the node's space is the destination's, so the
+/// rectangle is the one the draw is confined to.
+///
 /// A draw whose source has no texture is not in the tree: the source was
 /// released before the list was drawn. The draw's own order is the tree's
 /// draw order, so the draws composite in the order the list names them.
@@ -305,65 +404,115 @@ pub fn draw_ops_scene(ops: &[DrawOp], textures: &Map<u32, Texture>) -> RenderSce
     let mut scene = RenderScene::with_root_node();
     let root = scene.root;
     for op in ops {
-        let node = match op {
-            DrawOp::Image(draw) => {
-                let Some(texture) = textures.get(&draw.source) else {
-                    continue;
-                };
-                let Some(blend) = draw_blend(draw.mode, draw.source_over) else {
-                    continue;
-                };
-                RenderNode {
-                    content: RenderContent::Texture(texture.clone()),
-                    src: source_region(draw.rect),
-                    dst: RectF::new(0.0, 0.0, 1.0, 1.0),
-                    affine: Some(affine_from_corners(draw.corners)),
-                    opacity: f32::from(draw.opacity) / 255.0,
-                    blend,
-                    ..RenderNode::default()
-                }
-            }
-            DrawOp::Composite(draw) => {
-                let Some(texture) = textures.get(&draw.source) else {
-                    continue;
-                };
-                let Some(blend) = draw_blend(draw.mode, draw.source_over) else {
-                    continue;
-                };
-                let (x0, y0, x1, y1) = draw.rect;
-                let (x, y) = (draw.x, draw.y);
-                RenderNode {
-                    content: RenderContent::Texture(texture.clone()),
-                    src: source_region(draw.rect),
-                    dst: RectF::new(x as f32, y as f32, (x1 - x0) as f32, (y1 - y0) as f32),
-                    opacity: f32::from(draw.opacity) / 255.0,
-                    blend,
-                    ..RenderNode::default()
-                }
-            }
-            DrawOp::Fill(draw) => {
-                let [origin, right, _corner, down] = draw.points.as_slice() else {
-                    continue;
-                };
-                RenderNode {
-                    content: RenderContent::Solid([
-                        f32::from(draw.color[0]),
-                        f32::from(draw.color[1]),
-                        f32::from(draw.color[2]),
-                        f32::from(draw.color[3]) / 255.0,
-                    ]),
-                    dst: RectF::new(0.0, 0.0, 1.0, 1.0),
-                    affine: Some(affine_from_corners([*origin, *right, *down])),
-                    ..RenderNode::default()
-                }
-            }
+        let (clip, draw) = confined_draw(op);
+        let Some(node) = draw_op_node(draw, textures) else {
+            continue;
         };
-        let id = scene.push(node);
+        let id = match clip {
+            Some(clip) => {
+                // The node that carries the rectangle holds the draw as its
+                // child, so the rectangle confines the draw and the pixels
+                // the draw's own subtree reaches.
+                let container = RenderNode {
+                    content: RenderContent::None,
+                    dst: RectF::new(0.0, 0.0, 1.0, 1.0),
+                    clip: Some(Clip::Rect(clip_rect_f(clip))),
+                    ..RenderNode::default()
+                };
+                let container_id = scene.push(container);
+                let child_id = scene.push(node);
+                if let Some(parent) = scene.node_mut(container_id) {
+                    parent.children.push(child_id);
+                }
+                container_id
+            }
+            None => scene.push(node),
+        };
         if let Some(parent) = scene.node_mut(root) {
             parent.children.push(id);
         }
     }
     scene
+}
+
+/// The rectangle a draw is confined to and the draw itself.
+///
+/// A draw that is confined twice is confined to the narrower of the two
+/// rectangles, and an empty intersection confines it to nothing: the tree
+/// carries one rectangle, and the CPU pass draws the same pixels.
+fn confined_draw(op: &DrawOp) -> (Option<RectI>, &DrawOp) {
+    match op {
+        DrawOp::Clipped { clip, draw } => {
+            let (inner, draw) = confined_draw(draw);
+            let clip = match inner {
+                Some(inner) => intersect_rect(*clip, inner).unwrap_or((0, 0, 0, 0)),
+                None => *clip,
+            };
+            (Some(clip), draw)
+        }
+        _ => (None, op),
+    }
+}
+
+/// The node a draw is drawn as, or `None` when the draw is not drawn.
+fn draw_op_node(op: &DrawOp, textures: &Map<u32, Texture>) -> Option<RenderNode> {
+    match op {
+        DrawOp::Image(draw) => {
+            let texture = textures.get(&draw.source)?;
+            let blend = draw_blend(draw.mode, draw.source_over)?;
+            Some(RenderNode {
+                content: RenderContent::Texture(texture.clone()),
+                src: source_region(draw.rect),
+                dst: RectF::new(0.0, 0.0, 1.0, 1.0),
+                affine: Some(affine_from_corners(draw.corners)),
+                opacity: f32::from(draw.opacity) / 255.0,
+                blend,
+                ..RenderNode::default()
+            })
+        }
+        DrawOp::Composite(draw) => {
+            let texture = textures.get(&draw.source)?;
+            let blend = draw_blend(draw.mode, draw.source_over)?;
+            let (x0, y0, x1, y1) = draw.rect;
+            let (x, y) = (draw.x, draw.y);
+            Some(RenderNode {
+                content: RenderContent::Texture(texture.clone()),
+                src: source_region(draw.rect),
+                dst: RectF::new(x as f32, y as f32, (x1 - x0) as f32, (y1 - y0) as f32),
+                opacity: f32::from(draw.opacity) / 255.0,
+                blend,
+                ..RenderNode::default()
+            })
+        }
+        DrawOp::Fill(draw) => {
+            let [origin, right, _corner, down] = draw.points.as_slice() else {
+                return None;
+            };
+            Some(RenderNode {
+                content: RenderContent::Solid([
+                    f32::from(draw.color[0]),
+                    f32::from(draw.color[1]),
+                    f32::from(draw.color[2]),
+                    f32::from(draw.color[3]) / 255.0,
+                ]),
+                dst: RectF::new(0.0, 0.0, 1.0, 1.0),
+                affine: Some(affine_from_corners([*origin, *right, *down])),
+                ..RenderNode::default()
+            })
+        }
+        DrawOp::Clipped { .. } => {
+            // A confined draw is peeled before the node is built, so the
+            // draw a node is built from is never confined itself.
+            None
+        }
+    }
+}
+
+/// The rectangle of the destination a draw is confined to, as the render
+/// tree's clip.
+fn clip_rect_f(clip: RectI) -> RectF {
+    let (x0, y0, x1, y1) = clip;
+    RectF::new(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32)
 }
 
 /// The source rectangle of a draw, as the render tree's region.
@@ -4226,6 +4375,21 @@ pub fn operate_rect(
     operate_rect_on(DestAlpha::Straight, dst, dx, dy, source, options);
 }
 
+/// [`operate_rect`] confined to a rectangle of the destination.
+///
+/// The rectangle holds the pixels the pass writes: the pixels outside it
+/// keep what they hold.
+fn operate_rect_clipped(
+    dst: &mut BitmapState,
+    dx: i32,
+    dy: i32,
+    source: BlitSource<'_>,
+    options: BlitOptions,
+    clip: Option<RectI>,
+) {
+    operate_rect_on_clipped(DestAlpha::Straight, dst, dx, dy, source, options, clip);
+}
+
 /// [`operate_rect`] onto a destination whose stored alpha follows
 /// `dst_alpha`.
 ///
@@ -4239,6 +4403,22 @@ pub fn operate_rect_on(
     dy: i32,
     source: BlitSource<'_>,
     options: BlitOptions,
+) {
+    operate_rect_on_clipped(dst_alpha, dst, dx, dy, source, options, None);
+}
+
+/// [`operate_rect_on`] confined to a rectangle of the destination.
+///
+/// The rectangle holds the pixels the pass writes: the pixels outside it
+/// keep what they hold.
+fn operate_rect_on_clipped(
+    dst_alpha: DestAlpha,
+    dst: &mut BitmapState,
+    dx: i32,
+    dy: i32,
+    source: BlitSource<'_>,
+    options: BlitOptions,
+    clip: Option<RectI>,
 ) {
     let BlitSource {
         bitmap: src,
@@ -4280,6 +4460,10 @@ pub fn operate_rect_on(
         }
     };
     let Some(dc) = intersect(dst, (dx, dy, dx.saturating_add(sw), dy.saturating_add(sh))) else {
+        return;
+    };
+    // The pass writes inside the clip alone.
+    let Some(dc) = intersect_rect(dc, clip_bounds(clip)) else {
         return;
     };
     // A source pixel outside the source bitmap reads as the transparent
@@ -8474,5 +8658,126 @@ mod tests {
                 "the dirty region differs at opa={opa}"
             );
         }
+    }
+
+    /// A source of `size` pixels in one colour.
+    fn uniform_source(size: u32, colour: [u8; 4]) -> BitmapState {
+        let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+        for _ in 0..size * size {
+            rgba.extend_from_slice(&colour);
+        }
+        BitmapState::new(size, size, rgba)
+    }
+
+    /// The sources a draw list reads.
+    fn sources(source: BitmapState) -> DrawSources {
+        let mut sources: DrawSources = crate::hasher::map();
+        sources.insert(0u32, Arc::new(source));
+        sources
+    }
+
+    /// A clipped draw reaches the pixels inside its rectangle alone.
+    ///
+    /// The rectangle is the one the item's paint box and the viewport of the
+    /// shape that encloses it meet at
+    /// (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:48-80`),
+    /// and the pixels outside it keep what they hold.
+    #[test]
+    fn a_clipped_draw_is_confined_to_its_rectangle() {
+        let mut dst = BitmapState::new(16, 16, vec![0u8; 16 * 16 * 4]);
+        let sources = sources(uniform_source(16, [255, 255, 255, 255]));
+        let draw = DrawOp::Clipped {
+            clip: (4, 4, 12, 12),
+            draw: Box::new(DrawOp::Image(ImageDraw {
+                source: 0,
+                rect: (0, 0, 16, 16),
+                corners: [(0.0, 0.0), (16.0, 0.0), (0.0, 16.0)],
+                opacity: 255,
+                mode: 2,
+                source_over: true,
+            })),
+        };
+        draw_ops(&mut dst, &[draw], &sources);
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let pixel = dst.rgba.as_chunks::<4>().0[y * 16 + x];
+                if (4..12).contains(&x) && (4..12).contains(&y) {
+                    assert_eq!(
+                        pixel,
+                        [255, 255, 255, 255],
+                        "the pixel ({x},{y}) is inside the clip"
+                    );
+                } else {
+                    assert_eq!(
+                        pixel,
+                        [0, 0, 0, 0],
+                        "the pixel ({x},{y}) is outside the clip"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A clipped affine draw is confined to its rectangle as well.
+    ///
+    /// The placement is skewed, so the draw takes the resampling path, and
+    /// the clip still holds the pixels the draw does not reach.
+    #[test]
+    fn a_clipped_affine_draw_is_confined_to_its_rectangle() {
+        let mut dst = BitmapState::new(16, 16, vec![0u8; 16 * 16 * 4]);
+        let sources = sources(uniform_source(16, [255, 255, 255, 255]));
+        let draw = DrawOp::Clipped {
+            clip: (4, 4, 12, 12),
+            draw: Box::new(DrawOp::Image(ImageDraw {
+                source: 0,
+                rect: (0, 0, 16, 16),
+                corners: [(0.0, 0.0), (16.0, 4.0), (4.0, 16.0)],
+                opacity: 255,
+                mode: 2,
+                source_over: true,
+            })),
+        };
+        draw_ops(&mut dst, &[draw], &sources);
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let pixel = dst.rgba.as_chunks::<4>().0[y * 16 + x];
+                if (4..12).contains(&x) && (4..12).contains(&y) {
+                    assert!(
+                        pixel[3] != 0,
+                        "the pixel ({x},{y}) is inside the clip and covered"
+                    );
+                } else {
+                    assert_eq!(
+                        pixel,
+                        [0, 0, 0, 0],
+                        "the pixel ({x},{y}) is outside the clip"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A draw that is not clipped reaches every pixel it covers.
+    #[test]
+    fn an_unclipped_draw_reaches_every_pixel_it_covers() {
+        let mut dst = BitmapState::new(16, 16, vec![0u8; 16 * 16 * 4]);
+        let sources = sources(uniform_source(16, [255, 255, 255, 255]));
+        let draw = DrawOp::Image(ImageDraw {
+            source: 0,
+            rect: (0, 0, 16, 16),
+            corners: [(0.0, 0.0), (16.0, 0.0), (0.0, 16.0)],
+            opacity: 255,
+            mode: 2,
+            source_over: true,
+        });
+        draw_ops(&mut dst, &[draw], &sources);
+        assert!(
+            dst.rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 255),
+            "the draw reaches every pixel"
+        );
     }
 }

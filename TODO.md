@@ -569,12 +569,14 @@ own decision and its own test.
 Landed: the pose reads the target image through the non-mutating accessor, so
 it no longer invalidates the target layer's cached subtree composite every
 frame, and a draw source's texture is filled once and not re-sent while its
-pixels do not change. What is left is the surface the pose is composed in:
-the motion player still creates, fills, uploads and destroys a group and a
-clip surface per frame
+pixels do not change. Landed again: a clipped item is no longer rendered into
+an offscreen of its own — the clip is a rectangle of the draw list, and the
+item's pixels are the icon's texture, which the device holds already. What is
+left is the group's surface: the stencil-composite group still creates, fills,
+uploads and destroys a surface per frame
 (`crates/compat/src/natives/plugins/motion_player/player.rs`: the group's
-surface is created at 2190-2194, filled at 2252 and handed to the scene at
-2305; the clip's at 2443-2459; the sources are pruned at 1773).
+surface is created at 2202, filled at 2267 and handed to the scene at 2323;
+the mask's own surface is created at 2281; the sources are pruned at 1773).
 
 * **The next step is reusable offscreen buffers with stable source ids**, so
   that a frame allocates nothing and uploads nothing that did not change. Two
@@ -591,6 +593,26 @@ surface is created at 2190-2194, filled at 2252 and handed to the scene at
   source's pixels, so it must do that at a later revision than the one the
   texture was filled at; if it does not, the texture keeps the old pixels and
   the pose draws a stale picture with no error.
+* **The stencil-composite group needs a per-pixel alpha mask, so it stays on
+  the CPU.** Its mask is the group's own alpha cut by the mask layers' alpha
+  (`reference/cpp/plugins/motionplayer/PlayerRenderExecute.cpp:456-472`), and
+  a rectangle clip cannot express it. The group surface is the one surface
+  the pose still allocates per frame.
+* **The mesh, the vertices and the shape bounds are rebuilt for every node
+  on every frame** (`refresh_geometry` at
+  `crates/compat/src/natives/plugins/motion_player/player.rs:1064`,
+  `refresh_node_geometry` at 3322): the grid points are a fresh vector per
+  node per frame. A node whose mesh does not deform could keep its points.
+* **Every drawn icon builds its chunk request again** (`IconChunks::new` at
+  `crates/compat/src/natives/plugins/motion_player/player.rs:2994` and 3056):
+  three to four path strings per icon per frame. The request names the
+  chunk's own path, so it can live with the icon.
+* **The tint table grows with the number of distinct vertex colours** and is
+  only emptied by `clearCache` (`tinted` at
+  `crates/compat/src/natives/plugins/motion_player/player.rs:171`,
+  `tinted_source` at 2753): every entry is a full tinted bitmap the scene
+  keeps alive. A motion that animates its colours grows the table and the
+  memory with it.
 
 
 ## 5. Dialogs and popups
