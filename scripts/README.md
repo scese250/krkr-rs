@@ -185,13 +185,29 @@ fire.
 - `KRKR_TEST_SAVE` — a real KAG save BMP for the save-fixture test.
 - `KRKR_REPO` — the checkout root; docs use it where a command starts outside
   the repository.
-- `KRKR_REFERENCE` — the reference checkout `storage-media`, `native-arity`,
-  `native-parity` and `plugin-parity` read (a clone with a `cpp/` directory).
-  Defaults to `<repo>/reference`;
-  `krkr-gate --reference PATH <check>` sets it for that run, and
-  `krkr-gate --reference PATH gate` hands it to every check the gate runs.
-  Without it, a clone at another path makes those four checks fail with the
-  paths they tried instead of scanning nothing.
+- `KRKR_REFERENCE` — the reference checkout the gate's checks and the test
+  suite read (a clone with a `cpp/` directory and a `tests/test_files`
+  directory). It is found the same way everywhere: `KRKR_REFERENCE` when it
+  is set, then `<repo>/reference`; the first candidate that holds a `cpp/`
+  directory is the checkout. A relative value is resolved against the
+  repository root. `krkr-gate --reference PATH <check>` sets it for that run,
+  and `krkr-gate --reference PATH gate` hands it to every check the gate
+  runs. Without it, a clone at another path makes those four checks fail
+  with the paths they tried instead of scanning nothing.
+- The reference-dependent tests of the `compat` crate read the same checkout:
+  the tests whose name starts with `reference_checkout_` mount the fixtures
+  under the checkout's `tests/test_files`, and they fail — naming the
+  fixture, the variable and the directory it must point at — when the
+  checkout is not there. A test that cannot run never reports a pass. Run
+  them with the checkout named:
+
+  ```bash
+  KRKR_REFERENCE=/path/to/krkr2 cargo test -p compat \
+      --test motion_player --test motion_timing --test env_image
+  ```
+
+  The variable must point at the clone root that holds `tests/test_files`
+  (and the `cpp/` directory that marks a clone as the checkout).
 
 ## Notes
 

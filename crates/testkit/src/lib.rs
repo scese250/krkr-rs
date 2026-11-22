@@ -35,7 +35,7 @@ pub use media_fixtures::{
     pattern, test_image, tiny_wav_mono,
 };
 pub use reference::{
-    REFERENCE_ENV, ReferenceFixtureError, reference_fixture, reference_fixture_or_skip,
+    REFERENCE_ENV, ReferenceFixtureError, reference_fixture, require_reference_fixture,
 };
 pub use render::headless_window;
 pub use vm::vm_lock;

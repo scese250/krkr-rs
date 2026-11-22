@@ -13,6 +13,11 @@
 //! The tests drive the shipped script surface: a `Motion.Player` bound to the
 //! reference's e-mote fixture, whose `全体構造` clip is a one-shot of 61
 //! frames (`lastTime 61`, `loopTime -1`).
+//!
+//! The tests whose name starts with `reference_checkout_` need the reference
+//! checkout: they mount the fixtures under its `tests/test_files`. Set
+//! `KRKR_REFERENCE` to the clone root that holds that directory; without it
+//! the test fails and names the fixture, the variable and the directory.
 
 mod common;
 
@@ -42,10 +47,12 @@ struct Env {
 }
 
 impl Env {
-    /// A VM whose storage is the reference `emote` fixture directory, or
-    /// `None` when the reference checkout is not available.
-    fn with_reference_storage() -> Option<Env> {
-        let dir = testkit::reference_fixture_or_skip("emote")?;
+    /// A VM whose storage is the checkout's `emote` fixture directory.
+    ///
+    /// The test fails when the checkout is unavailable: a test that cannot
+    /// run must not report a pass.
+    fn with_reference_storage() -> Env {
+        let dir = testkit::require_reference_fixture("emote");
         let engine = Box::new(Tjs2Engine::new().expect("create engine"));
         let mut scene = Box::new(Scene::default());
         let mut storage = Box::new(
@@ -67,12 +74,12 @@ impl Env {
         }
         host.install(&engine).expect("install compat surface");
         common::link_all_builtins(&engine);
-        Some(Env {
+        Env {
             _host: host,
             engine,
             _scene: scene,
             _storage: storage,
-        })
+        }
     }
 
     fn run(&self, script: &str) {
@@ -132,11 +139,9 @@ impl Env {
 /// `reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:468`,
 /// `reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:971`).
 #[test]
-fn a_delta_counts_at_sixty_frames_a_second() {
+fn reference_checkout_a_delta_counts_at_sixty_frames_a_second() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     env.start("p1");
     // The tick that follows the play is swallowed by the frame gate
     // (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:819-826`).
@@ -162,11 +167,9 @@ fn a_delta_counts_at_sixty_frames_a_second() {
 /// single late update lands on the pose of the new time and not on the pose
 /// of the first step.
 #[test]
-fn one_update_advances_the_clock_by_the_whole_delta() {
+fn reference_checkout_one_update_advances_the_clock_by_the_whole_delta() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     env.start("p1");
     env.run("p1.progress(0);");
     env.run("p1.progress(100);");
@@ -190,11 +193,9 @@ fn one_update_advances_the_clock_by_the_whole_delta() {
 /// total it applies
 /// (`reference/cpp/plugins/motionplayer/PlayerFrameProgress.cpp:468`).
 #[test]
-fn six_updates_end_at_the_same_clock_as_one() {
+fn reference_checkout_six_updates_end_at_the_same_clock_as_one() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     env.start("p1");
     env.run("p1.progress(0);");
     env.run("p1.progress(100);");
@@ -218,11 +219,9 @@ fn six_updates_end_at_the_same_clock_as_one() {
 /// `reference/cpp/plugins/motionplayer/RuntimeSupport.h:421-443`). The
 /// update does not leave the clip running and it does not restart it.
 #[test]
-fn a_one_shot_clip_stops_at_its_last_frame() {
+fn reference_checkout_a_one_shot_clip_stops_at_its_last_frame() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     env.start("p1");
     env.run("p1.progress(0);");
     env.run("var before = p1.getPlayingTimelineInfoList();");

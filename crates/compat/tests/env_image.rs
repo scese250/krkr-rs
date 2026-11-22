@@ -14,6 +14,11 @@
 //! The second pins the timeline information. Every entry carries the members
 //! the game's `AffineSourceMotion` reads from it, `label` among them; a
 //! missing member is a fatal script error in the game.
+//!
+//! The test whose name starts with `reference_checkout_` needs the reference
+//! checkout: it mounts the fixture under the checkout's `tests/test_files`.
+//! Set `KRKR_REFERENCE` to the clone root that holds that directory; without
+//! it the test fails and names the fixture, the variable and the directory.
 
 mod common;
 
@@ -96,18 +101,15 @@ fn the_draw_gives_the_target_layer_the_canvas_size() {
 /// game's `AffineSourceMotion` reads `label` and `blendRatio` from the
 /// entries, so a missing member ends the scenario with a fatal script error.
 #[test]
-fn the_timeline_information_carries_the_reference_members() {
+fn reference_checkout_the_timeline_information_carries_the_reference_members() {
     let _lock = vm_lock();
     let env = Env::with_storage();
     // The motion player's classes exist only after its first link, the way
     // a game script links it.
     env.link_plugin("motionplayer.dll");
     let dir = env.game_dir().expect("the temp game directory").clone();
-    let Some(fixture) =
-        testkit::reference_fixture_or_skip(std::path::Path::new("emote").join(MOTION_FIXTURE))
-    else {
-        return;
-    };
+    let fixture =
+        testkit::require_reference_fixture(std::path::Path::new("emote").join(MOTION_FIXTURE));
     std::fs::copy(&fixture, dir.join(MOTION_FIXTURE)).expect("copy the motion fixture");
     env.run(&format!(
         "Motion.ResourceManager.setEmotePSBDecryptSeed({MOTION_SEED});\

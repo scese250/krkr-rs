@@ -11,6 +11,11 @@
 //! module cache, the player's property/animation/variable/timeline model and
 //! the EmotePlayer shell. Every behaviour assertion cites the reference
 //! `file:line` it pins.
+//!
+//! The tests whose name starts with `reference_checkout_` need the reference
+//! checkout: they mount the fixtures under its `tests/test_files`. Set
+//! `KRKR_REFERENCE` to the clone root that holds that directory; without it
+//! the test fails and names the fixture, the variable and the directory.
 
 mod common;
 
@@ -35,32 +40,37 @@ impl Env {
         Env::build(None)
     }
 
-    /// A VM whose storage is the reference `emote` fixture directory, or
-    /// `None` when the reference checkout is not available.
-    fn with_reference_storage() -> Option<Env> {
-        let dir = testkit::reference_fixture_or_skip("emote")?;
-        Some(Env::build(Some(dir)))
+    /// A VM whose storage is the checkout's `emote` fixture directory.
+    ///
+    /// The test fails when the checkout is unavailable: a test that cannot
+    /// run must not report a pass.
+    fn with_reference_storage() -> Env {
+        let dir = testkit::require_reference_fixture("emote");
+        Env::build(Some(dir))
     }
 
-    /// A VM whose storage holds a copy of the reference motion fixture at
+    /// A VM whose storage holds a copy of the motion fixture at
     /// `motion/bare_motion.psb`, so a name without an extension exercises the
-    /// candidate list. `None` when the reference checkout is not available.
-    fn with_motion_alias() -> Option<Env> {
-        let source = testkit::reference_fixture_or_skip("emote/e-mote3.0バニラパジャマa.psb")?;
+    /// candidate list.
+    ///
+    /// The test fails when the checkout is unavailable.
+    fn with_motion_alias() -> Env {
+        let source = testkit::require_reference_fixture("emote/e-mote3.0バニラパジャマa.psb");
         let dir = std::env::temp_dir().join("krkr-motion-player-alias");
         let nested = dir.join("motion");
         std::fs::create_dir_all(&nested).expect("create alias directory");
         std::fs::copy(source, nested.join("bare_motion.psb")).expect("copy motion fixture");
-        Some(Env::build(Some(dir)))
+        Env::build(Some(dir))
     }
 
-    /// A VM whose storage is the reference `emote` fixture directory and
+    /// A VM whose storage is the checkout's `emote` fixture directory and
     /// whose only linked plugin is the motion player, the way a game that
-    /// plays a motion links it. `None` when the reference checkout is not
-    /// available.
-    fn with_motion_player_only() -> Option<Env> {
-        let dir = testkit::reference_fixture_or_skip("emote")?;
-        Some(Env::build_with_plugins(Some(dir), false))
+    /// plays a motion links it.
+    ///
+    /// The test fails when the checkout is unavailable.
+    fn with_motion_player_only() -> Env {
+        let dir = testkit::require_reference_fixture("emote");
+        Env::build_with_plugins(Some(dir), false)
     }
 
     fn build(storage_dir: Option<std::path::PathBuf>) -> Env {
@@ -387,11 +397,9 @@ fn layer_getter_matches_reference_field_types_and_defaults() {
 }
 
 #[test]
-fn player_draw_samples_the_icon_texture() {
+fn reference_checkout_player_draw_samples_the_icon_texture() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // The default clip's object layers name `src/body_parts/...` icons, whose
@@ -440,11 +448,9 @@ fn player_draw_samples_the_icon_texture() {
 }
 
 #[test]
-fn player_draw_applies_the_draw_affine_translate() {
+fn reference_checkout_player_draw_applies_the_draw_affine_translate() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // The title maps its 1920x1080 canvas into the 1920x1440 target with
@@ -475,11 +481,9 @@ fn player_draw_applies_the_draw_affine_translate() {
 }
 
 #[test]
-fn player_draw_leaves_the_target_uncleared_by_default() {
+fn reference_checkout_player_draw_leaves_the_target_uncleared_by_default() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // The ordinary draw path paints over the target image without clearing it:
@@ -509,11 +513,9 @@ fn player_draw_leaves_the_target_uncleared_by_default() {
 }
 
 #[test]
-fn player_draw_does_not_clear_the_target_when_clear_is_enabled() {
+fn reference_checkout_player_draw_does_not_clear_the_target_when_clear_is_enabled() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // The ordinary draw path only resizes the target layer: it never clears
@@ -550,11 +552,9 @@ fn player_draw_does_not_clear_the_target_when_clear_is_enabled() {
 }
 
 #[test]
-fn player_draw_accumulates_the_target_alpha_across_frames() {
+fn reference_checkout_player_draw_accumulates_the_target_alpha_across_frames() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // The pose is composited over the target with the source-over blend,
@@ -603,11 +603,9 @@ fn player_draw_accumulates_the_target_alpha_across_frames() {
 }
 
 #[test]
-fn d3d_adaptor_clears_its_render_target_before_the_pose() {
+fn reference_checkout_d3d_adaptor_clears_its_render_target_before_the_pose() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // The adaptor owns its render target and clears it before every pose
@@ -644,11 +642,9 @@ fn d3d_adaptor_clears_its_render_target_before_the_pose() {
 }
 
 #[test]
-fn player_draw_leaves_the_target_layer_geometry_and_visibility_alone() {
+fn reference_checkout_player_draw_leaves_the_target_layer_geometry_and_visibility_alone() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // The reference sizes and paints the target image; it does not move the
@@ -677,11 +673,9 @@ fn player_draw_leaves_the_target_layer_geometry_and_visibility_alone() {
 }
 
 #[test]
-fn player_draw_reuses_the_target_allocation_and_marks_the_image_modified() {
+fn reference_checkout_player_draw_reuses_the_target_allocation_and_marks_the_image_modified() {
     let _lock = vm_lock();
-    let Some(mut env) = Env::with_reference_storage() else {
-        return;
-    };
+    let mut env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // The reference composites into the target layer's image with
@@ -749,11 +743,9 @@ fn player_draw_reuses_the_target_allocation_and_marks_the_image_modified() {
 }
 
 #[test]
-fn motion_load_registers_nested_psb_resources() {
+fn reference_checkout_motion_load_registers_nested_psb_resources() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // Loading a motion registers its container's resources in the `psb://`
@@ -788,11 +780,9 @@ fn motion_load_registers_nested_psb_resources() {
 /// read from. A game that plays a motion without linking `psbfile.dll` still
 /// gets its textures.
 #[test]
-fn the_motion_player_serves_the_psb_media_it_registers() {
+fn reference_checkout_the_motion_player_serves_the_psb_media_it_registers() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_motion_player_only() else {
-        return;
-    };
+    let env = Env::with_motion_player_only();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     env.run(&format!(
@@ -902,11 +892,9 @@ fn has_ink(pixels: &[u8]) -> bool {
 }
 
 #[test]
-fn player_draw_routes_a_d3d_adaptor_to_its_render_target() {
+fn reference_checkout_player_draw_routes_a_d3d_adaptor_to_its_render_target() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // The reference's draw dispatch routes a D3D adaptor to the render target
@@ -971,11 +959,9 @@ fn player_draw_routes_a_d3d_adaptor_to_its_render_target() {
 }
 
 #[test]
-fn d3d_adaptor_without_canvas_capture_renders_nothing() {
+fn reference_checkout_d3d_adaptor_without_canvas_capture_renders_nothing() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // The reference gates the whole D3D route on the canvas-capture flag: an
@@ -1304,11 +1290,9 @@ fn emote_player_shell_transforms_animate() {
 }
 
 #[test]
-fn resource_manager_loads_and_unloads_a_psb_module() {
+fn reference_checkout_resource_manager_loads_and_unloads_a_psb_module() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // `load(ttstr)` parses the PSB and returns the module object
@@ -1390,11 +1374,9 @@ fn player_without_an_argument_installs_a_default_resource_manager() {
 }
 
 #[test]
-fn player_project_binding_syncs_variable_keys_from_the_motion_labels() {
+fn reference_checkout_player_project_binding_syncs_variable_keys_from_the_motion_labels() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     env.run(&format!(
@@ -1414,11 +1396,10 @@ fn player_project_binding_syncs_variable_keys_from_the_motion_labels() {
 }
 
 #[test]
-fn player_variable_keys_getter_does_not_replace_a_void_value_with_the_motion_labels() {
+fn reference_checkout_player_variable_keys_getter_does_not_replace_a_void_value_with_the_motion_labels()
+ {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     env.run(&format!(
@@ -1438,11 +1419,9 @@ fn player_variable_keys_getter_does_not_replace_a_void_value_with_the_motion_lab
 }
 
 #[test]
-fn player_motion_key_resolves_a_storage_like_name_and_syncs_variable_keys() {
+fn reference_checkout_player_motion_key_resolves_a_storage_like_name_and_syncs_variable_keys() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // A name carrying a path separator or an extension is looked up as it is
@@ -1460,11 +1439,9 @@ fn player_motion_key_resolves_a_storage_like_name_and_syncs_variable_keys() {
 }
 
 #[test]
-fn player_motion_key_expands_a_bare_name_through_the_candidate_list() {
+fn reference_checkout_player_motion_key_expands_a_bare_name_through_the_candidate_list() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_motion_alias() else {
-        return;
-    };
+    let env = Env::with_motion_alias();
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     // A bare name is looked up as `<name>.mtn`, `<name>.psb`,
     // `motion/<name>.mtn` and `motion/<name>.psb` in that order
@@ -1479,11 +1456,9 @@ fn player_motion_key_expands_a_bare_name_through_the_candidate_list() {
 }
 
 #[test]
-fn player_find_motion_returns_the_module_and_syncs_variable_keys() {
+fn reference_checkout_player_find_motion_returns_the_module_and_syncs_variable_keys() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     env.run(&format!(
@@ -1504,11 +1479,9 @@ fn player_find_motion_returns_the_module_and_syncs_variable_keys() {
 }
 
 #[test]
-fn player_is_exist_motion_resolves_the_candidate_list() {
+fn reference_checkout_player_is_exist_motion_resolves_the_candidate_list() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     env.run(&format!(
@@ -1525,11 +1498,9 @@ fn player_is_exist_motion_resolves_the_candidate_list() {
 }
 
 #[test]
-fn player_unload_all_drops_the_bound_motion_and_its_variable_keys() {
+fn reference_checkout_player_unload_all_drops_the_bound_motion_and_its_variable_keys() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     env.run(&format!(
@@ -1550,11 +1521,9 @@ fn player_unload_all_drops_the_bound_motion_and_its_variable_keys() {
 }
 
 #[test]
-fn emote_player_load_activates_the_registered_module_snapshot() {
+fn reference_checkout_emote_player_load_activates_the_registered_module_snapshot() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     env.run(&format!(
@@ -1628,11 +1597,9 @@ fn separate_layer_adaptor_layer_tree_owner_interface_delegates_to_its_owner() {
 /// node's own state
 /// (`reference/cpp/plugins/motionplayer/PlayerLayerQuery.cpp:24-71`).
 #[test]
-fn the_layer_getter_is_a_motion_layer_getter_instance() {
+fn reference_checkout_the_layer_getter_is_a_motion_layer_getter_instance() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     env.run(&format!(
@@ -1686,11 +1653,9 @@ fn the_layer_getter_is_a_motion_layer_getter_instance() {
 /// survives the next read
 /// (`reference/cpp/plugins/motionplayer/PlayerLayerQuery.cpp:48-71`).
 #[test]
-fn the_layer_getter_keeps_the_writes_into_its_arrays() {
+fn reference_checkout_the_layer_getter_keeps_the_writes_into_its_arrays() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     env.run(&format!(
@@ -1746,11 +1711,9 @@ fn the_color_weight_round_trips_through_the_script_surface() {
 /// `:1002-1004`). The `progress` member reports the playback ratio
 /// (`PlayerCore.cpp:1281-1305`).
 #[test]
-fn progress_gates_the_first_tick_and_drops_an_out_of_range_delta() {
+fn reference_checkout_progress_gates_the_first_tick_and_drops_an_out_of_range_delta() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     env.run(&format!(
@@ -1799,11 +1762,9 @@ fn d3d_adaptor_constructor_validates_its_window_and_size_arguments() {
 /// (`reference/cpp/plugins/motionplayer/PlayerCore.cpp:1175-1232`,
 /// `reference/cpp/plugins/motionplayer/PlayerTimeline.cpp:479-491`).
 #[test]
-fn player_motion_key_selects_its_clip_from_a_bound_project() {
+fn reference_checkout_player_motion_key_selects_its_clip_from_a_bound_project() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     env.run(&format!(
@@ -1838,11 +1799,9 @@ fn player_motion_key_selects_its_clip_from_a_bound_project() {
 /// (one each); the eye clips put the group's clip over the `shirome` mask, so
 /// the mask pass raises the antialiased mask edge to the threshold alpha.
 #[test]
-fn the_stencil_groups_mask_the_layout_and_eye_clips() {
+fn reference_checkout_the_stencil_groups_mask_the_layout_and_eye_clips() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     let draw = |name: &str, clip: &str, width: u32, height: u32| {
@@ -1904,11 +1863,9 @@ fn the_stencil_groups_mask_the_layout_and_eye_clips() {
 /// The game script is `system/world.tjs` (`EnvLayerObject.createWait(1)` /
 /// `:2`) and `system/affinesourcemotion.tjs` (`canSync`).
 #[test]
-fn a_real_motion_keeps_can_sync_closed_until_the_first_full_frame() {
+fn reference_checkout_a_real_motion_keeps_can_sync_closed_until_the_first_full_frame() {
     let _lock = vm_lock();
-    let Some(env) = Env::with_reference_storage() else {
-        return;
-    };
+    let env = Env::with_reference_storage();
     env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
     let path = "e-mote3.0バニラパジャマa.psb";
     env.run(&format!(
