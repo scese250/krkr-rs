@@ -1475,6 +1475,36 @@ page.
   or `++`/`--` statement. `docs.old/audits/bytecode-scripts.md` §5,
   `docs.old/vm-defects.md` BLK-3.
 
+* **A rare SIGSEGV in the compat crate's unit test binary is not attributed.**
+  Running the workspace suite (`cargo test --workspace --no-fail-fast`, what
+  `krkr-gate test` runs) died once on 2026-11-22 with `error: test failed, to
+  rerun pass -p compat --lib` and `process didn't exit successfully:
+  .../compat-6577376d1b259496 (signal: 11, SIGSEGV: invalid memory
+  reference)`. The last line the binary printed before it died was the movie
+  plugin's test log (`Member "openMovie" does not exist` — the VM's own
+  message, `crates/tjs/cpp/tjs2/tjsError.h:264`), and a signal prints no Rust
+  backtrace. It is rare: the same suite run again immediately afterwards
+  passed (exit 0), and the compat lib binary alone ran 600+ times without a
+  crash (200 runs of the plain build, 200 of the workspace build, plus
+  single-threaded runs). It is not deterministic: with `--test-threads=1` the
+  same binary runs all 190 tests green. It is not a stack overflow: the binary
+  ran 20 times with a 1 MB stack and 10 times with a 512 KB stack (the default
+  is 8 MB) with no crash. Cleared so far: the SIMD kernel
+  (`crates/engine/src/simd.rs`) is safe Rust throughout (slices,
+  `as_chunks_mut`; no unchecked access) and a partial row falls back before
+  writing; the engine's host font scan thread (`crates/engine/src/text.rs`)
+  owns an `Arc` to its state and never touches the engine; the engine's decode
+  job pool (`crates/engine/src/jobpool.rs`) stops and joins its workers when it
+  drops; the VM's member read and member call take the same raw id and both
+  rely on the caller owning the id's liveness. **Next step:** the host pipes
+  cores to `systemd-coredump`, so the next occurrence leaves a backtrace —
+  `coredumpctl list` shows the entry, `coredumpctl debug <entry>` gives the
+  backtrace. The crash has not been reproduced on demand, and guessing is not
+  the way to close it: the same discipline §3 item 1 asks for. **Open
+  question:** whether the crash is in the vendored C++ VM's own teardown or in
+  a race between the unit tests that share one process, and whether it
+  predates the recent changes — not answered yet, because the crash has not
+  been reproduced.
 * **The scratch space fills up.** A worker that builds the tree keeps a
   target directory of its own, and several of them fill `/tmp` - which is a
   tmpfs of sixteen gigabytes - until a write fails with an I/O error and the
