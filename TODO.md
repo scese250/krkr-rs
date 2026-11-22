@@ -95,11 +95,12 @@ residuals:
      save was refused. The port now creates those folders; the residual
      question is the `G//G/` spelling in the original log, which this title
      does not produce.
-4. **The title screen's motion paid two full-canvas operations every frame.**
+4. **The title screen's motion paid two full-canvas operations every
+   frame - but neither of them is established as the device's slow frame.**
    A device run of the game "LimeLight Lemonade Jam" showed slow frames of
    262-567 ms with `host.sync_upload` up to 318 ms, and another title of the
    same engine family showed the same signature. Two per-frame items in the
-   motion's pose path explained it, and both are landed:
+   motion's pose path are real and are landed:
    * the pose cleared the target layer's **image** on the CPU, which dirtied
      the canvas and put 1920x1080x4 bytes into every frame's upload - while
      the pose itself is drawn on the GPU and never travels back to the host.
@@ -112,13 +113,53 @@ residuals:
      not express a clip. The clip is now a rectangle of the draw list, and
      the node's pixels are the icon's texture, which the device holds
      already.
-   **Not verified on a device.** The host figures are the desktop's: this
-   title's motion is 11-14 ms of CPU per frame in a release run (the figure
-   in section 11 for the sibling title), and a desktop Vulkan run of this
-   title is smooth. No phone was connected when the change was made, so
-   "the phone's title animation is now smooth" is NOT established - only
-   "the two per-frame operations that made it slow are gone". The device
-   run that would establish it is owed.
+   **Neither is established as the cause, and one of them is not this
+   game's path.** The game links the plugin with `-nod3dm`
+   (`system/motion.tjs` in the game's data), so it plays the non-D3D route,
+   where the motion player does not clear at all: the clear change lands on
+   the D3D route and this game never takes it. The clip change is on the
+   game's path (a node whose paint box is trimmed by its shape's viewport is
+   common in these files), but the per-frame cost of that path was never
+   measured - the pose's own cost on this game's own `motion/yuzulogo.mtn`
+   and `motion/title_bg.mtn` is still unmeasured, because a headless run
+   cannot reach the title (the game waits for a click on its warning screen)
+   and no virtual display is available on this host. So the honest state is:
+   the clip offscreen was a real per-frame allocation, rasterization, upload
+   and destroy, and it is gone; the clear was a real full-canvas upload on
+   the D3D route, and it is gone; **neither has been shown to be the device's
+   slow frame**, and the device run that would settle it is owed.
+   **What the game's own code points at instead.** The title's per-frame path
+   is `system/affinesourcemotion.tjs`: `progress`, `draw`/`drawAffine`,
+   `clearEnabled`, `_redrawList`, `fillRect`, `updateImage`, `_redrawImage`,
+   `assignImages`. Three per-frame costs follow from it, and each is a
+   candidate the port pays and the reference does not:
+   * `fillRect` on the full-screen target layer dirties the layer's image,
+     and the port's layer images live on the CPU, so the whole canvas goes
+     to the GPU again. The reference can keep a layer's image as a device
+     bitmap, where a fill is a GPU fill
+     (`reference/cpp/core/visual/LayerIntf.cpp`, the D3D bitmap path).
+   * `assignImages` reads the motion's layer back through the read-back seam
+     (`crates/engine/src/scene.rs`, `sync_pose_pixels`) and copies it: a
+     full-canvas GPU-to-CPU round trip plus a full-canvas copy, every
+     frame.
+   * the title also plays a movie (`sysscn/title.ks`, the `title.movie`
+     hook), and the movie's picture is copied into the layer every frame
+     instead of being assigned as its image - the divergence section 7
+     already records.
+   Plus the 250 `onFrameUpdate` exceptions per two seconds below, each of
+   which costs a log write.
+   * **The engine uploads a dirty bitmap a layer holds, whether or not the
+     layer is drawn** (`crates/engine/src/engine.rs`, `sync_dirty_bitmaps`): a
+     bitmap no layer holds is skipped, but a bitmap a hidden layer holds is
+     sent to the GPU in full. The reference's renderer uploads the layers it
+     draws.
+   * **The port keeps the pose and the layer's image apart; the reference
+     keeps one picture.** The reference's ordinary route composites the pose
+     into the layer's bitmap, so the layer carries one image and the game
+     clearing it costs nothing extra. The port draws the pose on its own
+     surface and leaves the layer's image alone, so the game's per-frame
+     `fillRect` dirties an image that is uploaded and then covered by the
+     pose: a full-canvas upload the reference does not pay.
 5. **The title's movie raises in the game's own `onFrameUpdate` handler.**
    The same device run logged 250 `onFrameUpdate` exceptions in about two
    seconds on the title screen. The port's video event dispatch is not the
