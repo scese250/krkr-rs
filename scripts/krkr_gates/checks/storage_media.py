@@ -36,6 +36,12 @@ A domain that is neither is a finding.  A reference domain the port genuinely
 cannot recover is recorded, with a reason, in
 ``scripts/allowlists/storage_media_allow.txt``.
 
+The reference checkout is the one the other reference-reading checks use:
+``KRKR_REFERENCE`` (which ``krkr-gate --reference PATH`` sets), then
+``<repo>/reference``.  A checkout that is missing stops the check with the
+paths it tried, because a scan that finds no reference source covers no
+domain and would pass without proving anything.
+
 Usage:
     uv run --project scripts krkr-gate storage-media
     uv run --project scripts krkr-gate storage-media --self-test
@@ -51,7 +57,13 @@ import re
 import sys
 from pathlib import Path
 
-from ..common import ALLOWLISTS_DIR, FIXTURES_DIR, REPO_ROOT
+from ..common import (
+    ALLOWLISTS_DIR,
+    FIXTURES_DIR,
+    REPO_ROOT,
+    reference_citation,
+    reference_root,
+)
 from ..framework import (
     find_block,
     load_keyed_allowlist,
@@ -132,10 +144,19 @@ def _block(text: str, open_brace: int) -> str:
     return text[open_brace + 1 : len(text) - 1]
 
 
-def _reference_sources(root: Path):
-    base = root / "reference" / "cpp"
+def _reference_sources(reference: Path):
+    """Yield every reference source under the checkout's ``cpp`` directory.
+
+    A checkout without ``cpp`` is a missing reference, not an empty one: the
+    domains the reference defines would silently shrink to none and the check
+    would pass without covering anything.
+    """
+    base = reference / "cpp"
     if not base.is_dir():
-        return
+        raise SystemExit(
+            f"krkr-gate: no reference sources under {base} — the checkout at "
+            f"{reference} is incomplete; point --reference at the clone root."
+        )
     for path in sorted(base.rglob("*")):
         if path.suffix in REFERENCE_SUFFIXES:
             yield path
@@ -151,20 +172,17 @@ def _domain_from_getname(body: str, param: str, macros: dict[str, str]):
     return None
 
 
-def reference_domains(root: Path) -> dict[str, list[tuple[str, int]]]:
+def reference_domains(reference: Path) -> dict[str, list[tuple[str, int]]]:
     """Return ``scheme -> [(reference_path, line)]`` for every named media."""
     found: dict[str, list[tuple[str, int]]] = {}
-    for path in _reference_sources(root):
+    for path in _reference_sources(reference):
         raw = path.read_text(encoding="utf-8", errors="replace")
         macros = {
             match.group("name"): match.group("domain")
             for match in _DEFINE_BASENAME.finditer(raw)
         }
         masked = strip_cpp_comments(raw)
-        try:
-            rel = path.relative_to(root).as_posix()
-        except ValueError:
-            rel = path.as_posix()
+        rel = reference_citation(path, reference)
         for cls in _CLASS.finditer(masked):
             body = _block(masked, cls.end() - 1)
             getname = _GETNAME.search(body)
@@ -221,9 +239,13 @@ def documented_domains(root: Path) -> set[str]:
     return documented
 
 
-def scan(root: Path) -> list[dict[str, object]]:
-    """Return one finding per reference domain that is neither served nor documented."""
-    domains = reference_domains(root)
+def scan(root: Path, reference: Path) -> list[dict[str, object]]:
+    """Return one finding per reference domain that is neither served nor documented.
+
+    ``root`` is the port tree the check reads the served and documented
+    domains from; ``reference`` is the checkout the domains are derived from.
+    """
+    domains = reference_domains(reference)
     covered = served_domains(root) | documented_domains(root)
     findings: list[dict[str, object]] = []
     for scheme in sorted(domains):
@@ -242,7 +264,7 @@ def self_test(verbose: bool = True) -> int:
             print(f"check-storage-media: self-test fixture missing: {path}")
             return 1
     expected = json.loads(expected_path.read_text(encoding="utf-8"))
-    findings = scan(tree)
+    findings = scan(tree, tree / "reference")
     got = {finding["scheme"] for finding in findings}
     want = set(expected["findings"])
     if got != want:
@@ -291,10 +313,11 @@ def main(argv: list[str] | None = None) -> int:
     if selftest != 0:
         return 1
 
-    domains = reference_domains(ROOT)
+    reference = reference_root()
+    domains = reference_domains(reference)
     served = served_domains(ROOT)
     documented = documented_domains(ROOT)
-    findings = scan(ROOT)
+    findings = scan(ROOT, reference)
     allowed = load_keyed_allowlist(ALLOWLIST)
 
     if args.update_allow:
