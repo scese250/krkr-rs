@@ -43,6 +43,11 @@
 //! Invalidating that object closes the overlay and cuts the delivery, so a
 //! dead object is never called back and the picture stops with it.
 //!
+//! The delivery asks the owner for the member first. An owner that does not
+//! define it receives no event, and the delivery stays silent: the call the
+//! event delivery makes is never inspected, so an absent member is not an
+//! error.
+//!
 //! [`CompatServices::state`]: crate::CompatServices::state
 #![allow(unsafe_code)]
 
@@ -57,9 +62,9 @@ use crate::engine_api::{SoundError, SoundSource};
 use api::error::MediaError;
 use api::media::{DecodedAudio, RgbaFrame, VideoSpec};
 use tjs::{
-    DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
-    Tjs2Engine, Tjs2ValueId, TjsValue, VAL_INTEGER, VAL_OBJECT, VAL_REAL, VAL_RETAINED, VAL_STRING,
-    Value,
+    DetachedValue, MemberRead, NativeInstanceBuilder, NativeInstanceMethodDef,
+    NativeInstancePropertyDef, Tjs2Engine, Tjs2ValueId, TjsValue, VAL_INTEGER, VAL_OBJECT,
+    VAL_REAL, VAL_RETAINED, VAL_STRING, Value,
 };
 
 use crate::collections::Map;
@@ -2528,17 +2533,18 @@ extern "C" fn vo_layer2_set(
 
 /// A sink the event mapper calls for each queued [`VideoEvent`].
 trait EventSink {
-    /// Call `member` on the overlay object with `args`.
-    fn call_member(
-        &self,
-        objthis: *mut c_void,
-        member: &str,
-        args: &[TjsValue],
-    ) -> Result<TjsValue, String>;
+    /// Deliver `member` to the target object with `args`.
+    ///
+    /// The sink asks the target for the member first: a target that does not
+    /// define it receives nothing, and that is not an error.
+    fn deliver(&self, objthis: *mut c_void, member: &str, args: &[TjsValue]) -> Result<(), String>;
 }
 
 /// Map queued L2 events to the script `on*` members (the reference
 /// `FireStatusChanged`/`FirePeriodEvent`/`FireFrameUpdateEvent`).
+///
+/// The sink asks the target for the member first, so a target that does not
+/// define it receives no event and the delivery reports nothing.
 fn dispatch_events_with(sink: &dyn EventSink, objthis: *mut c_void, events: &[VideoEvent]) {
     if objthis.is_null() {
         return;
@@ -2555,8 +2561,8 @@ fn dispatch_events_with(sink: &dyn EventSink, objthis: *mut c_void, events: &[Vi
             // surface: the host observes the completion through the queue.
             VideoEvent::TransitionComplete => continue,
         };
-        if let Err(error) = sink.call_member(objthis, member, &args) {
-            log::warn!("VideoOverlay: {member} failed: {error}");
+        if let Err(error) = sink.deliver(objthis, member, &args) {
+            log::warn!("compat.video: {member} handler failed: {error}");
         }
     }
 }
@@ -2569,13 +2575,24 @@ struct EngineSink<'a> {
 }
 
 impl EventSink for EngineSink<'_> {
-    fn call_member(
+    fn deliver(
         &self,
         _objthis: *mut c_void,
         member: &str,
         args: &[TjsValue],
-    ) -> Result<TjsValue, String> {
-        self.host.call_member(self.owner.raw_id(), member, args)
+    ) -> Result<(), String> {
+        // Ask the owner for the member first: a member that is absent, void
+        // or null holds no handler, and a member that holds a value that is
+        // not an object cannot be called. The delivery does nothing in both
+        // cases, and the frame reports nothing.
+        match self.host.member_read(self.owner.raw_id(), member) {
+            Ok(MemberRead::Object(_)) => {}
+            Ok(_) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        self.host
+            .call_member(self.owner.raw_id(), member, args)
+            .map(|_| ())
     }
 }
 
@@ -2688,7 +2705,7 @@ fn present(source: &mut Option<Box<dyn VideoSource>>, slot: &mut VideoSlot) -> b
         return false;
     };
     if let Err(error) = slot.overlay.present_frame(frame) {
-        log::warn!("VideoOverlay: inconsistent decoded frame: {error}");
+        log::warn!("compat.video: inconsistent decoded frame: {error}");
         return false;
     }
     true
@@ -3130,16 +3147,16 @@ mod tests {
     }
 
     impl EventSink for FakeSink {
-        fn call_member(
+        fn deliver(
             &self,
             _objthis: *mut c_void,
             member: &str,
             args: &[TjsValue],
-        ) -> Result<TjsValue, String> {
+        ) -> Result<(), String> {
             self.calls
                 .borrow_mut()
                 .push((member.to_string(), args.to_vec()));
-            Ok(TjsValue::Void)
+            Ok(())
         }
     }
 

@@ -158,8 +158,6 @@
 {"anchor": "System: default member {name}: {error}", "path": "crates/compat/src/natives/system.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "BitmapLayerTreeOwner: could not duplicate a retained object: {error}", "path": "crates/compat/src/natives/tree_owner.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "{what}: evaluation failed: {error}", "path": "crates/compat/src/natives/tree_owner.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "VideoOverlay: {member} failed: {error}", "path": "crates/compat/src/natives/video.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "VideoOverlay: inconsistent decoded frame: {error}", "path": "crates/compat/src/natives/video.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "image: the load of {name:?} took {:.1} ms (resolve={:.1} storage_read={:.1} header_probe={:.1})", "path": "crates/compat/src/natives/visual/bitmap.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "image: the synchronous load of {name:?} took {:.1} ms (storage_read={read_ms:.1} decode={decode_ms:.1})", "path": "crates/compat/src/natives/visual/bitmap.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "image: the decode pool refused {name:?} ({error}); the load decodes synchronously on the calling thread", "path": "crates/compat/src/natives/visual/bitmap.rs", "reason": "the record predates the convention; the migration is in TODO.md"}

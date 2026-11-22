@@ -113,7 +113,20 @@ The status sequence for a full transport run is exactly
 `pause` → `"pause"`, `stop` → `"stop"`, `close` → `"unload"`.
 
 Dispatch goes through the object's class chain, so a script override wins
-over the native hook. Handler failures are **logged, never raised**.
+over the native hook. The delivery **asks the owner for the member first**:
+an owner that does not define it — or whose member holds nothing — receives
+no event, and nothing is reported. Only a handler that fails is **logged,
+never raised** (`compat.video: <member> handler failed: …`).
+
+The reference delivers an event with a call whose result it never inspects
+(`reference/cpp/core/base/EventIntf.cpp:97-111`), and a member that is not
+there makes that call return `TJS_E_MEMBERNOTFOUND` instead of raising
+(`reference/cpp/core/tjs2/tjsObject.cpp:1214-1226`): an owner without the
+member is not an error there, and the port does not turn it into one. The
+whole family takes this path — `onStatusChanged`
+(`reference/cpp/core/visual/VideoOvlIntf.cpp:91-111`), `onPeriod`
+(`:151-165`) and `onFrameUpdate` (`:167-181`) are posted to the owner the
+same way.
 
 The events are delivered to the script object that owns the overlay.
 **Invalidating that object stops the delivery**: the overlay is closed and
@@ -191,6 +204,11 @@ and pan, and the invalidation stopping the picture and the event delivery.
 
 Unit tests inside the module cover the event→script-member mapping and the
 frame selection of the buffered source.
+
+`crates/compat/tests/video_event_dispatch.rs` covers the delivery itself: an
+owner that does not define the event member receives nothing and the frame
+reports nothing, an owner whose member holds nothing is the same, and an
+owner that defines the member still receives the event with its argument.
 
 ---
 

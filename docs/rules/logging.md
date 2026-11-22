@@ -54,6 +54,7 @@ from. It is the crate, and the module inside it:
 | `compat.storage` | the storage natives |
 | `compat.system` | the system natives |
 | `compat.timer` | the timer natives |
+| `compat.video` | the video natives and the movie playback |
 | `engine.audio` | the engine mixer |
 | `engine.frame` | the frame clock and the engine frame |
 | `engine.jobpool` | the decode pool |
