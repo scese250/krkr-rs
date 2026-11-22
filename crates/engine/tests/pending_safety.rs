@@ -6,7 +6,7 @@
 //! out-of-bounds index.
 
 use api::media::RgbaFrame;
-use engine::video::blit_frame_to_layer;
+use engine::video::{FrameCopy, blit_frame_to_layer};
 use engine::{BitmapState, Rect, Scene};
 
 /// A pixel's byte offset is its row's scan line plus the column: a scan line
@@ -109,7 +109,12 @@ fn a_destination_without_pixels_refuses_the_frame() {
         state.bitmap = Some(image);
     }
     let frame = RgbaFrame::new(2, 2, 0, vec![255; 16]);
-    assert!(!blit_frame_to_layer(&mut scene, layer, &frame, false));
+    assert!(!blit_frame_to_layer(
+        &mut scene,
+        layer,
+        &frame,
+        FrameCopy::Replace
+    ));
     assert!(
         scene.bitmap(image).expect("image").rgba.is_empty(),
         "the refused copy writes nothing"
@@ -131,6 +136,11 @@ fn a_valid_frame_still_blits() {
     }
     let pixels: Vec<u8> = (0u8..16).collect();
     let frame = RgbaFrame::new(2, 2, 0, pixels.clone());
-    assert!(blit_frame_to_layer(&mut scene, layer, &frame, false));
+    assert!(blit_frame_to_layer(
+        &mut scene,
+        layer,
+        &frame,
+        FrameCopy::Replace
+    ));
     assert_eq!(scene.bitmap(image).expect("image").rgba, pixels);
 }

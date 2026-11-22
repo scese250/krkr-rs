@@ -88,7 +88,7 @@ pub(crate) use engine::sound::{
 
 // Video-overlay playback state, events, bounds and layer blits.
 pub(crate) use engine::video::{
-    PlayStatus, VideoBounds, VideoEvent, VideoOverlay, blit_frame_to_layer,
+    FrameCopy, PlayStatus, VideoBounds, VideoEvent, VideoOverlay, blit_frame_to_layer,
     blit_frame_to_layer_opacity,
 };
 

@@ -22,7 +22,7 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-use crate::engine_api::{VideoEvent, VideoOverlay, blit_frame_to_layer};
+use crate::engine_api::{FrameCopy, VideoEvent, VideoOverlay, blit_frame_to_layer};
 use api::blend::BlendMode;
 use tjs::{NativeObjThisMethodDef, Tjs2Engine, Value};
 
@@ -375,7 +375,15 @@ fn copy_frame(ctx: &CompatCtx, slot: &MovieSlot) {
     if let Some(bitmap_id) = bitmap_id {
         scene.resolve_bitmap(bitmap_id);
     }
-    if !blit_frame_to_layer(scene, slot.layer, frame, slot.alpha) {
+    // The picture is copied with the "Copy" render method, or with
+    // "CopyColor" when the movie's alpha is on: the colour is written and
+    // the destination's alpha is kept.
+    let copy = if slot.alpha {
+        FrameCopy::KeepAlpha
+    } else {
+        FrameCopy::Replace
+    };
+    if !blit_frame_to_layer(scene, slot.layer, frame, copy) {
         log::warn!(
             "LayerExMovie: layer #{} has no image to copy into",
             slot.layer

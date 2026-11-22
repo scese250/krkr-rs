@@ -56,7 +56,7 @@ use std::sync::Arc;
 
 use crate::engine_api::Scene;
 use crate::engine_api::{
-    PlayStatus, VideoBounds, VideoEvent, VideoOverlay, blit_frame_to_layer_opacity,
+    FrameCopy, PlayStatus, VideoBounds, VideoEvent, VideoOverlay, blit_frame_to_layer_opacity,
 };
 use crate::engine_api::{SoundError, SoundSource};
 use api::error::MediaError;
@@ -2772,7 +2772,12 @@ fn composite_frame(
     let Ok(scene) = scene_mut(ctx) else {
         return;
     };
-    blit_frame_to_layer_opacity(scene, layer_id, frame, source_over, opacity);
+    let copy = if source_over {
+        FrameCopy::Composite { opacity }
+    } else {
+        FrameCopy::Replace
+    };
+    blit_frame_to_layer_opacity(scene, layer_id, frame, copy);
 }
 
 /// The attached L2 scene, mutably.

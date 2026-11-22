@@ -48,7 +48,9 @@ use std::sync::Arc;
 
 use api::media::{RgbaFrame, VideoSpec};
 
-use crate::layer_ops::{BlitOptions, BlitSource, blit_copy_clipped, blit_over, clip_rect};
+use crate::layer_ops::{
+    BlitOptions, BlitSource, COPY_MAIN, blit_copy_clipped, blit_over, blit_plane, clip_rect,
+};
 use crate::scene::{BitmapState, Scene, bitmap_holds_pixels};
 
 /// Playback status of the video overlay.
@@ -836,24 +838,45 @@ impl VideoOverlay {
     }
 }
 
+/// How a decoded picture is written into a layer's MainImage.
+///
+/// The three spellings are the render methods a copy can use: `Copy` writes
+/// the source rectangle over the destination including its alpha, `CopyColor`
+/// writes the colour and keeps the destination's alpha, and the
+/// alpha-compositing copy blends the source over the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameCopy {
+    /// `Copy`: the source rectangle is written straight over the destination,
+    /// alpha included.
+    Replace,
+    /// `CopyColor`: the destination's colour becomes the source's colour and
+    /// the destination's alpha is kept.
+    KeepAlpha,
+    /// The alpha-compositing copy: the source is blended over the
+    /// destination at the given opacity.
+    Composite {
+        /// The opacity the source is blended at, `0..=255`.
+        opacity: u8,
+    },
+}
+
 /// Copy a decoded RGBA [`RgbaFrame`] into `layer_id`'s MainImage at full
 /// opacity. See [`blit_frame_to_layer_opacity`].
 pub fn blit_frame_to_layer(
     scene: &mut Scene,
     layer_id: u32,
     frame: &RgbaFrame,
-    source_over: bool,
+    copy: FrameCopy,
 ) -> bool {
-    blit_frame_to_layer_opacity(scene, layer_id, frame, source_over, 255)
+    blit_frame_to_layer_opacity(scene, layer_id, frame, copy)
 }
 
 /// Copy a decoded RGBA [`RgbaFrame`] into `layer_id`'s MainImage, clipped to
 /// the layer's clip rectangle and to the smaller of the layer and frame
 /// dimensions.
 ///
-/// `source_over` selects the alpha-compositing copy (a half-width alpha
-/// stream) over the straight replacement (an opaque stream); `opacity` is the
-/// compositing opacity applied in that path. The layer must already own a
+/// `copy` names the spelling of the copy; the composite carries the opacity
+/// it blends at. The layer must already own a
 /// MainImage; `false` is returned when
 /// it has none, the frame has no pixels, or the image does not hold the pixels
 /// its size declares. This is the shared primitive behind the movie layer copy
@@ -862,8 +885,7 @@ pub fn blit_frame_to_layer_opacity(
     scene: &mut Scene,
     layer_id: u32,
     frame: &RgbaFrame,
-    source_over: bool,
-    opacity: u8,
+    copy: FrameCopy,
 ) -> bool {
     if frame.width == 0 || frame.height == 0 {
         return false;
@@ -914,26 +936,34 @@ pub fn blit_frame_to_layer_opacity(
         );
         return false;
     }
-    if source_over {
-        blit_over(
-            dst,
-            dx,
-            dy,
-            BlitSource {
-                bitmap: &source,
-                rect: src_rect,
-            },
-            clip,
-            BlitOptions {
-                mode: 0,
-                opa: opacity,
-                treat_as_opaque: false,
-                hold_alpha: false,
-                source_over: false,
-            },
-        );
-    } else {
-        blit_copy_clipped(dst, dx, dy, &source, src_rect, clip);
+    match copy {
+        FrameCopy::Composite { opacity } => {
+            blit_over(
+                dst,
+                dx,
+                dy,
+                BlitSource {
+                    bitmap: &source,
+                    rect: src_rect,
+                },
+                clip,
+                BlitOptions {
+                    mode: 0,
+                    opa: opacity,
+                    treat_as_opaque: false,
+                    hold_alpha: false,
+                    source_over: false,
+                },
+            );
+        }
+        FrameCopy::KeepAlpha => {
+            // `CopyColor`: the destination's colour becomes the source's
+            // colour and the destination's alpha is kept.
+            blit_plane(dst, dx, dy, &source, src_rect, clip, COPY_MAIN);
+        }
+        FrameCopy::Replace => {
+            blit_copy_clipped(dst, dx, dy, &source, src_rect, clip);
+        }
     }
     true
 }
