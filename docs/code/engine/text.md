@@ -40,14 +40,15 @@ statics and no hidden caches.
 
 | value | state |
 |---|---|
-| `TextEngine` | the L1 `FontSystem`, the `cosmic-text` shaping system, the font registry, the host font database the background scan builds, the memoized shaped layouts, the memoized per-character advances and the memoized missing system families |
+| `TextEngine` | the L1 `FontSystem`, the `cosmic-text` shaping system, the font registry, the host font database the background scan builds, the memoized shaped layouts, the memoized per-character advances, the memoized missing system families and the memoized host faces that carry a character |
 | `FontRegistry` | the registered faces, the names they answer to, the registered-name order and the default face |
 | `GlyphAtlas` | the atlas texture, its CPU mirror, the shelf packer, the glyph entry map and the pending GPU uploads |
 | `TextCoverageCache` | the rasterized character masks and their blurred shadows |
 
-The five L2 memos — the shaped layouts, the per-character advances, the
-missing system families, the coverage masks and the atlas entries — share the
-bound `MAX_TEXT_CACHE_ENTRIES` (1300) and evict least-recently-used.
+The six L2 memos — the shaped layouts, the per-character advances, the
+missing system families, the host faces that carry a character, the coverage
+masks and the atlas entries — share the bound `MAX_TEXT_CACHE_ENTRIES` (1300)
+and evict least-recently-used.
 
 ---
 
@@ -59,19 +60,16 @@ bound `MAX_TEXT_CACHE_ENTRIES` (1300) and evict least-recently-used.
 impl TextEngine {
     pub fn new() -> Self;
     pub fn set_system_font_dirs(&mut self, dirs: Vec<PathBuf>);
-    pub fn set_host_faces(&mut self, default_families: Vec<String>,
-                          coverage_codepoint: char);
+    pub fn set_host_faces(&mut self, default_families: Vec<String>);
     pub fn add_font(&mut self, bytes: &[u8], index: u32) -> Result<FontId, TextError>;
     pub fn font_id(&self, family: &str) -> Option<FontId>;
     pub fn alias(&mut self, name: &str, id: FontId);
     pub fn registry(&self) -> &FontRegistry;
     pub fn default_face(&mut self) -> Option<FontId>;
-    pub fn coverage_face(&mut self) -> Option<FontId>;
     pub fn default_face_name(&mut self) -> Option<&str>;
     pub fn registered_face_names(&mut self) -> Vec<String>;
-    pub fn designate_coverage_face(&mut self, id: FontId) -> Result<(), TextError>;
     pub fn load_system_font(&mut self, family: &str) -> Result<FontId, TextError>;
-    pub fn install_coverage_face(&mut self, codepoint: char) -> Result<FontId, TextError>;
+    pub fn install_host_face(&mut self) -> Result<Option<FontId>, TextError>;
     pub fn face(&self, id: FontId) -> Option<&Font>;
     pub fn family_name(&self, id: FontId) -> Option<&str>;
     pub fn has_glyph(&self, id: FontId, codepoint: char) -> bool;
@@ -108,9 +106,6 @@ impl FontRegistry {
     pub fn list_names(&self) -> Vec<String>;
     pub fn default_name(&self) -> Option<&str>;
     pub fn default_face(&self) -> Option<FontId>;
-    pub fn designate_coverage_face(&mut self, id: FontId);
-    pub fn designated_coverage_face(&self) -> Option<FontId>;
-    pub fn coverage_face(&self) -> Option<FontId>;
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
 }
@@ -131,10 +126,8 @@ The registry is the **one** place that knows which faces exist:
   nothing, so the host's own default font is registered first: the preferred
   family when the host provides it, and one of the host's own faces when it
   provides none of them.
-* The **coverage face** is the face the host designated for the per-character
-  fallback. A registry that designated none reaches for the default face, so a
-  host whose default font carries the characters keeps one face in both
-  roles.
+* The **default face** is also the face the per-character fallback reaches
+  for when the requested face does not carry a character.
 * The **registered-name list** is newest first and leaves the oldest name
   out, so a registry that holds a single name reports an empty list. The
   reference's font list stops at the map's oldest entry for the same reason
@@ -145,12 +138,31 @@ The registry is the **one** place that knows which faces exist:
 
 ### The per-character fallback
 
-`provider_for` answers the face that draws one character: the requested face
-when it maps the character, otherwise the coverage face when it maps it, and
-otherwise `TextError::MissingGlyph` — a character no face carries has no
-glyph, and the rasterizer is told so instead of drawing another character's
-shape. `layout` records that face in every `LaidOutGlyph`, so the drawing
-path draws each character with the face that carries it.
+`provider_for` answers the face that draws one character, and it answers it
+in this order:
+
+1. **the requested face**, when it maps the character;
+2. **the default face**, when the default face maps it. The default face is
+   the engine's default font, so on a host that does not carry the game's
+   own font it is the host's font the engine installed
+   (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:182-186`);
+3. **a host face that maps this character**, found by searching the host's
+   installed faces for the character itself. The search stops at the first
+   face that carries it;
+4. **the requested face's own default character** — the glyph the face draws
+   for a character it does not map
+   (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:188-194`).
+
+The chain never raises for a character no face carries: the face's default
+character is drawn in its place and the run continues
+(`reference/cpp/core/visual/impl/GDIFontRasterizer.cpp:170,218-220`). Only a
+face that carries no glyph at all has nothing left to draw, and that is the
+one case the resolution reports as `TextError::MissingGlyph`.
+
+`layout` records the resolved face in every `LaidOutGlyph`, so the drawing
+path draws each character with the face that carries it. A resolution that
+cannot name a face is an error the caller sees: the layout propagates it
+instead of dropping it.
 
 The **measurement** and the **drawing** follow different rules on purpose:
 
@@ -181,21 +193,17 @@ query, a face registered afterwards is found by `font_id` before the memo is
 consulted, and the memo is dropped when `set_system_font_dirs` rebuilds the
 font database.
 
-`set_host_faces` selects the host's two font roles: the families the host
-prefers for its own default font, and the character the host's coverage face
-has to carry. The preferred families are a **preference**, not a requirement:
-a host that names its fonts differently still has a default face. The
-**default face is resolved on the first use of the text service**, not when
-the role is selected, so a game that asks about no font never registers a
-host face. The **coverage face is resolved when a character needs it**: it is
-the face the per-character fallback draws with, so a measurement — which asks
-a face for its metrics and never for the fallback — does not pay for it. The
-resolution is guarded by a flag that lives with the state it guards, the way
-the reference's font system keeps its initialization flag beside the font
-names it fills; the work happens on whichever thread asks first, and it
-happens once.
+`set_host_faces` selects the host's font role: the families the host
+prefers for its own default font. The preferred families are a **preference**,
+not a requirement: a host that names its fonts differently still has a
+default face. The **default face is resolved on the first use of the text
+service**, not when the role is selected, so a game that asks about no font
+never registers a host face. The resolution is guarded by a flag that lives
+with the state it guards, the way the reference's font system keeps its
+initialization flag beside the font names it fills; the work happens on
+whichever thread asks first, and it happens once.
 
-Selecting the roles also starts the **host font scan**: the host's font
+Selecting the role also starts the **host font scan**: the host's font
 directories are read on a thread of its own, so the request that needs a host
 face does not read them on the thread that asks. The scan publishes the
 database it built, and the first use takes it — waiting for the scan if it is
@@ -208,7 +216,7 @@ reads the host's whole font directory — every font file, with every face of
 every collection — and it costs hundreds of milliseconds of CPU on its own
 thread (measured on the reference host: 233 ms in a debug build at a load of
 80, 703 ms at a load of 107). The scan starts when the host selects its
-roles, so it runs while the game starts up; the first text use waits for it
+role, so it runs while the game starts up; the first text use waits for it
 only when it is still running, and the measured wait at the first text use
 was **0.7 ms** (the scan had finished 4.4 s earlier).
 
@@ -223,7 +231,7 @@ enumeration cheap needs the host's font *files* rather than its font
 the text service's current protocol does not carry.
 
 A scan reads the directories it was started with, so a new directory list
-starts a new scan. A text service whose host selected no roles has no scan:
+starts a new scan. A text service whose host selected no role has no scan:
 the request that needs a host face reads the font directories itself, on its
 own thread, and the host's own faces resolve. A scan that failed does not take
 the host's faces away: the directories are read again on the thread that
@@ -242,16 +250,27 @@ load is passed over so that the next face the host carries can serve. A host
 with no usable font at all has no default face: the absence is reported, and
 the operation that needs a face raises. The host's own faces stay reachable
 under their own names, and a preferred family the host does not provide is
-still reported as absent when it is asked for by name. The coverage face is
-designated when a character needs it, so the coverage face is a second face
-and not the default one. A registry that already holds a face keeps it.
+still reported as absent when it is asked for by name. A registry that
+already holds a face keeps it.
 
-`install_coverage_face` registers the face the per-character fallback reaches
-for: the first installed face that maps `codepoint` **and can draw it**, and
-designates it. A face the rasterizer cannot load, or that the shaping
-database cannot register, is passed over, so a host that carries one unusable
-face still gets a coverage face from the next face that carries the
-character. A registry that already designated a coverage face keeps it.
+`install_host_face` registers one of the host's own faces: the face the
+engine falls back to when the host names its fonts differently than the
+families the engine asked for. A face the rasterizer cannot load is passed
+over, so a host that carries one unusable face still gets a face from the
+next face it carries.
+
+The per-character search over the host's faces is **memoized per
+character**: the face it found for a character is remembered, so a repeated
+request for the same character does not read the host's font files again.
+The memo lives in the text engine's own state, is dropped with the font
+database it describes, and is bounded by the same entry limit as the other
+L2 memos.
+
+A host whose faces cannot be read yields no face in that search, and the
+failure is recorded: the resolution continues with the faces that are
+registered and the character is drawn with the face's default character. The
+typed error belongs to the path where a *named* family is asked for and the
+host's faces are unknown (`load_system_font`).
 
 ### The pre-rendered font's file
 
@@ -402,7 +421,10 @@ project_text(render_scene, parent, atlas, glyphs, start_z)
 | an unregistered `FontId` | `TextError::UnknownFont` |
 | a zero, negative or non-finite size | `TextError::InvalidSize` |
 | unusable font data or a missing collection index | `TextError::InvalidFont` (or `TextError::Glyph`) |
-| the host provides no face at all, and no face carries the character a draw needs | `TextError::FontNotFound` |
+| the host provides no face at all, and no face carries the character a draw needs | the face's default character is drawn in its place; the run continues |
+| the requested face carries no glyph at all | `TextError::MissingGlyph` |
+| the host's faces cannot be read, and a named family is asked for | `TextError::HostFontScan` |
+| the host's faces cannot be read, and a character is drawn | the failure is recorded, and the character is drawn with the face's default character |
 | the host's font directories cannot be read, by the scan and by the read that follows it | `TextError::HostFontScan` |
 | the atlas has no free cell | `TextError::AtlasFull` — the caller must grow or recreate the atlas; it is never worked around |
 | a coverage buffer that does not match its dimensions | `TextError::InvalidCoverage` |

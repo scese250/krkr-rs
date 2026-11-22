@@ -1,5 +1,5 @@
-//! Integration tests for the L2 font registry, the per-character fallback
-//! and the measure-versus-draw split.
+//! Integration tests for the L2 font registry, the per-character face
+//! resolution and the measure-versus-draw split.
 //!
 //! The faces are synthetic (`testkit::font_fixtures`), so the tests do not
 //! depend on the host's fonts: the narrow face carries Latin glyphs only and
@@ -7,11 +7,14 @@
 //!
 //! Reference: the font map is keyed by the family names of the enumerated
 //! faces and its oldest entry is the default font
-//! (`reference/cpp/core/visual/FontImpl.cpp:242-245`); a character the
-//! requested face does not map is drawn by the fallback face
-//! (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:165-195`); a
+//! (`reference/cpp/core/visual/FontImpl.cpp:242-245`); the rasterizer asks
+//! the requested face for a character, then the default font, and draws the
+//! face's default character when neither carries it
+//! (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:180-194`); a
 //! measurement follows the requested face
 //! (`reference/cpp/core/visual/LayerIntf.cpp:11702-11713`).
+
+use std::path::PathBuf;
 
 use engine::font::FontId;
 use engine::text::{TextEngine, TextError, TextStyle};
@@ -30,6 +33,9 @@ const NARROW_A_ADVANCE: f32 = 13.0;
 /// whole pixels.
 const WIDE_CJK_ADVANCE: f32 = 29.0;
 
+/// A character no face carries: a private-use code point.
+const UNCARRYABLE: char = '\u{10FFFD}';
+
 /// The style the measurements use.
 fn style() -> TextStyle {
     TextStyle::new(SIZE_PX)
@@ -46,88 +52,6 @@ fn engine_with_wide_default() -> (TextEngine, FontId, FontId) {
         .add_font(&narrow_face(), 0)
         .expect("register the narrow face");
     (engine, wide, narrow)
-}
-
-/// An engine with the two roles the host fills: the narrow face is the
-/// default face (it supplies the metrics of a face name that resolves to
-/// nothing) and the wide face is the coverage face (it draws a character the
-/// requested face does not carry).
-fn engine_with_two_roles() -> (TextEngine, FontId, FontId) {
-    let mut engine = TextEngine::new();
-    let narrow = engine
-        .add_font(&narrow_face(), 0)
-        .expect("register the narrow face");
-    let wide = engine
-        .add_font(&wide_face(), 0)
-        .expect("register the wide face");
-    engine
-        .designate_coverage_face(wide)
-        .expect("designate the coverage face");
-    (engine, narrow, wide)
-}
-
-/// The two roles are two faces: the default face supplies the metrics of a
-/// face name that resolves to nothing, and the coverage face draws the
-/// characters the requested face does not carry.
-///
-/// Reference: a face name that resolves to nothing takes the default font's
-/// metrics (`reference/cpp/core/visual/FontSystem.cpp:53-102`), and the
-/// rasterizer falls back to the default font for a character the requested
-/// face does not carry
-/// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:165-195`).
-#[test]
-fn the_coverage_face_draws_the_characters_the_default_face_lacks() {
-    let (mut engine, narrow, wide) = engine_with_two_roles();
-    assert_eq!(
-        engine.default_face(),
-        Some(narrow),
-        "the default face is the oldest registered entry"
-    );
-    assert_eq!(
-        engine.coverage_face(),
-        Some(wide),
-        "the coverage face is the face the host designated"
-    );
-    assert!(
-        !engine.has_glyph(narrow, WIDE_ONLY_CODEPOINT),
-        "the default face must not carry the CJK glyph"
-    );
-    assert_eq!(
-        engine
-            .provider_for(narrow, WIDE_ONLY_CODEPOINT)
-            .expect("the provider"),
-        wide,
-        "a character the requested face lacks is drawn by the coverage face"
-    );
-    assert_eq!(
-        engine.provider_for(narrow, 'A').expect("the provider"),
-        narrow,
-        "a character the requested face carries is drawn by it"
-    );
-}
-
-/// A registry that designated no coverage face reaches for the default face,
-/// so a host whose default font carries the characters keeps one face in both
-/// roles.
-///
-/// Reference: the rasterizer falls back to the default font for a character
-/// the requested face does not carry
-/// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:165-195`).
-#[test]
-fn a_registry_without_a_coverage_face_reaches_for_the_default_face() {
-    let (mut engine, wide, narrow) = engine_with_wide_default();
-    assert_eq!(
-        engine.coverage_face(),
-        Some(wide),
-        "the default face fills the coverage role"
-    );
-    assert_eq!(
-        engine
-            .provider_for(narrow, WIDE_ONLY_CODEPOINT)
-            .expect("the provider"),
-        wide,
-        "a character the requested face lacks is drawn by the default face"
-    );
 }
 
 /// The default face is the oldest registered entry: the face registered
@@ -211,13 +135,71 @@ fn a_face_resolves_under_each_of_its_names() {
     assert_eq!(engine.font_id("no-such-family"), None);
 }
 
+/// The requested face draws the characters it carries: the fallback never
+/// displaces a face the character belongs to.
+///
+/// Reference: the rasterizer asks the requested face first
+/// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:180-181`).
+#[test]
+fn the_requested_face_draws_the_characters_it_carries() {
+    let (mut engine, wide, narrow) = engine_with_wide_default();
+    assert!(
+        engine.has_glyph(narrow, 'A'),
+        "the narrow face must carry the Latin glyph"
+    );
+    assert!(
+        engine.has_glyph(wide, 'A'),
+        "the default face must carry the Latin glyph too"
+    );
+    assert_eq!(
+        engine.provider_for(narrow, 'A').expect("the provider"),
+        narrow,
+        "a character the requested face carries is drawn by it"
+    );
+    assert_eq!(
+        engine.provider_for(wide, 'A').expect("the provider"),
+        wide,
+        "the default face draws the character it carries"
+    );
+}
+
+/// The default face draws a character the requested face does not carry.
+///
+/// Reference: the rasterizer falls back to the default font for a character
+/// the requested face does not carry
+/// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:182-186`).
+#[test]
+fn the_default_face_draws_the_characters_the_requested_face_lacks() {
+    let (mut engine, wide, narrow) = engine_with_wide_default();
+    assert_eq!(
+        engine.default_face(),
+        Some(wide),
+        "the default face is the oldest registered entry"
+    );
+    assert!(
+        !engine.has_glyph(narrow, WIDE_ONLY_CODEPOINT),
+        "the requested face must not carry the CJK glyph"
+    );
+    assert!(
+        engine.has_glyph(wide, WIDE_ONLY_CODEPOINT),
+        "the default face must carry the CJK glyph"
+    );
+    assert_eq!(
+        engine
+            .provider_for(narrow, WIDE_ONLY_CODEPOINT)
+            .expect("the provider"),
+        wide,
+        "a character the requested face lacks is drawn by the default face"
+    );
+}
+
 /// The fallback is per character: a character the requested face does not map
 /// is drawn by the default face, and a character it does map is drawn by
 /// itself.
 ///
 /// Reference: the rasterizer asks the requested face first and falls back to
 /// the default face for a character the requested face does not carry
-/// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:165-195`).
+/// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:180-186`).
 #[test]
 fn the_fallback_is_per_character() {
     let (mut engine, wide, narrow) = engine_with_wide_default();
@@ -247,15 +229,61 @@ fn the_fallback_is_per_character() {
     );
 }
 
-/// A character no registered face carries has no glyph at all: the fallback
-/// reports it instead of drawing another character's shape.
+/// A character no face carries is drawn with the face's own default
+/// character: the run continues instead of raising.
+///
+/// Reference: the rasterizer draws the face's default character and then its
+/// first character when the requested face and the default font carry
+/// neither, and raises only when the face has no glyph at all
+/// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:188-194`); the
+/// Windows rasterizer draws an empty glyph and continues
+/// (`reference/cpp/core/visual/impl/GDIFontRasterizer.cpp:170,218-220`).
 #[test]
-fn a_character_no_face_carries_has_no_provider() {
+fn a_character_no_face_carries_is_drawn_with_the_substitute() {
     let (mut engine, _wide, narrow) = engine_with_wide_default();
-    assert!(matches!(
-        engine.provider_for(narrow, '\u{10FFFD}'),
-        Err(TextError::MissingGlyph { .. })
-    ));
+    assert!(
+        !engine.has_glyph(narrow, UNCARRYABLE),
+        "no face may carry the private-use character"
+    );
+    assert_eq!(
+        engine
+            .provider_for(narrow, UNCARRYABLE)
+            .expect("the substitute is not an error"),
+        narrow,
+        "the requested face draws its own default character"
+    );
+    let drawn = engine
+        .rasterize_glyph(narrow, UNCARRYABLE, &style())
+        .expect("the substitute is drawn");
+    assert!(
+        !drawn.is_empty(),
+        "the face's default character is drawn in place of the missing one"
+    );
+    assert_eq!(
+        drawn.advance, 16.0,
+        "the substitute advances like the face's default character"
+    );
+}
+
+/// A face this engine does not know has no provider: the resolution reports
+/// it instead of naming a face that cannot draw the character.
+///
+/// Reference: the rasterizer raises when the requested face has no glyph to
+/// offer (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:180-194`).
+#[test]
+fn an_unregistered_face_is_reported() {
+    let mut engine = TextEngine::new();
+    let mut other = TextEngine::new();
+    let foreign = other
+        .add_font(&narrow_face(), 0)
+        .expect("register the face in another engine");
+    let Err(error) = engine.provider_for(foreign, 'A') else {
+        panic!("an unregistered face must be reported");
+    };
+    assert!(
+        matches!(error, TextError::UnknownFont(_)),
+        "an unregistered face must be reported: {error:?}"
+    );
 }
 
 /// The measurement follows the requested face, the drawing follows the face
@@ -301,7 +329,7 @@ fn the_measurement_follows_the_requested_face_and_the_drawing_the_provider() {
 }
 
 /// A shaped run names the face that draws each of its characters, so a
-/// character the requested face lacks is drawn by the fallback face.
+/// character the requested face lacks is drawn by the default face.
 #[test]
 fn a_shaped_run_names_the_face_that_draws_each_character() {
     let (mut engine, wide, narrow) = engine_with_wide_default();
@@ -317,4 +345,89 @@ fn a_shaped_run_names_the_face_that_draws_each_character() {
         layout.glyphs[1].font, wide,
         "the fallback character names the face that draws it"
     );
+}
+
+/// A character the requested face and the default face do not carry is drawn
+/// by a host face that carries it: the host's faces are searched for the
+/// character itself.
+///
+/// Reference: the rasterizer falls back to the default font for a character
+/// the requested face does not carry
+/// (`reference/cpp/core/visual/FreeTypeFontRasterizer.cpp:182-186`); the
+/// default font is the host's own font, which the enumeration provides
+/// (`reference/cpp/core/visual/FontImpl.cpp:178-190`).
+#[test]
+fn a_host_face_carries_the_character_the_requested_face_lacks() {
+    let Some(dir) = host_font_dir() else {
+        return;
+    };
+    let mut engine = TextEngine::new();
+    engine.set_system_font_dirs(vec![dir.clone()]);
+    engine.set_host_faces(vec![NARROW_NAMES[0].to_string()]);
+    let default = engine
+        .default_face()
+        .expect("the host's default face is registered");
+    assert!(
+        !engine.has_glyph(default, WIDE_ONLY_CODEPOINT),
+        "the host's default face must not carry the CJK glyph"
+    );
+    let provider = engine
+        .provider_for(default, WIDE_ONLY_CODEPOINT)
+        .expect("the host's faces carry the character");
+    assert_ne!(
+        provider, default,
+        "the host's own face must not be asked to carry the character"
+    );
+    assert!(
+        engine.has_glyph(provider, WIDE_ONLY_CODEPOINT),
+        "the provider must carry the character"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The search over the host's faces is memoized per character: a repeated
+/// request for the same character reuses the face the search found instead of
+/// reading the host's font files again.
+#[test]
+fn the_host_face_search_is_memoized_per_character() {
+    let Some(dir) = host_font_dir() else {
+        return;
+    };
+    let mut engine = TextEngine::new();
+    engine.set_system_font_dirs(vec![dir.clone()]);
+    engine.set_host_faces(vec![NARROW_NAMES[0].to_string()]);
+    let default = engine
+        .default_face()
+        .expect("the host's default face is registered");
+    let first = engine
+        .provider_for(default, WIDE_ONLY_CODEPOINT)
+        .expect("the host's faces carry the character");
+    let registered = engine.registry().len();
+    let second = engine
+        .provider_for(default, WIDE_ONLY_CODEPOINT)
+        .expect("the host's faces carry the character");
+    assert_eq!(first, second, "the memoized face must be the one found");
+    assert_eq!(
+        engine.registry().len(),
+        registered,
+        "a repeated request must not register the face a second time"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A directory holding the synthetic faces, for the host's own font
+/// directories.
+///
+/// `None` when the directory cannot be written.
+fn host_font_dir() -> Option<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let dir =
+        std::env::temp_dir().join(format!("krkr-font-registry-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::write(dir.join("narrow.ttf"), narrow_face()).ok()?;
+    std::fs::write(dir.join("wide.ttf"), wide_face()).ok()?;
+    Some(dir)
 }

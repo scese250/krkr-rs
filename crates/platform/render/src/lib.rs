@@ -69,7 +69,7 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 pub use crate::effect::{EffectPipeline, RenderEffect};
 pub use crate::glyph::{
     Font, FontSystem, create_font_system, font_data_has_glyph, font_metrics, glyph_advance,
-    has_glyph, load_font, rasterize_glyph,
+    has_default_glyph, has_glyph, load_font, rasterize_default_glyph, rasterize_glyph,
 };
 pub use crate::null::{FrameStats, NULL_MAX_TEXTURE_DIMENSION, NullRenderPipeline};
 pub use crate::pixels::unpremultiply_rgba8;

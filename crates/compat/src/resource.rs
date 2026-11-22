@@ -25,9 +25,8 @@ use crate::engine_api::{
     StorageReadError,
 };
 use crate::engine_api::{
-    CoverageMask, DEFAULT_COVERAGE_CODEPOINT, FontId, TextCoverageCache, TextEngine, TextStyle,
-    blit_coverage_into, blur_coverage, blurred_text_coverage, compose_text_into,
-    rasterize_text_coverage,
+    CoverageMask, FontId, TextCoverageCache, TextEngine, TextStyle, blit_coverage_into,
+    blur_coverage, blurred_text_coverage, compose_text_into, rasterize_text_coverage,
 };
 use api::media::{DecodedImage, ImageInfo};
 use tjs::{Tjs2Engine, TjsValue, Value};
@@ -549,13 +548,17 @@ pub(crate) fn resolve_face(
         }
     }
     // No candidate resolved: the default face draws the text. A registry
-    // that holds no face yet gets the host's coverage face first, so a face
-    // the host provides is never lost to an empty registry.
+    // that holds no face yet gets one of the host's own faces first, so a
+    // face the host provides is never lost to an empty registry.
     match service.default_face() {
         Some(default) => Ok(default),
-        None => service
-            .install_coverage_face(DEFAULT_COVERAGE_CODEPOINT)
-            .map_err(|error| format!("no font is available for face '{face}': {error}")),
+        None => match service.install_host_face() {
+            Ok(Some(id)) => Ok(id),
+            Ok(None) => Err(format!(
+                "no font is available for face '{face}': the host provides no font"
+            )),
+            Err(error) => Err(format!("no font is available for face '{face}': {error}")),
+        },
     }
 }
 

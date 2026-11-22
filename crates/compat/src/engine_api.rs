@@ -76,9 +76,8 @@ pub(crate) use engine::font::FontId;
 
 // Text shaping, coverage rasterization, the glyph cache and font identity.
 pub(crate) use engine::text::{
-    CoverageMask, DEFAULT_COVERAGE_CODEPOINT, TextCoverageCache, TextEngine, TextError, TextStyle,
-    blit_coverage_into, blur_coverage, blurred_text_coverage, compose_text_into,
-    rasterize_text_coverage,
+    CoverageMask, TextCoverageCache, TextEngine, TextError, TextStyle, blit_coverage_into,
+    blur_coverage, blurred_text_coverage, compose_text_into, rasterize_text_coverage,
 };
 
 // The sound mixer, its stream/buffer/channel state and typed errors.

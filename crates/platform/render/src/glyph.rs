@@ -17,6 +17,10 @@
 //! [`GlyphError::MissingGlyph`] instead of substituting another character.
 //! Choosing the face that does map the character is the middle layer's job
 //! (the per-character fallback), not the rasterizer's.
+//!
+//! The face's own default glyph is the one exception: [`rasterize_default_glyph`]
+//! draws it on request, so a middle layer that resolved no face for a
+//! character can still draw the face's default shape in its place.
 
 use std::fmt;
 
@@ -211,7 +215,9 @@ fn decode_name(platform_id: ttf_parser::PlatformId, bytes: &[u8]) -> Option<Stri
 /// * Control characters produce an empty bitmap with zero advance.
 /// * A character the face does not map has no glyph: [`GlyphError::MissingGlyph`]
 ///   is returned. The face that does map the character is chosen by the
-///   middle layer (the per-character fallback), never substituted here.
+///   middle layer (the per-character fallback), never substituted here; the
+///   face's own default glyph is drawn on request, through
+///   [`rasterize_default_glyph`].
 /// * A glyph the face maps but does not outline (a space, a combining mark)
 ///   produces an empty bitmap carrying that glyph's advance.
 /// * [`GlyphStyle::bold`] applies a 1 px rightward coverage dilation and adds
@@ -249,6 +255,62 @@ pub fn rasterize_glyph(
             codepoint: glyph as u32,
         });
     }
+    Ok(rasterize_outline(font, scale, id, style))
+}
+
+/// Rasterizes the face's default glyph, the glyph the face draws for a
+/// character it does not map.
+///
+/// The default glyph is the face's own `.notdef` glyph. A face whose
+/// `.notdef` carries no outline draws an empty bitmap, so the pen stays
+/// where it was and the run continues.
+///
+/// `glyph` names the character the default glyph is drawn for; it is the
+/// character the error names when the face carries no glyph at all.
+///
+/// # Errors
+///
+/// Returns [`GlyphError::Rasterize`] for a non-positive/non-finite
+/// `size_px`, and [`GlyphError::MissingGlyph`] when the face carries no
+/// glyph at all.
+pub fn rasterize_default_glyph(
+    fs: &FontSystem,
+    font: &Font,
+    glyph: char,
+    size_px: f32,
+    style: GlyphStyle,
+) -> Result<GlyphBitmap, GlyphError> {
+    if size_px <= 0.0 || !size_px.is_finite() {
+        return Err(GlyphError::Rasterize {
+            message: format!("invalid glyph size {size_px}"),
+        });
+    }
+    if !has_default_glyph(fs, font) {
+        return Err(GlyphError::MissingGlyph {
+            codepoint: glyph as u32,
+        });
+    }
+    let scale = px_scale_for_height(font.face(), size_px);
+    Ok(rasterize_outline(font, scale, GlyphId(0), style))
+}
+
+/// Returns whether the face carries a glyph to draw for a character it does
+/// not map.
+///
+/// The face's default glyph is the one it carries; a face that carries no
+/// glyph at all cannot draw a character it does not map.
+pub fn has_default_glyph(fs: &FontSystem, font: &Font) -> bool {
+    let _ = fs;
+    font.face().glyph_count() > 0
+}
+
+/// Rasterizes the glyph `id` of `font` at `scale` into an 8-bit coverage
+/// bitmap.
+///
+/// A glyph the face carries without an outline produces an empty bitmap that
+/// keeps the glyph's advance, so the pen still moves.
+fn rasterize_outline(font: &Font, scale: PxScale, id: GlyphId, style: GlyphStyle) -> GlyphBitmap {
+    let scaled = font.face().as_scaled(scale);
     let mut advance = round_advance(scaled.h_advance(id)) as f32;
     // The bold pixel is part of the advance whatever the glyph outlines, so the
     // no-outline and empty-bitmap returns below report it too.
@@ -260,7 +322,7 @@ pub fn rasterize_glyph(
     let Some(outline) = scaled.outline_glyph(positioned) else {
         // The face maps this glyph but it has no outline; keep its advance so
         // the pen still moves.
-        return Ok(GlyphBitmap::new(0, 0, Vec::new(), 0.0, 0.0, advance));
+        return GlyphBitmap::new(0, 0, Vec::new(), 0.0, 0.0, advance);
     };
 
     let bounds = outline.px_bounds();
@@ -270,14 +332,7 @@ pub fn rasterize_glyph(
     let bearing_y = (-bounds.min.y).round();
 
     if width == 0 || height == 0 {
-        return Ok(GlyphBitmap::new(
-            0,
-            0,
-            Vec::new(),
-            bearing_x,
-            bearing_y,
-            advance,
-        ));
+        return GlyphBitmap::new(0, 0, Vec::new(), bearing_x, bearing_y, advance);
     }
 
     let w = width as usize;
@@ -303,9 +358,7 @@ pub fn rasterize_glyph(
     }
 
     debug_assert_eq!(coverage.len(), width as usize * height as usize);
-    Ok(GlyphBitmap::new(
-        width, height, coverage, bearing_x, bearing_y, advance,
-    ))
+    GlyphBitmap::new(width, height, coverage, bearing_x, bearing_y, advance)
 }
 
 /// Returns whether the face maps `glyph` to a glyph of its own.

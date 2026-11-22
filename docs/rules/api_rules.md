@@ -189,15 +189,15 @@ The text group carries the **font registry** group beside the text engine:
 `FontId` and the text engine's own operations. The registry is the one place
 that knows which faces exist, what they are called and which of them holds
 which role: the default face supplies the metrics of a face name that resolves
-to nothing, and the coverage face draws a character the requested face does
-not carry. L3 reads it through the attached text handle
-(`CompatServices::attach_text`), which carries the engine's own text service —
-the same handle every text consumer uses, so there is no second face table in
-L3. L3 asks the service for the faces it needs (`default_face`,
-`coverage_face`, `default_face_name`, `registered_face_names`) and never
-reaches into the registry itself. The registry's names are the faces' own
-family names; a name L3 resolved (a storage path, a candidate list) is an
-alias on that registry and stays out of the registered-name list.
+to nothing, and it is the face the per-character fallback reaches for when the
+requested face does not carry a character. L3 reads it through the attached
+text handle (`CompatServices::attach_text`), which carries the engine's own
+text service — the same handle every text consumer uses, so there is no second
+face table in L3. L3 asks the service for the faces it needs (`default_face`,
+`default_face_name`, `registered_face_names`) and never reaches into the
+registry itself. The registry's names are the faces' own family names; a name
+L3 resolved (a storage path, a candidate list) is an alias on that registry
+and stays out of the registered-name list.
 
 A layer's pose may live on the backend rather than in its image, so the
 pixels a script reads cross the seam as an action on the scene:

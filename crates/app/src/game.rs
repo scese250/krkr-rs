@@ -1078,16 +1078,15 @@ impl GameHost {
         // face.
         vm.compat()
             .set_system_font_dirs(platform::system_font_dirs());
-        // The host's two font roles are selected, not installed: the text
-        // service resolves them on its first use, so a game that asks about
-        // no font never scans the host's faces.
+        // The host's font role is selected, not installed: the text service
+        // resolves it on its first use, so a game that asks about no font
+        // never scans the host's faces.
         host.engine_mut().text_mut().set_host_faces(
             platform::default_font_families()
                 .iter()
                 .copied()
                 .map(str::to_string)
                 .collect(),
-            engine::text::DEFAULT_COVERAGE_CODEPOINT,
         );
         // SAFETY: `storage` is declared after `vm` in the returned struct, so
         // it outlives the compat host that holds the installed source.
@@ -2686,21 +2685,17 @@ mod tests {
         );
     }
 
-    /// The host fills the engine's two font roles with two faces: the default
-    /// face is the host's own default font and supplies the metrics of a face
-    /// name that resolves to nothing, and the coverage face carries a
-    /// Japanese ideograph and draws the characters the requested face lacks.
+    /// The host fills the engine's font role with the host's own default
+    /// font: the default face supplies the metrics of a face name that
+    /// resolves to nothing.
     ///
-    /// The roles are selected, not installed: the text service resolves them
-    /// on its first use, so the faces are there when the engine is asked for
-    /// them.
+    /// The role is selected, not installed: the text service resolves it on
+    /// its first use, so the face is there when the engine is asked for it.
     ///
-    /// A host that provides no face with a Japanese ideograph has no coverage
-    /// face to resolve, and a host that provides none of its default font
-    /// families has no default face to resolve; the test stops in either
-    /// case.
+    /// A host that provides none of its default font families has no default
+    /// face to resolve; the test stops in that case.
     #[test]
-    fn the_host_resolves_the_default_font_and_the_coverage_face() {
+    fn the_host_resolves_the_default_font() {
         let mut text = engine::text::TextEngine::new();
         text.set_host_faces(
             platform::default_font_families()
@@ -2708,14 +2703,7 @@ mod tests {
                 .copied()
                 .map(str::to_string)
                 .collect(),
-            engine::text::DEFAULT_COVERAGE_CODEPOINT,
         );
-        let coverage = text
-            .coverage_face()
-            .expect("the host resolved a coverage face");
-        if !text.has_glyph(coverage, '\u{4E00}') {
-            return;
-        }
         let default = text
             .default_face()
             .expect("the host resolved a default face");
@@ -2729,10 +2717,6 @@ mod tests {
         assert_eq!(
             default, expected,
             "the default face must be the host's own default font"
-        );
-        assert_ne!(
-            default, coverage,
-            "the metrics role and the coverage role must be two faces"
         );
     }
 }

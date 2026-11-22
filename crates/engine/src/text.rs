@@ -55,12 +55,6 @@ use cosmic_text::{Attrs, Buffer, Family, FontSystem as CosmicFontSystem, Metrics
 /// ([`GlyphAtlas`]).
 pub const MAX_TEXT_CACHE_ENTRIES: usize = 1300;
 
-/// The character the host's coverage face has to provide.
-///
-/// The coverage face draws a character the requested face does not carry, so
-/// it is the first installed face that covers a Japanese ideograph.
-pub const DEFAULT_COVERAGE_CODEPOINT: char = '\u{4E00}';
-
 /// Errors produced by text layout, atlas composition and projection.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -77,12 +71,14 @@ pub enum TextError {
         /// Human-readable description of the failure.
         message: String,
     },
-    /// No registered face provides the character, so there is no glyph to
-    /// draw and no extent to measure.
+    /// No registered face provides the character, and the requested face
+    /// carries no glyph at all, so there is no glyph to draw and no extent
+    /// to measure.
     ///
-    /// The per-character fallback reaches for the coverage face; when that
-    /// face does not provide the character either, the character cannot be
-    /// rendered at all.
+    /// The per-character fallback draws a character the requested face does
+    /// not carry with the default face, then with a host face that carries
+    /// it, and finally with the requested face's own default glyph. A face
+    /// that carries no glyph at all has nothing left to draw.
     #[error("no registered face provides the character U+{codepoint:04X}")]
     MissingGlyph {
         /// The code point no face provides.
@@ -329,11 +325,11 @@ impl CoverageMask {
 struct LayoutKey {
     /// Registered face index.
     font: FontId,
-    /// The coverage face the per-character fallback reaches for.
+    /// The number of registered faces.
     ///
-    /// The fallback decides which face draws a character, so the coverage
-    /// face is part of the shaping inputs.
-    coverage_face: Option<FontId>,
+    /// The shaper picks a face per character from the registered ones, so a
+    /// newly registered face changes the shaping inputs.
+    faces: usize,
     /// Source text.
     text: String,
     /// `size_px.to_bits()` (so the key stays `Eq`).
@@ -365,26 +361,19 @@ struct AdvanceKey {
     italic: bool,
 }
 
-/// The host's two font roles and the state of their resolution.
+/// The host's font role and the state of its resolution.
 ///
-/// The host selects the roles; the text service resolves them on its first
-/// use, so the host's faces are registered then and not when they are
-/// selected. A game that asks about no font never registers a host face.
+/// The host selects the role; the text service resolves it on its first use,
+/// so the host's faces are registered then and not when they are selected. A
+/// game that asks about no font never registers a host face.
 #[derive(Debug)]
 struct HostFaces {
     /// The families the host installs as its own default font, in the order
     /// the engine tries them. The resolution takes them, so a resolved role
     /// holds none.
     default_families: Vec<String>,
-    /// The character the host's coverage face has to carry.
-    coverage_codepoint: char,
     /// Whether the default face has been resolved.
     resolved: bool,
-    /// Whether the coverage face has been resolved.
-    ///
-    /// The coverage face is resolved when a character needs it, so it has a
-    /// guard of its own.
-    coverage_resolved: bool,
 }
 
 /// The database the host's font directories provide, and what the scan found.
@@ -403,7 +392,7 @@ struct HostFontDatabase {
 ///
 /// The scan runs on a thread of its own, so the request that needs a host
 /// face does not read the host's font directories on the thread that asks.
-/// The scan starts when the host selects its roles, so it runs while the
+/// The scan starts when the host selects its role, so it runs while the
 /// game starts up instead of inside the first font request, and it publishes
 /// its result when it has one. A request that arrives before the result
 /// waits for the scan.
@@ -471,8 +460,8 @@ pub struct TextEngine {
     render_system: FontSystem,
     /// `cosmic-text` shaping/layout system (stateless service).
     cosmic: CosmicFontSystem,
-    /// The registered faces, the names they answer to and the two roles a
-    /// face can hold.
+    /// The registered faces, the names they answer to and the role the
+    /// default face holds.
     registry: FontRegistry,
     /// The host font database used by [`TextEngine::load_system_font`], once
     /// it is built.
@@ -486,12 +475,12 @@ pub struct TextEngine {
     /// [`TextEngine::set_system_font_dirs`]. They are scanned, in addition to
     /// `fontdb`'s default locations, when the system database is first built.
     system_font_dirs: Vec<PathBuf>,
-    /// The host's two font roles, and whether they have been resolved.
+    /// The host's font role, and whether it has been resolved.
     ///
-    /// `None` when the host selected no roles: the text service then
+    /// `None` when the host selected no role: the text service then
     /// registers no host face, and every face comes from a script.
     host_faces: Option<HostFaces>,
-    /// The host font scan, when the host selected its roles.
+    /// The host font scan, when the host selected its role.
     ///
     /// The scan runs on a thread of its own and publishes the database it
     /// builds; the text service takes it when it first needs a host face.
@@ -500,7 +489,7 @@ pub struct TextEngine {
     ///
     /// The scan runs off the thread that asks for a face, so the request
     /// never reads the host's font directories itself. The id is kept as
-    /// the evidence of that. A text service whose host selected no roles has
+    /// the evidence of that. A text service whose host selected no role has
     /// no scan and reads the directories on the thread that asks.
     host_font_thread: Option<ThreadId>,
     /// The number of times the host font database was built.
@@ -519,6 +508,13 @@ pub struct TextEngine {
     /// repeated exact lookup does not scan the font database again. Bounded at
     /// [`MAX_TEXT_CACHE_ENTRIES`] with least-recently-used eviction.
     missing_system_families: LruCache<String, ()>,
+    /// The host face that carries a character, memoized per character.
+    ///
+    /// The per-character search over the host's faces reads the host's font
+    /// files, so the face it found is memoized: a repeated request for the
+    /// same character does not read them again. The memo is dropped with the
+    /// database it describes.
+    host_glyph_faces: LruCache<char, Option<FontId>>,
 }
 
 impl TextEngine {
@@ -545,23 +541,26 @@ impl TextEngine {
             layout_cache: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
             advance_cache: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
             missing_system_families: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
+            host_glyph_faces: LruCache::new(MAX_TEXT_CACHE_ENTRIES),
         }
     }
 
     /// Selects the host's system-font directories.
     ///
     /// The directories are read by the host font scan, which runs on a
-    /// thread of its own when the host selects its roles. A scan reads the
+    /// thread of its own when the host selects its role. A scan reads the
     /// directories it was started with, so a new list starts a new scan:
     /// the thread of the old scan publishes into a state nobody reads any
     /// more.
     ///
     /// The missing-family memo is dropped with the database it describes: a
     /// family the previous directories did not provide may be in the new ones.
+    /// The per-character host memo is dropped with it for the same reason.
     pub fn set_system_font_dirs(&mut self, dirs: Vec<PathBuf>) {
         self.system_font_dirs = dirs;
         self.system_fonts = None;
         self.missing_system_families.clear();
+        self.host_glyph_faces.clear();
         // A scan that is running reads the directories it was started with,
         // so the new list starts a new scan.
         if self.host_scan.is_some() {
@@ -570,27 +569,24 @@ impl TextEngine {
         }
     }
 
-    /// Selects the host's two font roles.
+    /// Selects the host's font role.
     ///
     /// `default_families` names the families the host installs as its own
     /// default font, in the order the engine tries them; the first one the
     /// host provides becomes the engine's default face, the face a face name
-    /// that resolves to nothing takes its metrics from.
-    /// `coverage_codepoint` is the character the host's coverage face has to
-    /// carry: the coverage face draws a character the requested face does
-    /// not carry.
+    /// that resolves to nothing takes its metrics from, and the face the
+    /// per-character fallback reaches for when the requested face does not
+    /// carry a character.
     ///
-    /// The roles are resolved on the first use of the text service, not here:
+    /// The role is resolved on the first use of the text service, not here:
     /// the host's faces are registered then, so a game that asks about no font
-    /// never registers a host face. Selecting the roles starts the host font
-    /// scan, so the scan runs while the game starts up. Select the roles
+    /// never registers a host face. Selecting the role starts the host font
+    /// scan, so the scan runs while the game starts up. Select the role
     /// before any face is resolved.
-    pub fn set_host_faces(&mut self, default_families: Vec<String>, coverage_codepoint: char) {
+    pub fn set_host_faces(&mut self, default_families: Vec<String>) {
         self.host_faces = Some(HostFaces {
             default_families,
-            coverage_codepoint,
             resolved: false,
-            coverage_resolved: false,
         });
         self.start_host_scan();
     }
@@ -599,7 +595,7 @@ impl TextEngine {
     ///
     /// The scan reads the host's font directories, which is the work the
     /// first face request would otherwise do on the thread that asks for it.
-    /// The scan starts when the host selects its roles, so it runs while the
+    /// The scan starts when the host selects its role, so it runs while the
     /// game starts up; the request that needs a host face waits for the scan
     /// that is already running.
     ///
@@ -647,9 +643,9 @@ impl TextEngine {
     /// never registers a host face. The guard lives with the state it
     /// guards, so the work happens on whichever thread asks first and it
     /// happens once: the text service is reached through an exclusive
-    /// borrow, so two callers cannot ask for the roles at the same time.
+    /// borrow, so two callers cannot ask for the role at the same time.
     ///
-    /// A host that selected no roles resolves nothing: every face then comes
+    /// A host that selected no role resolves nothing: every face then comes
     /// from a script.
     fn resolve_host_default_face(&mut self) {
         let Some(faces) = self.host_faces.as_mut() else {
@@ -673,38 +669,6 @@ impl TextEngine {
             None => "none",
         };
         log::info!("engine.text: the system default face is {default_name}");
-    }
-
-    /// Resolves the host's coverage face, once.
-    ///
-    /// The coverage face is the face the per-character fallback draws a
-    /// character the requested face does not carry with. It is resolved when
-    /// a character needs it and not when the text service is first touched:
-    /// a measurement asks a face for its metrics and never for the fallback,
-    /// so it does not pay for the face the fallback draws with.
-    ///
-    /// The default face is resolved first, so the host's own faces stay the
-    /// oldest ones.
-    fn resolve_host_coverage_face(&mut self) {
-        let Some(faces) = self.host_faces.as_mut() else {
-            return;
-        };
-        if faces.coverage_resolved {
-            return;
-        }
-        faces.coverage_resolved = true;
-        let coverage_codepoint = faces.coverage_codepoint;
-        if let Err(error) = self.install_coverage_face(coverage_codepoint) {
-            log::warn!("engine.text: no installed system face provides a CJK glyph: {error}");
-        }
-        // The role is named so the host log says which face fills it: a host
-        // with no coverage face draws every character its default face lacks
-        // with an error, and the log is where that shows.
-        let coverage_name = match self.registry.designated_coverage_face() {
-            Some(id) => self.family_name(id).unwrap_or("none"),
-            None => "none",
-        };
-        log::info!("engine.text: the system coverage face is {coverage_name}");
     }
 
     /// Registers a font face from `bytes` (a TTF/OTF, or a TTC/OTC with
@@ -775,12 +739,12 @@ impl TextEngine {
         self.registry.alias(name, id);
     }
 
-    /// The font registry: the registered faces, the names they answer to, the
-    /// default face and the coverage face.
+    /// The font registry: the registered faces, the names they answer to and
+    /// the default face.
     ///
-    /// The registry describes the faces the engine knows. The host's roles are
-    /// resolved through [`TextEngine::default_face`] and
-    /// [`TextEngine::coverage_face`], which resolve them first.
+    /// The registry describes the faces the engine knows. The host's role is
+    /// resolved through [`TextEngine::default_face`], which resolves it
+    /// first.
     pub fn registry(&self) -> &FontRegistry {
         &self.registry
     }
@@ -795,16 +759,6 @@ impl TextEngine {
         self.registry.default_face()
     }
 
-    /// The face the per-character fallback reaches for.
-    ///
-    /// The designated coverage face, or the default face when the host
-    /// designated none.
-    fn coverage_face_id(&self) -> Option<FontId> {
-        self.registry
-            .designated_coverage_face()
-            .or_else(|| self.default_face_id())
-    }
-
     /// The default face: the oldest registered face.
     ///
     /// The default face supplies the metrics of a face name that resolves to
@@ -813,16 +767,6 @@ impl TextEngine {
     pub fn default_face(&mut self) -> Option<FontId> {
         self.resolve_host_default_face();
         self.default_face_id()
-    }
-
-    /// The face the per-character fallback reaches for.
-    ///
-    /// The face the host designated for the role, or the default face when
-    /// the host designated none. The host's coverage face is resolved first,
-    /// so the face is the one the host's coverage face designates.
-    pub fn coverage_face(&mut self) -> Option<FontId> {
-        self.resolve_host_coverage_face();
-        self.coverage_face_id()
     }
 
     /// The name the default face is registered under.
@@ -839,28 +783,11 @@ impl TextEngine {
 
     /// The registered face names, newest first, without the oldest name.
     ///
-    /// The host's coverage face is resolved first, so the list holds the
+    /// The host's default face is resolved first, so the list holds the
     /// faces the host provides.
     pub fn registered_face_names(&mut self) -> Vec<String> {
-        self.resolve_host_coverage_face();
+        self.resolve_host_default_face();
         self.registry.list_names()
-    }
-
-    /// Designates an already registered face as the face the per-character
-    /// fallback reaches for.
-    ///
-    /// The per-character fallback draws a character the requested face does
-    /// not carry with this face.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TextError::UnknownFont`] when `id` is not registered.
-    pub fn designate_coverage_face(&mut self, id: FontId) -> Result<(), TextError> {
-        if self.registry.face(id).is_none() {
-            return Err(TextError::UnknownFont(id.index()));
-        }
-        self.registry.designate_coverage_face(id);
-        Ok(())
     }
 
     /// Resolves `family` against the host's installed fonts, registers the
@@ -918,9 +845,9 @@ impl TextEngine {
     /// The host font database, taken from the host font scan.
     ///
     /// The database is built once, by the scan the host started when it
-    /// selected its roles: the first use waits for that scan and reads the
+    /// selected its role: the first use waits for that scan and reads the
     /// database it built, and every later use reads the database the first
-    /// use took. A text service whose host selected no roles has no scan:
+    /// use took. A text service whose host selected no role has no scan:
     /// the first use reads the host's font directories itself.
     ///
     /// # Errors
@@ -961,7 +888,7 @@ impl TextEngine {
     /// waits for the scan and never reads the host's font directories
     /// itself.
     ///
-    /// A text service whose host selected no roles has no scan: the
+    /// A text service whose host selected no role has no scan: the
     /// directories are read here, on the thread that asked for a face.
     ///
     /// A scan that failed does not leave the host's faces unknown: the scan
@@ -1070,18 +997,21 @@ impl TextEngine {
     /// The face that draws `codepoint` for a request for `id`.
     ///
     /// The requested face draws the character when it maps it. Otherwise the
-    /// coverage face draws it, when the coverage face maps it. A character no
-    /// face maps has no glyph at all, and the caller is told so instead of
-    /// getting another character's shape.
+    /// default face draws it, when the default face maps it; otherwise a
+    /// host face that maps this character draws it. A character no face maps
+    /// is drawn by the requested face's own default glyph.
     ///
-    /// The coverage face is resolved when a character reaches for it: a
-    /// measurement asks a face for its metrics and never for the fallback, so
-    /// it does not pay for the face the fallback draws with.
+    /// The host's faces are searched per character, and the face the search
+    /// found is memoized, so a repeated request for the same character does
+    /// not read the host's font files again. A host whose faces cannot be
+    /// read yields no face, and the failure is recorded: the resolution
+    /// continues with the faces that are registered.
     ///
     /// # Errors
     ///
     /// Returns [`TextError::UnknownFont`] when `id` is not registered, and
-    /// [`TextError::MissingGlyph`] when no registered face maps `codepoint`.
+    /// [`TextError::MissingGlyph`] when the requested face carries no glyph
+    /// at all.
     pub fn provider_for(&mut self, id: FontId, codepoint: char) -> Result<FontId, TextError> {
         let face = self
             .registry
@@ -1090,25 +1020,33 @@ impl TextEngine {
         if render::has_glyph(&self.render_system, &face.render, codepoint) {
             return Ok(id);
         }
-        // The requested face does not carry the character: the fallback face
-        // is resolved now, because this is the first character that needs it.
-        self.resolve_host_coverage_face();
-        let Some(coverage) = self.coverage_face_id() else {
-            return Err(TextError::MissingGlyph {
-                codepoint: codepoint as u32,
-            });
-        };
-        if coverage == id {
-            return Err(TextError::MissingGlyph {
-                codepoint: codepoint as u32,
-            });
+        // The requested face does not carry the character: it can still draw
+        // its own default glyph, so the substitute is available.
+        let has_default = render::has_default_glyph(&self.render_system, &face.render);
+        // The default face is the face the fallback reaches for. It is
+        // resolved here, because this is the first character that needs it.
+        self.resolve_host_default_face();
+        if let Some(default) = self.default_face_id()
+            && default != id
+        {
+            let default_face = self
+                .registry
+                .face(default)
+                .ok_or(TextError::UnknownFont(default.index()))?;
+            if render::has_glyph(&self.render_system, &default_face.render, codepoint) {
+                return Ok(default);
+            }
         }
-        let coverage_face = self
-            .registry
-            .face(coverage)
-            .ok_or(TextError::UnknownFont(coverage.index()))?;
-        if render::has_glyph(&self.render_system, &coverage_face.render, codepoint) {
-            return Ok(coverage);
+        // Then a host face that carries this character.
+        if let Some(host) = self.host_face_for(codepoint)
+            && host != id
+        {
+            return Ok(host);
+        }
+        // Nothing carries the character: the requested face draws its own
+        // default glyph in its place.
+        if has_default {
+            return Ok(id);
         }
         Err(TextError::MissingGlyph {
             codepoint: codepoint as u32,
@@ -1196,7 +1134,7 @@ impl TextEngine {
     ///
     /// The default face is the oldest registered face, so it is the face a
     /// face name that resolves to nothing takes its metrics from. The host's
-    /// roles are resolved before any script face is registered, so the host's
+    /// role is resolved before any script face is registered, so the host's
     /// own default font is the default face; a registry that already holds a
     /// face keeps it.
     ///
@@ -1240,21 +1178,22 @@ impl TextEngine {
         }
     }
 
-    /// Registers one of the host's own faces, as the engine's default face.
+    /// Registers one of the host's own faces.
     ///
     /// The host's preferred families are a preference; the host's own faces
     /// are the fallback. A host whose fonts are named differently than the
-    /// families the engine asked for therefore still has a default face.
+    /// families the engine asked for therefore still has a face to draw
+    /// with.
     ///
     /// A face the rasterizer cannot load is passed over, so a host that
-    /// carries one unusable face still gets a default face from the next face
-    /// it carries.
+    /// carries one unusable face still gets a face from the next face it
+    /// carries.
     ///
     /// # Errors
     ///
     /// Returns [`TextError::HostFontScan`] when the host's font directories
     /// could not be read.
-    fn install_host_face(&mut self) -> Result<Option<FontId>, TextError> {
+    pub fn install_host_face(&mut self) -> Result<Option<FontId>, TextError> {
         let scanned = self.system_database()?;
         let system = &scanned.database;
         for face in system.faces() {
@@ -1273,41 +1212,48 @@ impl TextEngine {
         Ok(None)
     }
 
-    /// Registers the face the per-character fallback reaches for: the first
-    /// installed face that maps `codepoint` and can draw it.
+    /// The host face that carries `codepoint`, if the host has one.
     ///
-    /// The per-character fallback draws a character the requested face does
-    /// not carry with this face. A registry that already designated a
-    /// coverage face keeps it.
+    /// The search walks the host's installed faces and stops at the first one
+    /// that carries the character. A host whose faces cannot be read, and a
+    /// face that cannot be loaded or registered, are recorded and the search
+    /// yields no face: the resolution continues with the faces that are
+    /// registered.
+    ///
+    /// The face the search found is memoized per character, so a repeated
+    /// request for the character does not read the host's font files again.
+    /// The memo is dropped with the database it describes.
+    fn host_face_for(&mut self, codepoint: char) -> Option<FontId> {
+        if let Some(cached) = self.host_glyph_faces.get(&codepoint) {
+            return *cached;
+        }
+        let found = self.search_host_face(codepoint);
+        self.host_glyph_faces.insert(codepoint, found);
+        found
+    }
+
+    /// Registers the first host face that carries `codepoint`.
+    ///
+    /// The search stops at the first face that carries the character: a host
+    /// with many faces does not read them all.
     ///
     /// A face the scan finds is not taken on its word: the face the
     /// rasterizer loaded must map the character too, and the face must
     /// register. A face that fails either test is passed over, so a host
-    /// that carries one unusable face still gets a coverage face from the
-    /// next face that carries the character.
+    /// that carries one unusable face still gets a face from the next face
+    /// that carries the character.
     ///
-    /// The host's default face is resolved first, so the host's own coverage
-    /// face is the one this returns.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TextError::FontNotFound`] when no installed system face
-    /// provides `codepoint`, [`TextError::HostFontScan`] when the host's
-    /// font directories could not be read, and the failure of the last face
-    /// that carried the character but could not be used.
-    pub fn install_coverage_face(&mut self, codepoint: char) -> Result<FontId, TextError> {
-        self.resolve_host_default_face();
-        if let Some(coverage) = self.registry.designated_coverage_face() {
-            return Ok(coverage);
-        }
-        let mut failure: Option<TextError> = None;
+    /// A host whose faces cannot be read, and a face that cannot be loaded or
+    /// registered, are recorded: the search yields no face and the
+    /// resolution continues with the faces that are registered.
+    fn search_host_face(&mut self, codepoint: char) -> Option<FontId> {
         let mut seen = 0usize;
-        while let Some((bytes, index)) = self.next_face_with_glyph(codepoint, seen)? {
+        while let Some((bytes, index)) = self.next_face_with_glyph(codepoint, seen) {
             seen += 1;
             let face = match render::load_font(&self.render_system, &bytes, index) {
                 Ok(face) => face,
                 Err(error) => {
-                    failure = Some(TextError::from(error));
+                    log::warn!("engine.text: the host's face cannot be loaded: {error}");
                     continue;
                 }
             };
@@ -1315,19 +1261,13 @@ impl TextEngine {
                 continue;
             }
             match self.register_face(&bytes, index, face) {
-                Ok(id) => {
-                    self.registry.designate_coverage_face(id);
-                    return Ok(id);
+                Ok(id) => return Some(id),
+                Err(error) => {
+                    log::warn!("engine.text: the host's face cannot be registered: {error}");
                 }
-                Err(error) => failure = Some(error),
             }
         }
-        match failure {
-            Some(error) => Err(error),
-            None => Err(TextError::FontNotFound {
-                family: codepoint.to_string(),
-            }),
-        }
+        None
     }
 
     /// Reads the bytes and collection index of the installed system face that
@@ -1336,19 +1276,19 @@ impl TextEngine {
     /// The scan reads one font file at a time and stops at the face the
     /// caller asked for, so a host with many faces does not read them all.
     ///
-    /// # Errors
-    ///
-    /// Returns [`TextError::HostFontScan`] when the host's font directories
-    /// could not be read.
-    fn next_face_with_glyph(
-        &mut self,
-        codepoint: char,
-        seen: usize,
-    ) -> Result<Option<(Vec<u8>, u32)>, TextError> {
+    /// A host whose faces cannot be read yields no face, and the failure is
+    /// recorded: the caller continues with the faces that are registered.
+    fn next_face_with_glyph(&mut self, codepoint: char, seen: usize) -> Option<(Vec<u8>, u32)> {
         // The rasterizer service is copied out of the engine so the scan does
         // not borrow the engine while the font database is borrowed.
         let render_system = self.render_system;
-        let scanned = self.system_database()?;
+        let scanned = match self.system_database() {
+            Ok(scanned) => scanned,
+            Err(error) => {
+                log::warn!("engine.text: the host's faces cannot be read: {error}");
+                return None;
+            }
+        };
         let system = &scanned.database;
         let mut matched = 0usize;
         for face in system.faces() {
@@ -1363,9 +1303,9 @@ impl TextEngine {
                 matched += 1;
                 continue;
             }
-            return Ok(Some(found));
+            return Some(found);
         }
-        Ok(None)
+        None
     }
 
     /// Returns the L1 metrics of `id` at `size_px`.
@@ -1405,16 +1345,10 @@ impl TextEngine {
     ) -> Result<TextLayout, TextError> {
         validate_size(style.size_px)?;
 
-        // The shaper picks the face for a character the requested face does
-        // not carry, so the fallback face has to be in the shaping database
-        // before the run is shaped. The fallback is resolved here, where the
-        // run is shaped, and not when the text service is first touched.
-        self.resolve_host_coverage_face();
-
         let wrap = wrap_width.filter(|w| w.is_finite() && *w > 0.0);
         let key = LayoutKey {
             font,
-            coverage_face: self.coverage_face_id(),
+            faces: self.registry.len(),
             text: text.to_owned(),
             size_bits: style.size_px.to_bits(),
             bold: style.bold,
@@ -1496,11 +1430,10 @@ impl TextEngine {
 
         // The fallback is per character: a character the requested face does
         // not map is drawn by the face that does map it, so every glyph names
-        // the face it is drawn with.
+        // the face it is drawn with. A face the resolution cannot name is an
+        // error the caller sees, never a silently dropped one.
         for glyph in &mut layout.glyphs {
-            if let Ok(provider) = self.provider_for(font, glyph.codepoint) {
-                glyph.font = provider;
-            }
+            glyph.font = self.provider_for(font, glyph.codepoint)?;
         }
 
         self.layout_cache.insert(key, layout.clone());
@@ -1516,6 +1449,9 @@ impl TextEngine {
 
     /// Rasterizes one glyph of `font` for `style`, returning its 8-bit
     /// coverage and pen bearings.
+    ///
+    /// A character the face does not carry is drawn with the face's own
+    /// default glyph, so a run continues where the face has nothing to draw.
     ///
     /// This is the CPU half of the text pipeline without the atlas: it exists
     /// for consumers that composite glyph coverage directly into a bitmap
@@ -1537,6 +1473,15 @@ impl TextEngine {
             .registry
             .face(font)
             .ok_or(TextError::UnknownFont(font.index()))?;
+        if !render::has_glyph(&self.render_system, &face.render, codepoint) {
+            return Ok(render::rasterize_default_glyph(
+                &self.render_system,
+                &face.render,
+                codepoint,
+                style.size_px,
+                style.glyph_style(),
+            )?);
+        }
         Ok(render::rasterize_glyph(
             &self.render_system,
             &face.render,
@@ -3293,12 +3238,12 @@ mod tests {
     }
 
     /// The host's default face is resolved on the first use of the text
-    /// service, not when the host selects its roles: a game that asks about no
+    /// service, not when the host selects its role: a game that asks about no
     /// font never registers a host face. The coverage face is resolved when a
     /// character needs it, so a measurement does not register it.
     ///
     /// The scan that reads the host's font directories starts when the host
-    /// selects its roles, but the database it builds is taken on the first
+    /// selects its role, but the database it builds is taken on the first
     /// use.
     ///
     /// Reference: `FontSystem::FontExists` calls `InitFontNames`, which
@@ -3312,16 +3257,16 @@ mod tests {
         };
         let mut engine = TextEngine::new();
         engine.set_system_font_dirs(vec![dir.clone()]);
-        engine.set_host_faces(vec![family.clone()], 'A');
+        engine.set_host_faces(vec![family.clone()]);
         assert_eq!(
             engine.system_database_builds(),
             0,
-            "selecting the roles must not take the host's faces"
+            "selecting the role must not take the host's faces"
         );
         assert_eq!(
             engine.registry().len(),
             0,
-            "selecting the roles must not register a face"
+            "selecting the role must not register a face"
         );
 
         // The first use resolves the default face and scans the host's faces
@@ -3337,7 +3282,7 @@ mod tests {
             1,
             "the default face is the only face the first use registers"
         );
-        let coverage = engine.coverage_face().expect("the host's coverage face");
+        let default_again = engine.default_face().expect("the host's default face");
         assert_eq!(
             engine.system_database_builds(),
             1,
@@ -3345,12 +3290,12 @@ mod tests {
         );
         assert_eq!(
             engine.registry().len(),
-            2,
-            "the two roles are two registered faces"
+            1,
+            "the default face is the only face the host's role registers"
         );
-        assert_ne!(
-            default, coverage,
-            "the metrics role and the coverage role must be two faces"
+        assert_eq!(
+            default, default_again,
+            "the default face must be the one the first use registered"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3359,7 +3304,7 @@ mod tests {
     /// needs a host face does not read the host's font directories on the
     /// thread that asks.
     ///
-    /// The scan starts when the host selects its roles and publishes the
+    /// The scan starts when the host selects its role and publishes the
     /// database it built; the request takes that database and waits for the
     /// scan that is already running.
     #[test]
@@ -3369,7 +3314,7 @@ mod tests {
         };
         let mut engine = TextEngine::new();
         engine.set_system_font_dirs(vec![dir.clone()]);
-        engine.set_host_faces(vec![family.clone()], 'A');
+        engine.set_host_faces(vec![family.clone()]);
         let default = engine.default_face().expect("the host's default face");
         assert!(
             engine.registry().face(default).is_some(),
@@ -3400,7 +3345,7 @@ mod tests {
         let mut engine = TextEngine::new();
         engine.set_system_font_dirs(vec![dir.clone()]);
         // The host's fonts are named something the engine did not ask for.
-        engine.set_host_faces(vec!["a-family-the-host-does-not-have".to_owned()], 'A');
+        engine.set_host_faces(vec!["a-family-the-host-does-not-have".to_owned()]);
         let default = engine
             .default_face()
             .expect("the host's own face is the default face");
@@ -3442,7 +3387,7 @@ mod tests {
         }
         let mut engine = TextEngine::new();
         engine.set_system_font_dirs(vec![dir.clone()]);
-        engine.set_host_faces(vec![family.clone()], 'A');
+        engine.set_host_faces(vec![family.clone()]);
         let default = engine.default_face().expect("the host's default face");
         assert_eq!(
             engine.family_name(default),
@@ -3467,7 +3412,7 @@ mod tests {
         };
         let mut engine = TextEngine::new();
         engine.set_system_font_dirs(vec![dir.clone()]);
-        engine.set_host_faces(vec![family.clone()], 'A');
+        engine.set_host_faces(vec![family.clone()]);
         // The scan publishes its result, and the state is then marked as
         // failed: that is what a failed scan leaves behind.
         let scan = engine.host_scan.as_ref().expect("the scan is running");
@@ -3486,7 +3431,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A text service whose host selected no roles still reads the host's
+    /// A text service whose host selected no role still reads the host's
     /// own fonts: the request that needs a host face reads the font
     /// directories on its own thread, and the families the host provides
     /// resolve.
@@ -3541,7 +3486,7 @@ mod tests {
         };
         let mut engine = TextEngine::new();
         engine.set_system_font_dirs(vec![dir.clone()]);
-        engine.set_host_faces(vec![family.clone()], 'A');
+        engine.set_host_faces(vec![family.clone()]);
         let default = engine.default_face().expect("the host's default face");
         assert!(
             engine.registry().face(default).is_some(),
@@ -3568,16 +3513,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The lazily resolved roles are the faces the eager installation
-    /// produced: the same default face and the same coverage face.
+    /// The lazily resolved role is the face the eager installation produced:
+    /// the same default face.
     ///
     /// Reference: the reference's font system fills its font map in the same
     /// order whether the enumeration is reached through the first
     /// `FontExists` or through a later one
     /// (`reference/cpp/core/visual/FontSystem.cpp:14-25,31-37`), so the faces
-    /// the roles name do not depend on when the enumeration happened.
+    /// the role names do not depend on when the enumeration happened.
     #[test]
-    fn the_resolved_roles_are_the_eagerly_installed_faces() {
+    fn the_resolved_role_is_the_eagerly_installed_face() {
         let Some((dir, family)) = explicit_font_dir_fixture() else {
             return;
         };
@@ -3586,32 +3531,20 @@ mod tests {
         let mut eager = TextEngine::new();
         eager.set_system_font_dirs(vec![dir.clone()]);
         let eager_default = eager.install_default_face(&families).ok();
-        let eager_coverage = eager.install_coverage_face('A').ok();
 
         let mut lazy = TextEngine::new();
         lazy.set_system_font_dirs(vec![dir.clone()]);
-        lazy.set_host_faces(families.clone(), 'A');
+        lazy.set_host_faces(families.clone());
         let lazy_default = lazy.default_face();
-        let lazy_coverage = lazy.coverage_face();
 
         assert_eq!(
             lazy_default, eager_default,
             "the default face must be the one the eager installation produced"
         );
-        assert_eq!(
-            lazy.registry().designated_coverage_face(),
-            eager.registry().designated_coverage_face(),
-            "the coverage face must be the one the eager installation produced"
-        );
-        assert_eq!(
-            lazy_coverage.is_some(),
-            eager_coverage.is_some(),
-            "both engines must fill the coverage role"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The host's roles are resolved before a script face is registered, so
+    /// The host's role is resolved before a script face is registered, so
     /// the host's own default font stays the oldest face and therefore the
     /// default face.
     ///
@@ -3620,7 +3553,7 @@ mod tests {
     /// filled by the enumeration before any script registers a name in it
     /// (`reference/cpp/core/visual/FontImpl.cpp:178-244`).
     #[test]
-    fn the_host_roles_are_resolved_before_a_script_face_is_registered() {
+    fn the_host_role_is_resolved_before_a_script_face_is_registered() {
         let Some((dir, family)) = explicit_font_dir_fixture() else {
             return;
         };
@@ -3629,7 +3562,7 @@ mod tests {
         };
         let mut engine = TextEngine::new();
         engine.set_system_font_dirs(vec![dir.clone()]);
-        engine.set_host_faces(vec![family.clone()], 'A');
+        engine.set_host_faces(vec![family.clone()]);
         let script = engine
             .add_font(&bytes, 0)
             .expect("register the script face");
@@ -4345,13 +4278,13 @@ mod tests {
         let Ok(font) = engine.add_font(&bytes, 0) else {
             return;
         };
-        let coverage_face = engine.coverage_face();
+        let faces = engine.registry().len();
         let style = TextStyle::new(16.0);
         let wrap: Option<f32> = None;
 
         let key_for = |text: &str| LayoutKey {
             font,
-            coverage_face,
+            faces,
             text: text.to_owned(),
             size_bits: style.size_px.to_bits(),
             bold: style.bold,
