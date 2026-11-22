@@ -95,71 +95,49 @@ residuals:
      save was refused. The port now creates those folders; the residual
      question is the `G//G/` spelling in the original log, which this title
      does not produce.
-4. **The title screen's motion paid two full-canvas operations every
-   frame - but neither of them is established as the device's slow frame.**
-   A device run of the game "LimeLight Lemonade Jam" showed slow frames of
-   262-567 ms with `host.sync_upload` up to 318 ms, and another title of the
-   same engine family showed the same signature. Two per-frame items in the
-   motion's pose path are real and are landed:
-   * the pose cleared the target layer's **image** on the CPU, which dirtied
-     the canvas and put 1920x1080x4 bytes into every frame's upload - while
-     the pose itself is drawn on the GPU and never travels back to the host.
-     The clear now rides with the pose onto the pose surface, the port's
-     counterpart of the reference's own render target
-     (`reference/cpp/plugins/motionplayer/D3DAdaptor.cpp:135-152`);
-   * a node whose paint box was trimmed by its shape's viewport was rendered
-     into a fresh offscreen bitmap every frame - an allocation, a CPU
-     rasterization, a GPU upload and a destroy - because the draw list could
-     not express a clip. The clip is now a rectangle of the draw list, and
-     the node's pixels are the icon's texture, which the device holds
-     already.
-   **Neither is established as the cause, and one of them is not this
-   game's path.** The game links the plugin with `-nod3dm`
-   (`system/motion.tjs` in the game's data), so it plays the non-D3D route,
-   where the motion player does not clear at all: the clear change lands on
-   the D3D route and this game never takes it. The clip change is on the
-   game's path (a node whose paint box is trimmed by its shape's viewport is
-   common in these files), but the per-frame cost of that path was never
-   measured - the pose's own cost on this game's own `motion/yuzulogo.mtn`
-   and `motion/title_bg.mtn` is still unmeasured, because a headless run
-   cannot reach the title (the game waits for a click on its warning screen)
-   and no virtual display is available on this host. So the honest state is:
-   the clip offscreen was a real per-frame allocation, rasterization, upload
-   and destroy, and it is gone; the clear was a real full-canvas upload on
-   the D3D route, and it is gone; **neither has been shown to be the device's
-   slow frame**, and the device run that would settle it is owed.
-   **What the game's own code points at instead.** The title's per-frame path
-   is `system/affinesourcemotion.tjs`: `progress`, `draw`/`drawAffine`,
-   `clearEnabled`, `_redrawList`, `fillRect`, `updateImage`, `_redrawImage`,
-   `assignImages`. Three per-frame costs follow from it, and each is a
-   candidate the port pays and the reference does not:
-   * `fillRect` on the full-screen target layer dirties the layer's image,
-     and the port's layer images live on the CPU, so the whole canvas goes
-     to the GPU again. The reference can keep a layer's image as a device
-     bitmap, where a fill is a GPU fill
-     (`reference/cpp/core/visual/LayerIntf.cpp`, the D3D bitmap path).
-   * `assignImages` reads the motion's layer back through the read-back seam
-     (`crates/engine/src/scene.rs`, `sync_pose_pixels`) and copies it: a
-     full-canvas GPU-to-CPU round trip plus a full-canvas copy, every
-     frame.
-   * the title also plays a movie (`sysscn/title.ks`, the `title.movie`
-     hook), and the movie's picture is copied into the layer every frame
-     instead of being assigned as its image - the divergence section 7
-     already records.
-   Plus the 250 `onFrameUpdate` exceptions per two seconds below, each of
-   which costs a log write.
-   * **The engine uploads a dirty bitmap a layer holds, whether or not the
-     layer is drawn** (`crates/engine/src/engine.rs`, `sync_dirty_bitmaps`): a
-     bitmap no layer holds is skipped, but a bitmap a hidden layer holds is
-     sent to the GPU in full. The reference's renderer uploads the layers it
-     draws.
-   * **The port keeps the pose and the layer's image apart; the reference
-     keeps one picture.** The reference's ordinary route composites the pose
-     into the layer's bitmap, so the layer carries one image and the game
-     clearing it costs nothing extra. The port draws the pose on its own
-     surface and leaves the layer's image alone, so the game's per-frame
-     `fillRect` dirties an image that is uploaded and then covered by the
-     pose: a full-canvas upload the reference does not pay.
+4. **The title screen's slow frames are the movie layer's CPU composite, not
+   the PSB motion.** Measured from the host's own slow-frame report of the
+   game "LimeLight Lemonade Jam": 185 slow frames of 34.8-189.1 ms, p50 54
+   ms. The breakdown:
+   * `phases.frame_tail` dominates 173 of the 185 frames (8.2 s in total,
+     64.8 ms at worst). The frame tail's first step is the movie poll
+     (`crates/app/src/game.rs`, `frame_tail` -> `compat::movie_poll`), and the
+     poll's per-frame copy is `copy_frame` -> `blit_frame_to_layer`
+     (`crates/compat/src/natives/plugins/layer_ex/movie.rs`): the decoded
+     picture is alpha-composited into the layer's bitmap on the CPU, 1436x790
+     pixels, about 40 ms a frame.
+   * `host.sync_upload` is the other cost (3 frames, 77.4 ms at worst): the
+     composited bitmap is dirty, so the whole canvas goes to the GPU.
+   * `phases.async` reaches 156 ms on the two frames that carry pool jobs,
+     and the pool is idle on 160 of the 185 frames: the PSB motion's chunks
+     are decoded once, not per frame. The motion is not this cost.
+   **The reference does that copy on the device.** `layerExMovie::onUpdate`
+   (`reference/cpp/plugins/layerExMovie.cpp:246-273`) takes the video
+   overlay's front buffer and the layer's main image as *textures* and calls
+   `OperateRect` with the "Copy" or "CopyColor" render method: a GPU-to-GPU
+   copy, with no CPU composite and no upload. The port's divergence is that
+   the layer's picture is a host-side buffer, so the same copy becomes a CPU
+   composite plus a full-canvas upload.
+   **Landed:** the movie layer now copies the picture the way the reference
+   does - with the "Copy" render method, or with "CopyColor" when the
+   movie's alpha is on (the destination's colour becomes the source's colour
+   and the destination's alpha is kept). The port had alpha-composited the
+   picture into the layer's bitmap, which was both a different result and the
+   40 ms a frame; the engine's `COPY_MAIN` is the same copy the reference's
+   render method performs, so the copy is now a copy.
+   **Not landed, and it is the larger half:** the picture is still a host-side
+   buffer, so the copy still ends in an upload of the whole canvas (the 77
+   ms). Closing that means the layer's picture becoming a device-side picture
+   the way the motion player's pose already is: the decoded frame becomes a
+   draw source and the layer draws it, instead of being composited into a
+   host buffer. The engine already has both seams - the draw sources and the
+   pose surface - and the layer's picture would then need the read-back seam
+   for the script that reads its pixels.
+   The earlier hypothesis is wrong for this game, and the reason is in the
+   game's own code: it links the plugin with `-nod3dm`
+   (`system/motion.tjs` in the game's data), so it plays the route where the
+   motion player does not clear at all, and the per-frame clip offscreen is
+   gone.
 5. **The title's movie raises in the game's own `onFrameUpdate` handler.**
    The same device run logged 250 `onFrameUpdate` exceptions in about two
    seconds on the title screen. The port's video event dispatch is not the
@@ -923,6 +901,28 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
   no coverage.
 
 ## 10. Native plugins
+
+* **The area-average port is written and held: three of its eighteen tests
+  fail.** The specification is at
+  `/tmp/pi-patches/spec-layerExAreaAverage/spec.md` (655 lines, no upstream
+  code) and the port is at `/tmp/pi-patches/hold/area-average/` (the module
+  and its test file). It is not wired into the plugin table, so nothing in
+  the tree depends on it. The three failures:
+  * the copy writes nothing: the destination stays transparent where the
+    source's green column should be. The kernel's own model
+    (`check_examples.py`) reproduces the specification's six worked
+    examples, so the fault is in the wiring between the member and the
+    kernel, not in the kernel.
+  * `Plugins.getList()` does not name the linked module. The port's
+    `getList` reports the script's original casing
+    (`crates/compat/src/plugins_native.rs`, `native_get_list`), and the
+    member does appear after the link, so either the registry does not
+    record a script-side link or the test's helper does not take that path.
+    Not established which.
+  * the dictionary literal at the first argument position (`%[]`) is a
+    syntax error there, while the same literal in a later position parses.
+    The port's parser and the upstream's argument order are the things to
+    compare.
 
 * **`Plugins.link` answers the outcome instead of `void`.** The reference's
   `Plugins.link` calls `TVPLoadPlugin(name)` and returns without setting a
