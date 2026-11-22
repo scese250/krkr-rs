@@ -38,10 +38,9 @@ enum class SaveResult { SAVED, UNCHANGED, FAILED }
  *
  * This is deliberately a plain file rather than `SharedPreferences`: it is
  * inspectable, portable, user-editable, and consistent with the rest of the
- * project, which stores configuration as JSON (`crates/tvp-config` deliberately
- * replaced the reference engine's XML preference files with JSON). The library
- * is the one piece of user state the launcher owns — losing it would mean
- * re-picking every game folder, which is exactly what it exists to prevent.
+ * project, which stores configuration as JSON. The library is the one piece
+ * of user state the launcher owns — losing it would mean re-picking every
+ * game folder, which is exactly what it exists to prevent.
  *
  * File: `<app files dir>/games.json`
  *

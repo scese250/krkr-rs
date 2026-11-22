@@ -19,6 +19,7 @@ data class RuntimeSettings(
     val frameRate: String,
     val preloadArchives: String,
     val debugOverlay: String,
+    val nativeResolution: String,
     val logLevel: String,
 )
 
@@ -27,9 +28,12 @@ data class RuntimeSettings(
  *
  * These mirror `api::config::FrameRateLimit` and the boolean
  * `preload_archives` and `debug_overlay` options: every default and
- * accepted value comes from there. Only options the engine can actually honour
- * are listed — there is no control for texture resolution or audio buffering,
- * because the engine exposes no knob for either.
+ * accepted value comes from there. The native-resolution choice is not one
+ * of the shared runtime options — it selects the sampler's filter, and it
+ * is the launcher's own — so its default and accepted values are stated
+ * here. Only options the engine can actually honour are listed — there is
+ * no control for texture resolution or audio buffering, because the engine
+ * exposes no knob for either.
  *
  * [LOG_LEVELS] mirrors the engine's `pendingLogLevel` field: one of `off`,
  * `error`, `warn`, `info`, `debug`, `trace`, with `info` when unset or empty.
@@ -59,11 +63,23 @@ object RuntimeOptions {
     /** The built-in debug-overlay default; mirrors `RuntimeConfig`. */
     const val DEFAULT_DEBUG_OVERLAY = "false"
 
+    /** The two accepted native-resolution values, as stored in the file. */
+    val NATIVE_RESOLUTION_VALUES = listOf("true", "false")
+
+    /**
+     * The built-in native-resolution default.
+     *
+     * Off draws the picture the way the plain rendering draws it; on reads
+     * every texture with a bilinear filter instead.
+     */
+    const val DEFAULT_NATIVE_RESOLUTION = "false"
+
     /** The stored defaults, used when the settings file is missing or empty. */
     val DEFAULTS = RuntimeSettings(
         frameRate = DEFAULT_FRAME_RATE.toString(),
         preloadArchives = DEFAULT_PRELOAD_ARCHIVES,
         debugOverlay = DEFAULT_DEBUG_OVERLAY,
+        nativeResolution = DEFAULT_NATIVE_RESOLUTION,
         logLevel = DEFAULT_LOG_LEVEL,
     )
 
@@ -94,6 +110,21 @@ object RuntimeOptions {
     fun debugOverlayDescription(): String =
         "Default: ${if (DEFAULT_DEBUG_OVERLAY == "true") "on" else "off"}. " +
             "Draw the frame rate and resident memory in the top-left corner."
+
+    /**
+     * A sentence naming the default and what the switch changes, shown under it.
+     *
+     * The rendering is experimental, and the sentence says so: the switch is a
+     * picture the user may not keep, not a settled option. It also says what
+     * the switch does not touch — the size the game sees and everything it
+     * reads stay the same — so the choice is not read as a scaling mode.
+     */
+    fun nativeResolutionDescription(): String =
+        "Default: ${if (DEFAULT_NATIVE_RESOLUTION == "true") "on" else "off"}. " +
+            "Draw the picture with a bilinear filter instead of point-sampling it, so a " +
+            "picture enlarged to the screen looks smoother. The rendering is experimental and " +
+            "may still change. Only the picture changes: the size the game sees and " +
+            "everything it reads stay the same."
 
     /** The accepted log levels, from least to most records; mirrors `pendingLogLevel`. */
     val LOG_LEVELS = listOf("off", "error", "warn", "info", "debug", "trace")
@@ -138,6 +169,11 @@ internal fun settingsFromJson(root: JSONObject): RuntimeSettings = RuntimeSettin
         RuntimeOptions.DEFAULTS.preloadArchives,
     ),
     debugOverlay = stringField(root, FIELD_DEBUG_OVERLAY, RuntimeOptions.DEFAULTS.debugOverlay),
+    nativeResolution = stringField(
+        root,
+        FIELD_NATIVE_RESOLUTION,
+        RuntimeOptions.DEFAULTS.nativeResolution,
+    ),
     logLevel = stringField(root, FIELD_LOG_LEVEL, RuntimeOptions.DEFAULTS.logLevel),
 )
 
@@ -147,6 +183,7 @@ internal fun settingsToJson(settings: RuntimeSettings): JSONObject = JSONObject(
     .put(FIELD_FRAME_RATE, settings.frameRate)
     .put(FIELD_PRELOAD_ARCHIVES, settings.preloadArchives)
     .put(FIELD_DEBUG_OVERLAY, settings.debugOverlay)
+    .put(FIELD_NATIVE_RESOLUTION, settings.nativeResolution)
     .put(FIELD_LOG_LEVEL, settings.logLevel)
 
 /**
@@ -167,6 +204,7 @@ private const val FIELD_VERSION = "version"
 private const val FIELD_FRAME_RATE = "frame_rate"
 private const val FIELD_PRELOAD_ARCHIVES = "preload_archives"
 private const val FIELD_DEBUG_OVERLAY = "debug_overlay"
+private const val FIELD_NATIVE_RESOLUTION = "native_resolution"
 private const val FIELD_LOG_LEVEL = "log_level"
 
 /**
@@ -186,7 +224,8 @@ private const val FIELD_LOG_LEVEL = "log_level"
  *
  * ```json
  * { "version": 1, "frame_rate": "60",
- *   "preload_archives": "false", "debug_overlay": "false", "log_level": "info" }
+ *   "preload_archives": "false", "debug_overlay": "false",
+ *   "native_resolution": "false", "log_level": "info" }
  * ```
  */
 class RuntimeSettingsStore(context: Context) {

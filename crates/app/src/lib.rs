@@ -291,6 +291,24 @@ impl HostConfig {
     }
 }
 
+/// The rendering policy a launcher's native-resolution choice asks for.
+///
+/// The choice is a boolean: on, the device reads every texture with a
+/// bilinear filter and a magnified picture is smooth; off, it point-samples
+/// them the way the software renderer does. Every launcher turns the choice
+/// into the policy here, so the same choice means the same rendering
+/// everywhere.
+///
+/// The policy is a rendering choice and not a script-visible one: the logical
+/// screen and every value a script reads stay where they are.
+pub fn render_policy(native_resolution: bool) -> RenderPolicy {
+    if native_resolution {
+        RenderPolicy::NativeResolution
+    } else {
+        RenderPolicy::Reference
+    }
+}
+
 /// The assembled host: the middle-layer engine and the frame it owns.
 ///
 /// See the crate documentation for the ownership model. Callers reach the
@@ -639,7 +657,9 @@ impl Host {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendKind, Host, HostConfig, HostError, InjectedFrameTime};
+    use super::{
+        BackendKind, Host, HostConfig, HostError, InjectedFrameTime, RenderPolicy, render_policy,
+    };
     use api::blend::BlendMode;
     use api::error::RenderError;
     use engine::Rect;
@@ -665,6 +685,15 @@ mod tests {
             layer.image_height = SIZE.1;
             layer.blend = BlendMode::Replace;
         }
+    }
+
+    /// Every launcher turns the native-resolution choice into the render policy
+    /// through this one mapping, so the same choice means the same rendering
+    /// on every platform.
+    #[test]
+    fn the_native_resolution_choice_selects_the_render_policy() {
+        assert_eq!(render_policy(false), RenderPolicy::Reference);
+        assert_eq!(render_policy(true), RenderPolicy::NativeResolution);
     }
 
     /// The headless Vulkan host draws its frame into an offscreen target.

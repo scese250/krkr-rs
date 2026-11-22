@@ -72,7 +72,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use app::{BackendKind, FrameTimeSource, GameHost, Host, HostConfig};
+use app::{BackendKind, FrameTimeSource, GameHost, Host, HostConfig, render_policy};
 use engine::{PixelTranslation, RenderPolicy};
 use log::{Log, Metadata, Record as LogRecord};
 use platform::{
@@ -1809,7 +1809,7 @@ fn main() {
     let mut vulkan = false;
     let mut headless = false;
     let mut surface_size = HEADLESS_SURFACE_SIZE;
-    let mut policy = RenderPolicy::default();
+    let mut native_resolution = false;
     let mut dump: Option<PathBuf> = None;
     let mut dump_frame: Option<usize> = None;
     let mut resize: Option<(u32, u32)> = None;
@@ -1917,7 +1917,7 @@ fn main() {
                     }
                 }
             }
-            "--native-resolution" => policy = RenderPolicy::NativeResolution,
+            "--native-resolution" => native_resolution = true,
             "--skip-at-frame" => {
                 skip_at_frame = Some(number(&mut args, "the fast-forward frame", 0));
             }
@@ -1956,6 +1956,10 @@ fn main() {
             }
         }
     }
+    // The rendering policy the flag asks for. The mapping that decides what
+    // the choice means is the shared one, so the example and the launchers
+    // draw the same picture.
+    let policy = render_policy(native_resolution);
     if vm_report {
         compat::set_compile_stats_enabled(true);
     }
@@ -2133,7 +2137,9 @@ fn main() {
     println!("the surface: {}x{}", surface_size.0, surface_size.1);
     println!(
         "the policy: {}",
-        if policy == RenderPolicy::NativeResolution {
+        // The policy is named through the shared mapping too, so the example
+        // names no variant of its own.
+        if policy == render_policy(true) {
             "native resolution"
         } else {
             "reference"

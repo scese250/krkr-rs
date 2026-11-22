@@ -12,7 +12,8 @@
 //! is its `filesDir.absolutePath`, where [`crate::state`] writes
 //! `krkr_state.json`. [`pendingFrameRate`](FIELD_FRAME_RATE),
 //! [`pendingPreloadArchives`](FIELD_PRELOAD_ARCHIVES),
-//! [`pendingDebugOverlay`](FIELD_DEBUG_OVERLAY) and
+//! [`pendingDebugOverlay`](FIELD_DEBUG_OVERLAY),
+//! [`pendingNativeResolution`](FIELD_NATIVE_RESOLUTION) and
 //! [`pendingLogLevel`](FIELD_LOG_LEVEL) are the launcher's
 //! persisted runtime settings; [`crate::config`] validates them into the
 //! values the emulator receives.
@@ -38,6 +39,9 @@ pub(crate) const FIELD_PRELOAD_ARCHIVES: &str = "pendingPreloadArchives";
 /// Static field on the same class holding the debug-overlay choice (`true` or
 /// `false`); unset means the launcher had no override.
 pub(crate) const FIELD_DEBUG_OVERLAY: &str = "pendingDebugOverlay";
+/// Static field on the same class holding the native-resolution choice (`true`
+/// or `false`); unset means the launcher had no override.
+pub(crate) const FIELD_NATIVE_RESOLUTION: &str = "pendingNativeResolution";
 /// Static field on the same class holding the log level
 /// (`off`/`error`/`warn`/`info`/`debug`/`trace`); unset means the launcher had
 /// no override.
@@ -136,6 +140,7 @@ mod tests {
         assert_eq!(FIELD_FRAME_RATE, "pendingFrameRate");
         assert_eq!(FIELD_PRELOAD_ARCHIVES, "pendingPreloadArchives");
         assert_eq!(FIELD_DEBUG_OVERLAY, "pendingDebugOverlay");
+        assert_eq!(FIELD_NATIVE_RESOLUTION, "pendingNativeResolution");
         assert_eq!(FIELD_LOG_LEVEL, "pendingLogLevel");
         assert_eq!(SIG_STRING, "Ljava/lang/String;");
     }

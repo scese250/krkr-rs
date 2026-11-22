@@ -46,7 +46,7 @@ mod android_entry {
     use std::time::Duration;
 
     use android_activity::AndroidApp;
-    use app::BackendKind;
+    use app::{BackendKind, render_policy};
 
     use crate::log_file::{self, FileSink};
     use crate::{config, host, jni_fields, state};
@@ -64,7 +64,8 @@ mod android_entry {
     /// the filter. The remaining saved runtime settings (frame-rate limit,
     /// archive preload and debug overlay) are read over the same JNI channel and
     /// resolved by [`crate::config`], and an out-of-range value is reported and
-    /// the loop is never started.
+    /// the loop is never started. The native-resolution choice is read the same
+    /// way and selects the sampler's filter.
     #[allow(unsafe_code)]
     #[unsafe(no_mangle)]
     pub fn android_main(app: AndroidApp) {
@@ -192,6 +193,27 @@ mod android_entry {
                 return;
             }
         };
+        // The native-resolution choice is a launch-time rendering choice, not a
+        // field of the shared runtime configuration, so it is resolved on its
+        // own and turned into the render policy here.
+        let native_resolution_value =
+            match read_settings_field(&app, jni_fields::FIELD_NATIVE_RESOLUTION) {
+                Ok(value) => value,
+                Err(message) => {
+                    report_startup_failure(&message);
+                    return;
+                }
+            };
+        let native_resolution =
+            match config::resolve_native_resolution(native_resolution_value.as_deref()) {
+                Ok(value) => value,
+                Err(error) => {
+                    log::error!("android.host: invalid runtime configuration: {error}");
+                    let message = error.to_string();
+                    state::write_state(state::State::Failed, Some(&message));
+                    return;
+                }
+            };
         let runtime = match config::resolve_runtime_config(
             frame_rate.as_deref(),
             preload_archives.as_deref(),
@@ -206,10 +228,11 @@ mod android_entry {
             }
         };
         log::info!(
-            "android.host: frame_rate_fps={} preload_archives={} debug_overlay={} log_level={}",
+            "android.host: frame_rate_fps={} preload_archives={} debug_overlay={} native_resolution={} log_level={}",
             runtime.frame_rate_limit.fps(),
             runtime.preload_archives,
             runtime.debug_overlay,
+            native_resolution,
             log_level.as_filter()
         );
         let frame_interval = Duration::from_secs_f64(runtime.frame_rate_limit.period_secs());
@@ -218,6 +241,7 @@ mod android_entry {
             game_dir,
             runtime.preload_archives,
             runtime.debug_overlay,
+            render_policy(native_resolution),
             frame_interval,
         );
         let outcome = host::run_loop(app, handler, frame_interval);

@@ -18,6 +18,7 @@ class RuntimeSettingsTest {
             frameRate = "120",
             preloadArchives = "true",
             debugOverlay = "true",
+            nativeResolution = "true",
             logLevel = "debug",
         )
         val decoded = settingsFromJson(JSONObject(settingsToJson(settings).toString()))
@@ -47,7 +48,33 @@ class RuntimeSettingsTest {
         assertEquals(RuntimeOptions.DEFAULTS.frameRate, decoded.frameRate)
         assertEquals(RuntimeOptions.DEFAULTS.preloadArchives, decoded.preloadArchives)
         assertEquals("true", decoded.debugOverlay)
+        assertEquals(RuntimeOptions.DEFAULTS.nativeResolution, decoded.nativeResolution)
         assertEquals(RuntimeOptions.DEFAULTS.logLevel, decoded.logLevel)
         assertTrue(decoded.debugOverlay in RuntimeOptions.DEBUG_OVERLAY_VALUES)
+    }
+
+    @Test
+    fun nativeResolutionDefaultsToOffWhenTheKeyIsAbsent() {
+        // A settings.json written before the option existed has no
+        // `native_resolution` key; the built-in default is `false`, so the
+        // picture is drawn the way the plain rendering draws it.
+        val root = JSONObject().put("version", 1).put("frame_rate", "60")
+        assertEquals("false", settingsFromJson(root).nativeResolution)
+    }
+
+    @Test
+    fun aPresentNativeResolutionValueIsPreservedForTheEngineToValidate() {
+        // An invalid value is kept verbatim; the engine rejects it with the
+        // option name rather than the launcher silently defaulting it.
+        val root = settingsToJson(RuntimeOptions.DEFAULTS).put("native_resolution", "yes")
+        assertEquals("yes", settingsFromJson(root).nativeResolution)
+    }
+
+    @Test
+    fun theNativeResolutionChoiceRoundTrips() {
+        val root = settingsToJson(RuntimeOptions.DEFAULTS).put("native_resolution", "true")
+        val decoded = settingsFromJson(root)
+        assertEquals("true", decoded.nativeResolution)
+        assertTrue(decoded.nativeResolution in RuntimeOptions.NATIVE_RESOLUTION_VALUES)
     }
 }

@@ -2110,7 +2110,14 @@ justify that risk, so the work stays inside L2 and L3.
 The experimental `--native-resolution` flag is landed, and so is the filtered
 sampling it asks for: the device samples every texture with a bilinear filter
 instead of point-sampling it, so a magnified picture is smooth instead of
-blocky. Those are stage 0 and stage 1, and the stages after them are open.
+blocky. Those are stage 0 and stage 1, and the stages after them are the ones
+below.
+
+Stage 5 is landed as well: the Android launcher carries the choice in its own
+settings store, under the key `native_resolution`, and an invalid value is
+rejected with the option name and the accepted values. The desktop's
+configuration file still cannot set it: there the choice is a launch argument
+and the file is not its store.
 
 The policy is the sampler's filter and nothing else
 (`engine::RenderPolicy`): it reaches the device through the pipeline's
@@ -2119,15 +2126,14 @@ disagree. It cannot move a click either - the translation still maps the
 script's pixels to the device's, so the picture and the click are the same
 picture whatever the filter is.
 
-The flag is a launch argument with no value, the Fit-with-letterbox
-presentation is untouched, the logical screen does not move, and no
-script-visible value changes. The architecture and the recorded divergence are
-in [`docs/arch/l2.md`](docs/arch/l2.md) §4.
+The choice is a launch-time choice the shared runtime configuration does not
+carry, the Fit-with-letterbox presentation is untouched, the logical screen
+does not move, and no script-visible value changes. The architecture and the
+recorded divergence are in [`docs/arch/l2.md`](docs/arch/l2.md) §4.
 
 The stages are: stage 2, the device-scale content; stage 3, the hi-res text;
-stage 4, the sampler's own details; stage 5, the other launchers. The scale
-change is the design question inside stage 2, and the measurement is what
-every stage needs.
+stage 4, the sampler's own details. The scale change is the design question
+inside stage 2, and the measurement is what every stage needs.
 
 What is left, in the order it should be done:
 
@@ -2157,7 +2163,8 @@ What is left, in the order it should be done:
   itself.
 * **The measurement.** The frame time, the VRAM and the upload bandwidth with
   the flag on and off, on a real title, on a quiet machine.
-* **Stage 5: the other launchers.** The Android launcher has no setting for
-  the flag yet, and the Android surface is usually already at the device's
-  resolution, so the flag matters most there. The configuration file cannot
-  set it either; both are one step each.
+
+What is unverified until the APK is built and run on a device: the Kotlin
+launcher side is reviewed by reading (the Android target is never built on the
+development host, §14), and the effect of the choice on a real device surface
+is unmeasured. The measurement the stages need is not done.

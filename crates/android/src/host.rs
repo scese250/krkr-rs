@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use android_activity::{AndroidApp, MainEvent, PollEvent};
-use app::{BackendKind, FrameTimeSource, GameHost, Host, HostConfig, PlatformFrameTime};
+use app::{
+    BackendKind, FrameTimeSource, GameHost, Host, HostConfig, PlatformFrameTime, RenderPolicy,
+};
 use platform::{
     EventHandler, Flow, FramePacing, PlatformError, PlatformEvent, PlatformWindow, Ticker,
 };
@@ -37,6 +39,12 @@ pub(crate) struct AndroidHost {
     /// Whether the debug overlay (frame rate and resident memory) is drawn,
     /// from the launcher's resolved settings.
     debug_overlay: bool,
+    /// The rendering policy the launcher's choice selects: how the device
+    /// draws the scene.
+    ///
+    /// The policy is on the host configuration before the host is created, so
+    /// the sampler's filter and the engine's policy are the same choice.
+    policy: RenderPolicy,
     /// The frame interval the launcher requested; it sets the presentation
     /// budget when the host resumes.
     frame_interval: Duration,
@@ -67,6 +75,7 @@ impl AndroidHost {
         game_dir: PathBuf,
         preload_archives: bool,
         debug_overlay: bool,
+        policy: RenderPolicy,
         frame_interval: Duration,
     ) -> Self {
         Self {
@@ -74,6 +83,7 @@ impl AndroidHost {
             game_dir,
             preload_archives,
             debug_overlay,
+            policy,
             frame_interval,
             running: None,
             frame_time: Box::new(PlatformFrameTime::new()),
@@ -172,7 +182,12 @@ impl EventHandler for AndroidHost {
                 return self.fail(format!("cannot obtain the Android display handle: {error}"));
             }
         };
-        let mut config = HostConfig::default().with_debug_overlay(self.debug_overlay);
+        // The policy is the one switch the launcher turned: the samplers are
+        // created with the pipeline, so the filter is derived from the policy
+        // on the configuration, before the host is created.
+        let mut config = HostConfig::default()
+            .with_debug_overlay(self.debug_overlay)
+            .with_policy(self.policy);
         config.backend = self.backend;
         config.surface_size = window.size();
         config.window_handle = Some(window_handle);

@@ -495,12 +495,10 @@ fn slow_report_budget(cli: &Cli) -> Option<Duration> {
 ///
 /// The flag is a flag and not a value: it turns the experimental rendering on
 /// and nothing else. The default draws the way the software renderer does.
+/// The choice is turned into the policy by the shared mapping, so the
+/// Android launcher's setting means the same rendering.
 fn render_policy(cli: &Cli) -> RenderPolicy {
-    if cli.native_resolution {
-        RenderPolicy::NativeResolution
-    } else {
-        RenderPolicy::Reference
-    }
+    app::render_policy(cli.native_resolution)
 }
 
 /// Environment variable naming the desktop configuration file.

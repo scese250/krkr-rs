@@ -41,9 +41,10 @@ import kotlin.math.roundToInt
 /**
  * The settings screen: the launcher's persisted copy of the engine options.
  *
- * The screen shows the four options the engine honours — the frame-rate
- * limit, the archive preload, the debug overlay and the engine log level —
- * with the same accepted values and range as the desktop launcher's
+ * The screen shows the five options the engine honours — the frame-rate
+ * limit, the archive preload, the debug overlay, the experimental
+ * native-resolution rendering and the engine log level — with the same
+ * accepted values and range as the desktop launcher's
  * `--fps`, `--preload-archives` and `--debug-overlay` options
  * (`api::config`). Nothing is offered for a feature the engine has no knob
  * for.
@@ -66,6 +67,7 @@ fun SettingsScreen(
     var frameRate by rememberSaveable { mutableStateOf(baseline.frameRate) }
     var preloadArchives by rememberSaveable { mutableStateOf(baseline.preloadArchives) }
     var debugOverlay by rememberSaveable { mutableStateOf(baseline.debugOverlay) }
+    var nativeResolution by rememberSaveable { mutableStateOf(baseline.nativeResolution) }
     var logLevel by rememberSaveable { mutableStateOf(baseline.logLevel) }
 
     // Validate only the frame rate here: the other values can only be set from
@@ -77,6 +79,8 @@ fun SettingsScreen(
     val preloadChecked = preloadArchives.toBooleanStrictOrNull() ?: false
     val debugKnown = debugOverlay in RuntimeOptions.DEBUG_OVERLAY_VALUES
     val debugChecked = debugOverlay.toBooleanStrictOrNull() ?: false
+    val nativeKnown = nativeResolution in RuntimeOptions.NATIVE_RESOLUTION_VALUES
+    val nativeChecked = nativeResolution.toBooleanStrictOrNull() ?: false
     val logLevelKnown = logLevel in RuntimeOptions.LOG_LEVELS
 
     // The slider shows a value inside its range, whatever the file holds, so
@@ -88,6 +92,7 @@ fun SettingsScreen(
     val dirty = frameRate != baseline.frameRate ||
         preloadArchives != baseline.preloadArchives ||
         debugOverlay != baseline.debugOverlay ||
+        nativeResolution != baseline.nativeResolution ||
         logLevel != baseline.logLevel
     LaunchedEffect(dirty) { onDirtyChange(dirty) }
 
@@ -96,6 +101,7 @@ fun SettingsScreen(
         frameRate = RuntimeOptions.DEFAULT_FRAME_RATE.toString()
         preloadArchives = RuntimeOptions.DEFAULT_PRELOAD_ARCHIVES
         debugOverlay = RuntimeOptions.DEFAULT_DEBUG_OVERLAY
+        nativeResolution = RuntimeOptions.DEFAULT_NATIVE_RESOLUTION
         logLevel = RuntimeOptions.DEFAULT_LOG_LEVEL
         onNotify("Defaults restored; save to apply them.")
     }
@@ -118,6 +124,12 @@ fun SettingsScreen(
             onNotify("Choose one of: ${RuntimeOptions.DEBUG_OVERLAY_VALUES.joinToString(", ")}.")
             return
         }
+        if (nativeResolution !in RuntimeOptions.NATIVE_RESOLUTION_VALUES) {
+            onNotify(
+                "Choose one of: ${RuntimeOptions.NATIVE_RESOLUTION_VALUES.joinToString(", ")}.",
+            )
+            return
+        }
         if (logLevel !in RuntimeOptions.LOG_LEVELS) {
             onNotify("Choose one of: ${RuntimeOptions.LOG_LEVELS.joinToString(", ")}.")
             return
@@ -126,6 +138,7 @@ fun SettingsScreen(
             frameRate = fps.toString(),
             preloadArchives = preloadArchives,
             debugOverlay = debugOverlay,
+            nativeResolution = nativeResolution,
             logLevel = logLevel,
         )
         if (store.write(written)) {
@@ -137,6 +150,7 @@ fun SettingsScreen(
             frameRate = written.frameRate
             preloadArchives = written.preloadArchives
             debugOverlay = written.debugOverlay
+            nativeResolution = written.nativeResolution
             logLevel = written.logLevel
             onNotify("Settings saved. They apply to the next game start.")
         } else {
@@ -221,6 +235,32 @@ fun SettingsScreen(
                 Text(
                     text = "This saved value (\"$preloadArchives\") is not one of " +
                         "${RuntimeOptions.PRELOAD_VALUES.joinToString(", ")}; " +
+                        "toggle the switch before saving.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
+
+            ListItem(
+                headlineContent = { Text("Native resolution (experimental)") },
+                supportingContent = { Text(RuntimeOptions.nativeResolutionDescription()) },
+                trailingContent = {
+                    Switch(
+                        checked = nativeChecked,
+                        onCheckedChange = { nativeResolution = it.toString() },
+                        // The visible label is a separate node, so name the
+                        // switch itself for TalkBack.
+                        modifier = Modifier.semantics {
+                            contentDescription = "Native resolution (experimental)"
+                        },
+                    )
+                },
+            )
+            if (!nativeKnown) {
+                Text(
+                    text = "This saved value (\"$nativeResolution\") is not one of " +
+                        "${RuntimeOptions.NATIVE_RESOLUTION_VALUES.joinToString(", ")}; " +
                         "toggle the switch before saving.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,

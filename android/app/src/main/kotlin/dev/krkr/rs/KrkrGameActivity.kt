@@ -105,6 +105,20 @@ class KrkrGameActivity : GameActivity() {
         var pendingDebugOverlay: String? = null
 
         /**
+         * Whether the picture is drawn with a bilinear filter instead of
+         * point-sampled (`true` or `false`), read through JNI like
+         * [pendingFrameRate].
+         *
+         * The rendering is experimental: the switch says so, and the choice
+         * changes the picture the device draws and nothing else.
+         *
+         * Null means the launcher had no persisted choice, so the engine's
+         * `false` default applies.
+         */
+        @JvmField
+        var pendingNativeResolution: String? = null
+
+        /**
          * The engine log level the user chose, one of `off`, `error`, `warn`,
          * `info`, `debug`, `trace`, read through JNI like [pendingFrameRate].
          *
@@ -130,7 +144,7 @@ class KrkrGameActivity : GameActivity() {
         pendingStateDir = filesDir.absolutePath
         publishRuntimeSettings()
         LauncherLog.i(
-            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"} fps=${pendingFrameRate ?: "?"} preload=${pendingPreloadArchives ?: "?"} overlay=${pendingDebugOverlay ?: "?"} log=${pendingLogLevel ?: "?"}",
+            "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"} fps=${pendingFrameRate ?: "?"} preload=${pendingPreloadArchives ?: "?"} overlay=${pendingDebugOverlay ?: "?"} native=${pendingNativeResolution ?: "?"} log=${pendingLogLevel ?: "?"}",
         )
         super.onCreate(savedInstanceState)
 
@@ -202,7 +216,7 @@ class KrkrGameActivity : GameActivity() {
         pendingStateDir = filesDir.absolutePath
         publishRuntimeSettings()
         LauncherLog.i(
-            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} fps=${pendingFrameRate ?: "?"} preload=${pendingPreloadArchives ?: "?"} overlay=${pendingDebugOverlay ?: "?"} log=${pendingLogLevel ?: "?"}",
+            "KrkrGameActivity.onNewIntent: engine already running; game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} fps=${pendingFrameRate ?: "?"} preload=${pendingPreloadArchives ?: "?"} overlay=${pendingDebugOverlay ?: "?"} native=${pendingNativeResolution ?: "?"} log=${pendingLogLevel ?: "?"}",
         )
     }
 
@@ -215,6 +229,7 @@ class KrkrGameActivity : GameActivity() {
         pendingFrameRate = settings.frameRate
         pendingPreloadArchives = settings.preloadArchives
         pendingDebugOverlay = settings.debugOverlay
+        pendingNativeResolution = settings.nativeResolution
         pendingLogLevel = settings.logLevel
     }
 }

@@ -163,6 +163,12 @@ The flag is a launch argument only: the configuration file cannot set it, and
 an unknown key is a typed error. The run names the choice in its startup
 records, so a log says whether the picture was filtered.
 
+The Android launcher carries the same choice in its own settings store, under
+the key `native_resolution`, because its surface is usually already at the
+device's resolution. The two mean the same rendering: both turn the choice
+into the render policy through one mapping, and an invalid stored value is
+rejected with the option name and the accepted values.
+
 ---
 
 ## 2. The game path

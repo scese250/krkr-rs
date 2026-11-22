@@ -3,9 +3,10 @@
 //!
 //! `KrkrGameActivity` persists the user's choices in its own settings file and
 //! publishes them as the static string fields `pendingFrameRate`,
-//! `pendingPreloadArchives`, `pendingDebugOverlay` and `pendingLogLevel` before
+//! `pendingPreloadArchives`, `pendingDebugOverlay`, `pendingNativeResolution`
+//! and `pendingLogLevel` before
 //! `super.onCreate` enters native code (see [`crate::jni_fields`]). This module
-//! is where those raw strings become the one validated value the emulator
+//! is where those raw strings become the validated values the emulator
 //! receives, so the launcher keeps owning configuration loading and the core
 //! does no configuration I/O of its own.
 //!
@@ -14,11 +15,15 @@
 //! value is a typed [`ConfigError`] naming the option and the accepted values;
 //! it is never silently replaced by the default.
 //!
+//! The native-resolution choice is resolved on its own ([`resolve_native_resolution`])
+//! and not as a field of [`RuntimeConfig`]: it is a launch-time rendering
+//! choice, not a runtime setting, and the shared value does not carry it.
+//!
 //! The Android launcher owns its own default resolution, and every default is
 //! the shared built-in: the frame-rate default is 60 fps, the preload default
-//! is `false`, the debug-overlay default is `false`, and the log-level default
-//! is `info`, which omits the VM's diagnostic detail. The user's stored choice
-//! overrides each default.
+//! is `false`, the debug-overlay default is `false`, the native-resolution
+//! default is `false`, and the log-level default is `info`, which omits the
+//! VM's diagnostic detail. The user's stored choice overrides each default.
 
 use api::config::{ConfigError, FrameRateLimit, RuntimeConfig, parse_bool};
 
@@ -28,6 +33,8 @@ const OPTION_FRAME_RATE: &str = "frame_rate";
 const OPTION_PRELOAD_ARCHIVES: &str = "preload_archives";
 /// Configuration-key name used in debug-overlay errors.
 const OPTION_DEBUG_OVERLAY: &str = "debug_overlay";
+/// Configuration-key name used in native-resolution errors.
+const OPTION_NATIVE_RESOLUTION: &str = "native_resolution";
 /// Configuration-key name used in log-level errors.
 const OPTION_LOG_LEVEL: &str = "log_level";
 
@@ -112,6 +119,31 @@ pub(crate) fn resolve_log_level(value: Option<&str>) -> Result<LogLevel, ConfigE
     match value {
         Some(value) => LogLevel::parse(OPTION_LOG_LEVEL, value),
         None => Ok(LogLevel::DEFAULT),
+    }
+}
+
+/// The rendering choice the launcher has when it published no value.
+///
+/// The default is the plain rendering: every texture is point-sampled.
+pub(crate) const DEFAULT_NATIVE_RESOLUTION: bool = false;
+
+/// Resolves the launcher's native-resolution choice over the built-in default.
+///
+/// `None` means the launcher published no value, so the documented default
+/// [`DEFAULT_NATIVE_RESOLUTION`] applies. A present value that is neither
+/// `true` nor `false` is a typed [`ConfigError`] naming the option and the
+/// accepted values — it is never silently replaced by the default.
+///
+/// The choice is not a field of [`RuntimeConfig`]: it selects the sampler's
+/// filter, and it reaches the device through the host configuration.
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidValue`] when `value` is neither `true` nor `false`.
+pub(crate) fn resolve_native_resolution(value: Option<&str>) -> Result<bool, ConfigError> {
+    match value {
+        Some(value) => parse_bool(OPTION_NATIVE_RESOLUTION, value),
+        None => Ok(DEFAULT_NATIVE_RESOLUTION),
     }
 }
 
@@ -233,6 +265,35 @@ mod tests {
         assert!(resolve_runtime_config(Some("fast"), Some("false"), None).is_err());
         assert!(resolve_runtime_config(Some("60"), Some("yes"), None).is_err());
         assert!(resolve_runtime_config(Some("60"), None, Some("on")).is_err());
+    }
+
+    /// The native-resolution choice resolves on and off like the other
+    /// booleans; an unset value means the launcher had no override and the
+    /// default applies, while an unparseable one is rejected with its option
+    /// name and the accepted values.
+    #[test]
+    fn the_native_resolution_resolves_on_and_off() {
+        let on = resolve_native_resolution(Some("true")).expect("true is valid");
+        assert!(on);
+        let off = resolve_native_resolution(Some("false")).expect("false is valid");
+        assert!(!off);
+        let unset = resolve_native_resolution(None).expect("defaults");
+        assert_eq!(unset, DEFAULT_NATIVE_RESOLUTION);
+        assert!(
+            !unset,
+            "the default draws the way the plain rendering draws"
+        );
+    }
+
+    /// An invalid native-resolution value is rejected, never replaced by the
+    /// default: the error names the option and the accepted values.
+    #[test]
+    fn an_invalid_native_resolution_is_rejected_with_the_option_and_the_accepted_values() {
+        let error = resolve_native_resolution(Some("yes"))
+            .expect_err("unknown native-resolution value")
+            .to_string();
+        assert!(error.contains("native_resolution"), "{error}");
+        assert!(error.contains("true, false"), "{error}");
     }
 
     #[test]

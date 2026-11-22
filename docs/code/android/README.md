@@ -142,6 +142,7 @@ finished value:
 | the game directory | `GameHost::open_with_preload(host, Vec::new(), game_dir, preload_archives)` — a directory-only launch mounts every `*.xp3` under the folder |
 | the archive preload | the same `open_with_preload` argument |
 | the debug overlay | `HostConfig::with_debug_overlay` |
+| the native resolution | `HostConfig::with_policy` — the policy is set before the pipeline is created |
 | the frame rate | the loop's ticker period |
 | the log level | the process logger's filter |
 

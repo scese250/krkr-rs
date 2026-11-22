@@ -120,8 +120,13 @@ pub struct FrameTimeReport;                // the frames, the percentiles, the 1
 // the one seam a launcher may install itself
 pub fn install_image_codec(host: &CompatHost, media: &Media, storage: &Storage);
 
+// the rendering policy a launcher's native-resolution choice selects
+pub fn render_policy(native_resolution: bool) -> RenderPolicy;
+
 // re-exported from L1
 pub use render::BackendKind;
+// re-exported from L2
+pub use engine::RenderPolicy;
 ```
 
 The audio decoder, the image codec, the video source and the emulated

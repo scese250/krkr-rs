@@ -5,17 +5,19 @@ Source: `crates/android/src/config.rs` (the resolver) and
 
 `KrkrGameActivity` persists the user's choices in its own settings file and
 publishes them as the static string fields `pendingFrameRate`,
-`pendingPreloadArchives`, `pendingDebugOverlay` and `pendingLogLevel` before
-`super.onCreate` enters native code. This module is where those raw strings
-become the one validated value the emulator receives, so **the launcher keeps
-owning configuration loading and the core does no configuration I/O of its
-own**.
+`pendingPreloadArchives`, `pendingDebugOverlay`, `pendingNativeResolution`
+and `pendingLogLevel` before `super.onCreate` enters native code. This module
+is where those raw strings become the validated values the emulator receives,
+so **the launcher keeps owning configuration loading and the core does no
+configuration I/O of its own**.
 
 ---
 
 ## 1. Responsibility
 
 * resolve the launcher's published strings into a validated `RuntimeConfig`;
+* resolve the launcher's native-resolution choice into the rendering policy
+  the host is created with;
 * resolve the launcher's log level into the filter the process logger uses;
 * read the launcher's static fields over JNI.
 
@@ -45,6 +47,9 @@ pub(crate) fn resolve_runtime_config(
     debug_overlay: Option<&str>,
 ) -> Result<RuntimeConfig, ConfigError>;
 
+pub(crate) fn resolve_native_resolution(value: Option<&str>) -> Result<bool, ConfigError>;
+pub(crate) const DEFAULT_NATIVE_RESOLUTION: bool = false;
+
 pub(crate) fn resolve_log_level(value: Option<&str>) -> Result<LogLevel, ConfigError>;
 
 pub(crate) enum LogLevel { Off, Error, Warn, Info, Debug, Trace }
@@ -61,18 +66,30 @@ override**, and the built-in default applies. A present but unparseable or
 out-of-range value is a typed `ConfigError` naming the option and the
 accepted values; it is **never** silently replaced by the default.
 
-The defaults are the shared built-ins:
+The defaults are the shared built-ins, except the native resolution, whose
+default is the launcher's own:
 
 | option | accepted values | default |
 |---|---|---|
 | the frame-rate limit | a decimal integer in `1..=1000` | `60` |
 | the archive preload | `true`, `false` | `false` |
 | the debug overlay | `true`, `false` | `false` |
+| the native resolution | `true`, `false` | `false` |
 | the log level | `off`, `error`, `warn`, `info`, `debug`, `trace` | `info` |
 
 `info` omits the VM's diagnostic detail: the VM's per-exception disassembly,
 register dump and console output reach the logger as `debug` records, so
 **`debug` is the level that surfaces a script exception** in `krkr.log`.
+
+The native-resolution choice is **not** a field of the shared
+`RuntimeConfig`: it is a launch-time rendering choice, not a runtime setting,
+and the shared value does not carry it. It is resolved on its own and turned
+into the render policy by the shared mapping (`app::render_policy`), so the
+desktop's `--native-resolution` flag and this setting mean the same
+rendering. The policy reaches the device through the host configuration
+(`HostConfig::with_policy`), which the host applies **before** it creates the
+pipeline — the samplers are created with the pipeline, so the filter and the
+engine's policy cannot disagree.
 
 The graphic cache limit is a desktop CLI option only; the Android launcher
 leaves the engine's reference default (disabled), so `graphic_cache_limit` is
@@ -93,6 +110,7 @@ pub(crate) const FIELD_STATE_DIR: &str = "pendingStateDir";
 pub(crate) const FIELD_FRAME_RATE: &str = "pendingFrameRate";
 pub(crate) const FIELD_PRELOAD_ARCHIVES: &str = "pendingPreloadArchives";
 pub(crate) const FIELD_DEBUG_OVERLAY: &str = "pendingDebugOverlay";
+pub(crate) const FIELD_NATIVE_RESOLUTION: &str = "pendingNativeResolution";
 pub(crate) const FIELD_LOG_LEVEL: &str = "pendingLogLevel";
 pub(crate) const SIG_STRING: &str = "Ljava/lang/String;";
 
@@ -131,7 +149,9 @@ The resolver owns no state: it is a pure function of the published strings.
 The `RuntimeConfig` it returns is passed to the composition root, which hands
 the parts to the engine (`GameHost::open_with_preload`,
 `HostConfig::with_debug_overlay`, the ticker's period) and the log level to
-the logger's filter.
+the logger's filter. The native-resolution choice becomes the render policy
+(`HostConfig::with_policy`), and the host sets it before it creates the
+pipeline.
 
 The launcher keeps the persisted copy; the emulator never writes it back.
 
@@ -141,7 +161,7 @@ The launcher keeps the persisted copy; the emulator never writes it back.
 
 | item | gate |
 |---|---|
-| `resolve_runtime_config`, `resolve_log_level`, `LogLevel` | `cfg(any(target_os = "android", test))` — host-tested |
+| `resolve_runtime_config`, `resolve_native_resolution`, `resolve_log_level`, `LogLevel` | `cfg(any(target_os = "android", test))` — host-tested |
 | the field-name constants | always compiled, so a host test can pin them |
 | `activity_static_string` | `cfg(target_os = "android")` — it needs the `jni` crate |
 
@@ -153,6 +173,7 @@ The launcher keeps the persisted copy; the emulator never writes it back.
 |---|---|
 | the frame rate is unparseable or outside `1..=1000` | `ConfigError::InvalidValue` naming `frame_rate` and the accepted range |
 | the preload or the overlay value is not `true`/`false` | `ConfigError::InvalidValue` naming the option and the accepted values |
+| the native-resolution value is not `true`/`false` | `ConfigError::InvalidValue` naming `native_resolution` and the accepted values |
 | the log level is not one of the six names | `ConfigError::InvalidValue` naming `log_level` and every accepted value |
 | a JNI read fails | the error is reported, the pending Java exception is cleared, and the caller treats it as a failure — never as "unset" |
 | a field is null or empty | `Ok(None)` — the default applies |
@@ -173,6 +194,10 @@ is reported the same way.
 * each field falling back to **its own** default independently of the options
   beside it;
 * the debug overlay resolving on and off;
+* the native-resolution choice resolving on and off, and an unset one taking
+  the default;
+* an invalid native-resolution value being rejected with the option name and
+  the accepted values;
 * the out-of-range values being rejected with the option name and the range
   (`frame_rate`, `1..=1000`, `preload_archives`, `true, false`,
   `debug_overlay`, `true, false`);

@@ -107,6 +107,7 @@ pub(crate) struct AndroidHost {
     game_dir: PathBuf,             // the folder the launcher selected
     preload_archives: bool,
     debug_overlay: bool,
+    policy: RenderPolicy,          // the rendering policy the launcher's choice selected
     running: Option<GameHost>,     // the game, created by `resumed`
     pending_events: Vec<PlatformEvent>,
     gestures: GestureSynthesizer,
@@ -118,6 +119,10 @@ pub(crate) struct AndroidHost {
 `AndroidHost` mirrors the desktop host: the L2 render host is created once
 the `ANativeWindow` exists and is torn down before that window is destroyed.
 Android always launches a game, so there is no empty-scene variant.
+
+The policy is on the host configuration before the host is created: the
+samplers are created with the pipeline, so the filter and the engine's policy
+are one choice and cannot disagree.
 
 | callback | what it does |
 |---|---|

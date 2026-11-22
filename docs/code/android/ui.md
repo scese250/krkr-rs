@@ -45,10 +45,27 @@ opens in) instead of finishing the Activity.
 | `GameCard.kt` | one game as a card: the monogram tile, the name, the folder, the play action, the per-game overflow menu |
 | `ManageBar.kt` | the bar of the selection mode and its bulk removal |
 | `EmptyLibrary.kt` | the empty state |
-| `SettingsScreen.kt` | the settings screen: the frame-rate slider, the two switches, the log-level chips, the save |
+| `SettingsScreen.kt` | the settings screen: the frame-rate slider, the three switches, the log-level chips, the save |
 | `LogsScreen.kt` | the log screen: the summary card, the level filter, the log rows |
 | `LogExport.kt` | the log share, copy and export actions |
 | `Components.kt` | the shared pieces: the monogram tile, the section header, the path label |
+
+### The settings screen
+
+`SettingsScreen.kt` is the launcher's copy of the engine's options, in three
+sections: **Playback** (the frame-rate slider), **Engine** (the archive
+preload, the native resolution and the debug overlay) and **Diagnostics** (the
+log-level chips). Every value is stored as the exact string the user's choice
+is stored as, and the engine validates it: a hand-edited value is reported by
+the engine with its option name and its accepted values, not replaced here.
+
+The **native resolution** switch turns the experimental rendering on: the
+device reads every texture with a bilinear filter instead of point-sampling
+it, so a picture enlarged to the screen looks smoother. Its label says
+*experimental* and the sentence under it says so again, because the rendering
+is not settled. The switch changes the picture and nothing else: the size the
+game sees and everything it reads stay the same. It is off by default, and it
+applies to the next game start.
 
 ### What `MainActivity.kt` keeps
 
@@ -111,7 +128,7 @@ Activity was restored, so a configuration change is not read as a crash.
 | the selection mode | `rememberSaveable` in `LauncherScreen` | yes |
 | the selected games | `rememberSaveable` with `SelectionSaver` (a `listSaver` over the selected tree URIs) in `LauncherScreen` | yes |
 | the game library | the `games.json` file, owned by `GameLibrary`; the in-memory list is Compose-local and re-read after every write | yes — it is on disk |
-| the settings draft | four `rememberSaveable` strings in `SettingsScreen` | yes |
+| the settings draft | five `rememberSaveable` strings in `SettingsScreen` | yes |
 | the "All files access" grant | the Activity (`permissionGranted`), re-read in `onResume` | yes — it is a system setting |
 | the engine's last report | the Activity (`startupIssue`), reconciled from the pending-launch marker in `onResume` | yes — it is a file |
 | the pending launch marker | `krkr-launch-pending.json`, owned by `EngineDiagnostics` | yes — it is a file |
@@ -195,7 +212,7 @@ No screen names a colour: every surface, text and outline colour comes from a
 * Every icon-only control carries a content description, and an icon that
   sits next to a visible label passes `null` so it is not announced twice.
 * The navigation rail always shows its label.
-* The two switches are named for TalkBack, because the visible label is a
+* The three switches are named for TalkBack, because the visible label is a
   separate node.
 * The game card is clickable with the click label "Play" (or "Select" in the
   selection mode) and the `Button` role.

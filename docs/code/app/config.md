@@ -108,6 +108,15 @@ entered, and the Android configuration module turns them into a validated
 present-but-invalid value is never replaced by the default; an unset field
 means the launcher had no override, which is a different thing.
 
+The native-resolution rendering is **not** one of those fields: it is a
+launch-time rendering choice, not a runtime setting, so the shared value
+does not carry it. The desktop asks for it with the `--native-resolution`
+launch argument — a flag with no value, so the `key=value` file cannot set
+it — and the Android launcher carries it in its own store, where the key is
+`native_resolution` and an invalid value is rejected with the option name
+and the accepted values. Both launchers turn the choice into the render
+policy through the same mapping (`app::render_policy`).
+
 The full contract, with both launchers side by side, is in
 [`../../runtime-config.md`](../../../docs.old/runtime-config.md).
 

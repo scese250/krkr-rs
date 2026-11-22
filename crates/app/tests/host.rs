@@ -27,6 +27,18 @@ fn host_applies_the_configured_graphic_cache_limit() {
     );
 }
 
+/// The host applies the launcher's rendering policy to the engine.
+///
+/// The samplers are created with the pipeline, so the policy is on the
+/// configuration before the host is created; the engine then holds the same
+/// policy, and the engine's policy and the device's sampler are one choice.
+#[test]
+fn host_applies_the_configured_render_policy() {
+    let host = app::Host::new(app::HostConfig::headless().with_policy(app::render_policy(true)))
+        .expect("headless host");
+    assert_eq!(host.policy(), app::RenderPolicy::NativeResolution);
+}
+
 /// Evaluates `expression` and returns its integer result.
 fn eval_int(vm: &VmHost, expression: &str) -> i64 {
     match vm.eval(expression, "t").expect("eval succeeds") {
