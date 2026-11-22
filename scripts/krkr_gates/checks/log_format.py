@@ -49,6 +49,7 @@ SUBSYSTEMS = (
     "compat.system",
     "compat.timer",
     "compat.video",
+    "compat.debug",
     "engine.audio",
     "engine.frame",
     "engine.jobpool",

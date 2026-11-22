@@ -77,6 +77,11 @@ using `clearLogFileOnError` as the clear flag.
 The file is written through the **L1 `fs` crate** to the host filesystem — it
 deliberately bypasses the game's storage namespace.
 
+A log file that cannot be opened or written is **recorded, not dropped**: the
+record names the `compat.debug` subsystem, the stream is closed and the file
+writes stop, and the script call that asked for the write still succeeds. A
+failed file is not written again until the log location changes.
+
 `logLocation` is normalized on assignment (lowercased, `\` folded to `/`, the
 in-archive part normalized), and **any name containing `>` clears the
 location**: an in-archive name has no local form. The setter then reopens the
@@ -144,9 +149,10 @@ There is no L2 seam.
 | `"Console.visible: compat context is not bound"` / `": missing value"` | the visibility property |
 | `"Controller.visible: compat context is not bound"` / `": missing value"` | the same |
 
-A failed log-file open is **logged**, not raised:
-`Debug: failed to open "<file>": <error>`. The failure is remembered, so the
-file is not retried until the location changes.
+A failed log-file open or write is **logged**, not raised:
+`compat.debug: failed to open "<file>": <error>` and
+`compat.debug: failed to write "<file>": <reason>`. The failure is
+remembered, so the file is not written again until the location changes.
 
 ---
 
@@ -159,6 +165,10 @@ non-object-raises / null-accepted rule, the property round trips, the
 `logLocation` archive-name clearing and the `-forcelog` option, the
 `startLogToFile` append semantics, the no-location case, and the
 `Console`/`Controller` singletons and their visibility flags.
+
+`crates/compat/tests/debug_log_file.rs` covers the log file that cannot be
+opened and the log file that cannot be written: the script call succeeds, the
+failure is recorded once, and the file writes stop.
 
 ---
 

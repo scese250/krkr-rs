@@ -16,7 +16,6 @@
 {"anchor": "compat.async: on_fire id={id:?} ms={elapsed_ms:.1}", "path": "crates/compat/src/natives/async_trigger.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "AsyncTrigger {id:?}: onFire failed ({error})", "path": "crates/compat/src/natives/async_trigger.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "disc sound.{}: action dispatch failed: {error}", "path": "crates/compat/src/natives/cdda_midi.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
-{"anchor": "Debug: failed to open {filename:?}: {e}", "path": "crates/compat/src/natives/debug.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "Debug logging handler failed: {e}", "path": "crates/compat/src/natives/debug.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "{text}", "path": "crates/compat/src/natives/debug.rs", "reason": "the record predates the convention; the migration is in TODO.md"}
 {"anchor": "{text}", "path": "crates/compat/src/natives/debug.rs", "reason": "the record predates the convention; the migration is in TODO.md"}

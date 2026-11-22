@@ -41,6 +41,7 @@ from. It is the crate, and the module inside it:
 | `android.host` | the Android composition root |
 | `android.input` | the Android input queue and the touch mapping |
 | `compat.audio` | the sound natives and the mixer |
+| `compat.debug` | the Debug native, its log file and its logging handlers |
 | `compat.event` | the event adapter |
 | `compat.font` | the font natives |
 | `compat.image` | the image natives and the pixel operations |

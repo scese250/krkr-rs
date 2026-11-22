@@ -35,6 +35,10 @@
 //! `core/CMakeLists.txt:39`). The handlers are matched by closure identity,
 //! so `removeLoggingHandler` retires exactly the callback it names and a
 //! duplicate registration is ignored.
+//!
+//! A log file that cannot be opened or written is recorded in the engine
+//! log: the stream is closed, the file writes stop, and the script call that
+//! asked for the write still succeeds.
 #![allow(unsafe_code)]
 
 use std::collections::VecDeque;
@@ -130,10 +134,17 @@ fn join_args(a: &[Value]) -> String {
 }
 
 /// Epoch seconds now, floored at the epoch if the clock predates 1970.
+///
+/// A clock before the epoch is a failure, not a value: it is recorded and
+/// the stamp falls back to the epoch.
 fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(elapsed) => elapsed.as_secs(),
+        Err(error) => {
+            log::warn!("compat.debug: the clock is before the epoch: {error}");
+            0
+        }
+    }
 }
 
 /// `HH:MM:SS` of the current time. The fields are UTC because `std` has no
@@ -200,6 +211,45 @@ fn push_log(services: &CompatServices, text: &str) {
     }
 }
 
+/// The log file's path: `{location}/krkr.console.log`.
+fn log_file_path(location: &str) -> String {
+    let mut native = strip_file_media(location).to_string();
+    if !native.ends_with('/') {
+        native.push('/');
+    }
+    format!("{native}/krkr.console.log")
+}
+
+/// Append `bytes` to the log file and flush them.
+///
+/// The write and the flush are one operation: a failure of either closes the
+/// log file and stops the file writes, so a log file that cannot be written
+/// costs one record instead of one per line. The failure is recorded in the
+/// engine log; the script call that asked for the write still succeeds.
+fn write_log_bytes(state: &mut DebugState, bytes: &[u8]) {
+    let file_system = fs::FileSystem::host("");
+    let Some(file) = state.log_file.as_ref() else {
+        return;
+    };
+    let failure = match fs::append(&file_system, file, bytes) {
+        Ok(written) if written == bytes.len() => match fs::flush(&file_system, file) {
+            Ok(()) => None,
+            Err(error) => Some(error.to_string()),
+        },
+        Ok(written) => Some(format!(
+            "only {written} of {} bytes were written",
+            bytes.len()
+        )),
+        Err(error) => Some(error.to_string()),
+    };
+    if let Some(reason) = failure {
+        let path = log_file_path(&state.log_location);
+        log::warn!("compat.debug: failed to write {path:?}: {reason}");
+        state.log_file = None;
+        state.log_open_failed = true;
+    }
+}
+
 /// Open (or reopen) the reference log stream: `{location}/krkr.console.log`
 /// (`tTVPLogStreamHolder::Open`, `DebugIntf.cpp:240-296`) — an empty
 /// `logLocation` means no stream at all (`DebugIntf.cpp:241-244`), and a
@@ -216,11 +266,7 @@ fn open_log_file(state: &mut DebugState, truncate: bool) {
         state.log_open_failed = true;
         return;
     }
-    let mut native = strip_file_media(&state.log_location).to_string();
-    if !native.ends_with('/') {
-        native.push('/');
-    }
-    let filename = format!("{native}/krkr.console.log");
+    let filename = log_file_path(&state.log_location);
     let file_system = fs::FileSystem::host("");
     let path = FsPath::host(&filename);
     let mode = if truncate {
@@ -234,12 +280,11 @@ fn open_log_file(state: &mut DebugState, truncate: bool) {
                 "{LOG_OPEN_SEPARATOR}Logging to {filename} started on {}\r\n",
                 log_date_time()
             );
-            let _ = fs::write_at(&file_system, &file, file.cursor(), header.as_bytes());
-            let _ = fs::flush(&file_system, &file);
             state.log_file = Some(file);
+            write_log_bytes(state, header.as_bytes());
         }
-        Err(e) => {
-            log::warn!("Debug: failed to open {filename:?}: {e}");
+        Err(error) => {
+            log::warn!("compat.debug: failed to open {filename:?}: {error}");
             state.log_file = None;
             state.log_open_failed = true;
         }
@@ -259,15 +304,11 @@ fn write_log_file(services: &CompatServices, text: &str) {
     if state.log_file.is_none() && !state.log_open_failed {
         open_log_file(&mut state, false);
     }
-    if let Some(file) = state.log_file.as_mut() {
-        let file_system = fs::FileSystem::host("");
-        let mut bytes = Vec::with_capacity(text.len() + 4);
-        bytes.push(b' ');
-        bytes.extend_from_slice(text.as_bytes());
-        bytes.extend_from_slice(b"\r\n");
-        let _ = fs::append(&file_system, file, &bytes);
-        let _ = fs::flush(&file_system, file);
-    }
+    let mut bytes = Vec::with_capacity(text.len() + 4);
+    bytes.push(b' ');
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\r\n");
+    write_log_bytes(&mut state, &bytes);
 }
 
 /// Dispatch `text` to every registered logging handler. The handler list is
@@ -397,7 +438,7 @@ fn start_log_file(services: &CompatServices, clear: bool) {
         .rev()
         .cloned()
         .collect();
-    if let Some(file) = state.log_file.as_mut() {
+    if state.log_file.is_some() {
         let mut block = String::new();
         if !important.is_empty() {
             block.push_str(&important);
@@ -411,9 +452,7 @@ fn start_log_file(services: &CompatServices, clear: bool) {
             block.push_str("\r\n");
         }
         block.push_str("\r\n");
-        let file_system = fs::FileSystem::host("");
-        let _ = fs::append(&file_system, file, block.as_bytes());
-        let _ = fs::flush(&file_system, file);
+        write_log_bytes(&mut state, block.as_bytes());
     }
 }
 
