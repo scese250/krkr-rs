@@ -1705,6 +1705,30 @@ an allowlist exemption.
   render crate (§13) are reported as clean. Add the rule when the counters are
   gone, and not before: a rule that fires on a known, recorded defect would
   turn the gate red for it.
+* **The tree drops the result of about 110 file-system calls.** The shape is
+  `let _ = std::fs::remove_file(...)`, `let _ = std::fs::remove_dir_all(...)`
+  and `let _ = file.flush()`: the error is discarded, so a failure that is not
+  a missing path is invisible. The count is `grep -rn "let _ = std::fs::"
+  crates/ --include=*.rs | wc -l`: **110** sites of the `std::fs` shape, plus
+  one that drops a `flush()`, 111 in all. The crates carry them as `compat`
+  35, `tjs` 22, `android` 16, `engine` 13, `app` 12, `platform` 10,
+  `devtools` 2. Most are test fixtures cleaning up their temporary
+  directories. The runtime production sites are in the Android launcher's log
+  writer - `crates/android/src/log_file.rs:143` (the flush) and `:158` (the
+  rotation's oldest file), and `crates/android/src/state.rs:246`, `:251` and
+  `:257` (the temporary state files) - where a dropped failure loses a log
+  record or a rotation without a word; `crates/tjs/build.rs:295` and `:647`
+  drop two build-time cleanups. **Open question:** the rule that covers a
+  best-effort cleanup is that a missing path is success and every other
+  failure is reported, and the Android's log writer already has that shape for
+  its renames (`crates/android/src/log_file.rs`, `rotate`), so the tree has one
+  place that does it right and many that do not. The work is to give the
+  cleanup a named owner that says it once - the rule belongs in the
+  error-handling rules (`AGENTS.md` §4) and in
+  [`docs/rules/code_styles.md`](docs/rules/code_styles.md) §4, not in a hundred
+  call sites - and to decide deliberately what the test cleanups do: a test
+  that cannot remove its temporary directory has lost nothing the engine
+  needs, but the decision must be said once rather than implied by 110 sites.
 
 ## 16. Deferred design work
 
