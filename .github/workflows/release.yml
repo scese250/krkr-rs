@@ -300,20 +300,14 @@ jobs:
           bash ./crates/android/check-jni-libs.sh \
             android/app/build/outputs/apk/release/app-release.apk
 
-      # What the package is made of, measured, and whether the names the
-      # native code resolves are still in it.
+      # Whether the names the native code resolves are still in the package.
       #
-      # The measurement is the baseline: every entry, grouped the way the
-      # package is built, with the totals, so a later build can be compared
-      # with this one instead of guessed at. The check is the part that
-      # matters for a shrinker: the engine reads seven static fields off its
-      # Activity through JNI *by name*, and the game-activity glue resolves
-      # the native entry point *by name* as well. A shrinker that renames or
-      # drops one of them leaves a package that installs, launches and then
-      # dies on the device, with nothing in this log to show for it — so the
-      # names are read out of the package and checked here, where a device is
-      # not needed. The step also holds the package to a size budget, so a
-      # build that grows without a reason fails before it is published.
+      # The engine reads its static fields off its Activity through JNI *by
+      # name*, and the game-activity glue resolves the native entry point *by
+      # name* as well. A shrinker that renames or drops one of them leaves a
+      # package that installs, launches and then dies on the device, with
+      # nothing in this log to show for it — so the names are read out of the
+      # package and checked here, where a device is not needed.
       - name: Verify the APK surface
         run: bash ./scripts/apk_surface_check.sh
 
