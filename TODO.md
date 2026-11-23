@@ -938,28 +938,6 @@ native OS popup would be a deliberate divergence, and Linux has nothing to call
 
 ## 10. Native plugins
 
-* **The area-average port is written and held: three of its eighteen tests
-  fail.** The specification is at
-  `/tmp/pi-patches/spec-layerExAreaAverage/spec.md` (655 lines, no upstream
-  code) and the port is at `/tmp/pi-patches/hold/area-average/` (the module
-  and its test file). It is not wired into the plugin table, so nothing in
-  the tree depends on it. The three failures:
-  * the copy writes nothing: the destination stays transparent where the
-    source's green column should be. The kernel's own model
-    (`check_examples.py`) reproduces the specification's six worked
-    examples, so the fault is in the wiring between the member and the
-    kernel, not in the kernel.
-  * `Plugins.getList()` does not name the linked module. The port's
-    `getList` reports the script's original casing
-    (`crates/compat/src/plugins_native.rs`, `native_get_list`), and the
-    member does appear after the link, so either the registry does not
-    record a script-side link or the test's helper does not take that path.
-    Not established which.
-  * the dictionary literal at the first argument position (`%[]`) is a
-    syntax error there, while the same literal in a later position parses.
-    The port's parser and the upstream's argument order are the things to
-    compare.
-
 * **`Plugins.link` answers the outcome instead of `void`.** The reference's
   `Plugins.link` calls `TVPLoadPlugin(name)` and returns without setting a
   result (`reference/cpp/core/plugin/PluginImpl.cpp:300-311`), and
@@ -1215,12 +1193,7 @@ is therefore unreachable from a script until it is implemented.
 
 * **One upstream function.** Each member's whole behaviour is in one upstream
   function, with no new format and no fixture.
-  * `layerExAreaAverage`: `Layer.stretchCopyAA`.
   * `layerExRaster`: `Layer.copyRaster`.
-  * `layerExImage`: `Layer.colorize`, `Layer.modulate`, `Layer.noise` and
-    `Layer.generateWhiteNoise`.
-  * `layerExLongExposure`: `Layer.initExposure`, `Layer.snapExposure`,
-    `Layer.statExposure`, `Layer.copyExposure` and `Layer.termExposure`.
   * `layerExBTOA`: `Layer.copyRightBlueToLeftAlpha`,
     `Layer.copyBottomBlueToTopAlpha`, `Layer.fillAlpha`,
     `Layer.copyAlphaToProvince`, `Layer.clipAlphaRect`, `Layer.overwrapRect`,
@@ -1233,7 +1206,6 @@ is therefore unreachable from a script until it is implemented.
     members `Window.startSaveLayerImage`, `Window.stopSaveLayerImage` and
     `Window.cancelSaveLayerImage` (its `Layer.copyBlueToAlpha` is recorded
     above).
-  * `saveStruct`: `Scripts.toStructString`.
   * `scriptsEx`: `Scripts.stringFuzzySearch`.
   * `KAGParserEx`: `KAGParser.hasLabel`.
   * `layerExDraw`: the sixteen `Layer.EncoderValue*` constants and

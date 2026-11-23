@@ -238,10 +238,10 @@ fn the_copy_uses_the_ranges_the_argument_carries() {
     // writes 255 (`upstream Main.cpp:54`, `upstream Main.cpp:79-82`).
     env.run(
         "exposure.copyExposure(%[ \
-           min_r=>0, max_r=>510, \
-           min_g=>0, max_g=>0, \
-           min_b=>0, max_b=>510, \
-           min_a=>0, max_a=>0]);",
+           min_r:0, max_r:510, \
+           min_g:0, max_g:0, \
+           min_b:0, max_b:510, \
+           min_a:0, max_a:0]);",
     );
     assert_eq!(pixel(&env, "exposure", 0, 0), [255, 255, 0, 255]);
     assert_eq!(pixel(&env, "exposure", 1, 0), [0, 255, 255, 255]);
@@ -261,7 +261,7 @@ fn a_missing_member_reads_as_zero() {
     // Only the lower bound of the red channel is given, so the upper bound
     // reads as zero and the pair has no range to stretch: the whole image is
     // written as 255 (`upstream Main.cpp:131-145`).
-    env.run("exposure.copyExposure(%[min_r=>100]);");
+    env.run("exposure.copyExposure(%[min_r:100]);");
     assert_eq!(pixel(&env, "exposure", 0, 0), [255, 255, 255, 255]);
     assert_eq!(pixel(&env, "exposure", 3, 3), [255, 255, 255, 255]);
 }
@@ -314,7 +314,7 @@ fn a_member_that_is_not_an_integer_is_refused() {
     // (`upstream Main.cpp:131-145`).
     assert_error(
         &env,
-        "exposure.copyExposure(%[min_r=>%[]])",
+        "exposure.copyExposure(%[min_r:%[]])",
         "Cannot convert the variable type ((object) to int)",
     );
 }

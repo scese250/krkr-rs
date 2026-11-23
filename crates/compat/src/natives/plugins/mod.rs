@@ -18,6 +18,9 @@ pub mod get_about;
 pub mod get_sample;
 pub mod json;
 pub mod layer_ex;
+pub mod layer_ex_area_average;
+pub mod layer_ex_image;
+pub mod layer_ex_long_exposure;
 pub mod motion_player;
 pub mod psb_file;
 pub mod psd_file;
@@ -138,6 +141,24 @@ pub const BUILTIN_PLUGINS: &[BuiltinPluginDef] = &[
         aliases: &["layerExMovie.dll", "perspective.dll"],
         dependencies: &[],
         register: layer_ex::register,
+    },
+    BuiltinPluginDef {
+        name: "layerExAreaAverage.dll",
+        aliases: &[],
+        dependencies: &[],
+        register: layer_ex_area_average::register,
+    },
+    BuiltinPluginDef {
+        name: "layerExImage.dll",
+        aliases: &[],
+        dependencies: &[],
+        register: layer_ex_image::register,
+    },
+    BuiltinPluginDef {
+        name: "layerExLongExposure.dll",
+        aliases: &[],
+        dependencies: &[],
+        register: layer_ex_long_exposure::register,
     },
     BuiltinPluginDef {
         name: "menu.dll",

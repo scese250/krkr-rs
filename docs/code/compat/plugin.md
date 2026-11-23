@@ -64,6 +64,9 @@ trait impl.
 | `getSample.dll` | — | — | the `WaveSoundBuffer` sample members |
 | `json.dll` | — | — | the JSON members |
 | `KAGParserEx.dll` | `KAGParser.dll` | — | nothing of its own — `KAGParser` is a core native registered at startup |
+| `layerExAreaAverage.dll` | — | — | the `Layer.stretchCopyAA` member |
+| `layerExImage.dll` | — | — | the `Layer.colorize`, `Layer.modulate`, `Layer.noise` and `Layer.generateWhiteNoise` members |
+| `layerExLongExposure.dll` | — | — | the `Layer.initExposure`, `Layer.termExposure`, `Layer.snapExposure`, `Layer.statExposure` and `Layer.copyExposure` members |
 | `layerExDraw.dll` | `layerExMovie.dll`, `perspective.dll` | — | the layer drawing, movie and perspective members |
 | `menu.dll` | — | — | the `MenuItem` surface (registered by the core `MenuItem` module) |
 | `motionplayer.dll` | — | — | the `Motion` / `Player` classes |

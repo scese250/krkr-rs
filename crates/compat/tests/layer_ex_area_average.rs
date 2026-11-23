@@ -122,7 +122,7 @@ fn the_link_resolves_to_the_builtin() {
         "var linked = Plugins.getList(); \
          var found = 0; \
          for (var i = 0; i < linked.length; i++) { \
-             if (linked[i] === 'layerExAreaAverage.dll') { found = 1; } \
+             if (linked[i] === 'layerexareaaverage.dll') { found = 1; } \
          }",
     );
     assert_eq!(
@@ -330,7 +330,10 @@ fn the_destination_rectangle_is_clipped_to_the_destination_image() {
 /// right edge, so the source width becomes 2 and the destination width
 /// becomes 2 as well. The covered region of the destination's second column
 /// reaches the source image's right edge, where the last column is never
-/// sampled, so that column is left as it was.
+/// sampled, so that column is left as it was. The same holds for the last
+/// row: the covered region of the destination's fourth row reaches the
+/// source image's bottom edge, where the last row is never sampled, so that
+/// row is left as it was too.
 #[test]
 fn the_source_rectangle_is_clipped_to_the_source_image() {
     let _lock = vm_lock();
@@ -342,7 +345,7 @@ fn the_source_rectangle_is_clipped_to_the_source_image() {
     );
     let dst = layer_id(&env, "dst");
     env.run("dst.stretchCopyAA(0, 0, 4, 4, src, 2, 0, 4, 4);");
-    for y in 0..4 {
+    for y in 0..3 {
         assert_eq!(
             pixel(&env, dst, 0, y),
             [0, 255, 0, 255],
@@ -352,6 +355,15 @@ fn the_source_rectangle_is_clipped_to_the_source_image() {
             pixel(&env, dst, 1, y),
             [255, 255, 255, 0],
             "the second column covers no source pixel and keeps its content"
+        );
+    }
+    // The last row covers no source row: the source image's last row is
+    // never sampled, so the destination's last row keeps its content.
+    for x in 0..4 {
+        assert_eq!(
+            pixel(&env, dst, x, 3),
+            [255, 255, 255, 0],
+            "the last row covers no source pixel and keeps its content"
         );
     }
 }
@@ -552,12 +564,12 @@ fn the_numbers_are_read_with_the_integer_conversion() {
     let _lock = vm_lock();
     let env = Env::new();
     two_square_layers(&env);
-    let message = env.error("dst.stretchCopyAA({}, 0, 2, 2, src, 0, 0, 2, 2);");
+    let message = env.error("dst.stretchCopyAA(%[], 0, 2, 2, src, 0, 0, 2, 2);");
     assert!(
         message.contains("dleft"),
         "the error names the argument: {message}"
     );
-    let message = env.error("dst.stretchCopyAA(0, 0, 2, 2, src, 0, 0, %[], 2);");
+    let message = env.error("dst.stretchCopyAA(0, 0, 2, 2, src, 0, 0, 2, %[]);");
     assert!(
         message.contains("sheight"),
         "the error names the argument: {message}"

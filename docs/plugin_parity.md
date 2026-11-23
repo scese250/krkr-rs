@@ -1,6 +1,6 @@
 # Plugin surface parity
 
-> **Generated** by `krkr-gate plugin-parity` on 2026-11-20 — do not edit by hand.
+> **Generated** by `krkr-gate plugin-parity` on 2026-11-24 — do not edit by hand.
 
 Machine-diff of the reference KiriKiri plugin surface (`reference/cpp/plugins/**`) against the plugin classes the Rust engine registers (`crates/compat/src/natives/plugins/**`). A *missing* member exists in the reference but is not registered by Rust. An *extra* is a genuine plugin-surface addition: a member registered by a plugin file that the reference class does not have. Core natives (`natives/*.rs`) and members inherited from a shared registration table are counted separately.
 
@@ -23,7 +23,7 @@ The checker exits non-zero when a missing member is **not** listed in `scripts/a
 | reference members | 974 |
 | matched | 974 |
 | **missing** | **0** |
-| extra (genuine plugin additions) | 2 |
+| extra (genuine plugin additions) | 23 |
 | core members (not plugin extras) | 336 |
 | coverage | **100.0%** |
 
@@ -69,7 +69,7 @@ Class and global members the reference installs after construction with ``PropSe
 | `GdiPlus.RectF` | 18 | 19 | 18 | 0 | 0 | 100.0% |
 | `ImageFunction` | 0 | 12 | 0 | 0 | 0 | n/a |
 | `Key` | 0 | 4 | 0 | 0 | 0 | n/a |
-| `Layer` | 48 | 48 | 48 | 0 | 0 | 100.0% |
+| `Layer` | 48 | 68 | 48 | 0 | 20 | 100.0% |
 | `MIDISoundBuffer` | 0 | 1 | 0 | 0 | 0 | n/a |
 | `MenuItem` | 15 | 36 | 15 | 0 | 0 | 100.0% |
 | `Motion` | 23 | 23 | 23 | 0 | 0 | 100.0% |
@@ -90,7 +90,7 @@ Class and global members the reference installs after construction with ``PropSe
 | `Pad` | 1 | 25 | 1 | 0 | 0 | 100.0% |
 | `Player` | 141 | 141 | 141 | 0 | 0 | 100.0% |
 | `Rect` | 0 | 25 | 0 | 0 | 0 | n/a |
-| `Scripts` | 24 | 33 | 24 | 0 | 0 | 100.0% |
+| `Scripts` | 24 | 34 | 24 | 0 | 1 | 100.0% |
 | `Steam` | 23 | 23 | 23 | 0 | 0 | 100.0% |
 | `Storages` | 32 | 45 | 32 | 0 | 0 | 100.0% |
 | `System` | 16 | 64 | 16 | 0 | 0 | 100.0% |
@@ -122,6 +122,14 @@ _None for tracked classes._
 ## Extra members by class
 
 Genuine plugin-surface additions: members registered in a plugin file that the reference class does not have. Core natives and members inherited from a shared registration table (``EmotePlayer`` gets ``Player``'s table) are excluded.
+
+### `Layer` — 20 extra
+
+`clipAlphaRect`, `colorize`, `copyAlphaToProvince`, `copyBottomBlueToTopAlpha`, `copyExposure`, `copyRightBlueToLeftAlpha`, `fillAlpha`, `fillByProvince`, `fillToProvince`, `generateWhiteNoise`, `initExposure`, `modulate`, `noise`, `overwrapRect`, `shrinkCopy`, `shrinkCopyFast`, `snapExposure`, `statExposure`, `stretchCopyAA`, `termExposure`
+
+### `Scripts` — 1 extra
+
+`toStructString`
 
 ### `Window` — 2 extra
 

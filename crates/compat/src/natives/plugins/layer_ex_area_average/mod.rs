@@ -158,7 +158,7 @@ extern "C" fn layer_stretch_copy_aa(
             "Layer.stretchCopyAA requires 9 arguments",
         );
     }
-    match stretch_copy_aa(&ctx, resolved.engine(), objthis, &a) {
+    match stretch_copy_aa(&ctx, resolved.engine(), objthis, a) {
         Ok(()) => {
             crate::native_util::set_void(out);
             0

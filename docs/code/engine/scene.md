@@ -105,7 +105,7 @@ bitmaps and fonts are released with them.
 |---|---|
 | creation | `add_layer`, `add_detached_layer`, `attach_layer` |
 | lookup | `layer`, `layer_mut`, `layer_mut_untracked` (crate-private), `is_primary_layer` |
-| geometry | `set_layer_image_size`, `internal_set_image_size`, `layer_size_changed`, `ensure_layer_image`, `clipping_rect`, `absolute_offset`, `main_image_pitch` |
+| geometry | `set_layer_image_size`, `internal_set_image_size`, `layer_size_changed`, `ensure_layer_image`, `allocate_layer_image`, `deallocate_layer_image`, `clipping_rect`, `absolute_offset`, `main_image_pitch` |
 | ordering | `assign_front_order`, `sibling_position`, `order_index`, `absolute_order_index`, `set_absolute_order_mode`, `set_absolute_order_index`, `set_order_index`, `renumber_siblings`, `ordered_children`, `window_layer_order`, `layer_move_to_front` |
 | lifetime | `remove_layer` (detach), `destroy_layer` (destroy the subtree), `invalidate_layer` |
 | focus | `set_focus`, `clear_focus`, `focused_in`, `set_domain_focus`, `window_input_root`, `next_focusable`, `prev_focusable`, `node_focusable` |

@@ -232,7 +232,13 @@ fn the_members_exist_once_the_plugin_is_linked() {
     );
 
     fixture.env.link_plugin(DLL);
-    fixture.run("layer.colorize(0, 255, 1.0);");
+    // A layer takes the class's members when it is made, so the member is
+    // called on a layer made after the link.
+    fixture.run(
+        "var linked = new Layer(w, null); \
+         linked.setImageSize(4, 4); \
+         linked.colorize(0, 255, 1.0);",
+    );
 }
 
 /// `colorize` takes the requested hue and the requested saturation and
@@ -335,7 +341,7 @@ fn the_members_leave_the_alpha_byte_alone() {
     let fixture = Fixture::new(true);
     // An opaque pixel and a transparent one, with the same colour. The
     // fill writes the alpha, while `setMainPixel` writes the colour alone.
-    fixture.run("layer.fillRect(0, 0, 1, 1, 0x0000ff);");
+    fixture.run("layer.fillRect(0, 0, 1, 1, 0xFF0000ff);");
     fixture.run("layer.setMainPixel(1, 0, 0x0000ff);");
     fixture.run("layer.colorize(0, 255, 1.0);");
     assert_eq!(
@@ -392,7 +398,7 @@ fn the_members_work_on_the_clip_rectangle_alone() {
 fn noise_moves_the_colour_channels_and_keeps_the_alpha() {
     let _lock = vm_lock();
     let fixture = Fixture::new(true);
-    fixture.run("layer.fillRect(0, 0, 1, 1, 0x808080);");
+    fixture.run("layer.fillRect(0, 0, 1, 1, 0xFF808080);");
     fixture.run("layer.noise(64);");
     let pixel = fixture.pixel(0, 0);
     assert_eq!(pixel[3], 255, "the alpha byte is left alone");
@@ -507,7 +513,7 @@ fn the_noise_is_reproducible() {
 fn generate_white_noise_gives_every_pixel_the_same_grey() {
     let _lock = vm_lock();
     let fixture = Fixture::new(true);
-    fixture.run("layer.fillRect(0, 0, 1, 1, 0x0000ff);");
+    fixture.run("layer.fillRect(0, 0, 1, 1, 0xFF0000ff);");
     fixture.run("layer.generateWhiteNoise();");
     let pixel = fixture.pixel(0, 0);
     assert_eq!(pixel[0], pixel[1], "the red and the green are the same");
@@ -570,7 +576,8 @@ fn the_members_refuse_a_call_with_too_few_arguments() {
 fn a_layer_without_a_main_image_reports_the_missing_image() {
     let _lock = vm_lock();
     let fixture = Fixture::new(true);
-    fixture.run("var empty = new Layer(w, null);");
+    // The binder type holds no image, so the layer has no pixels to write.
+    fixture.run("var empty = new Layer(w, null); empty.type = ltBinder;");
     for expression in [
         "empty.colorize(0, 255, 1.0)",
         "empty.modulate(0, 0, 0)",

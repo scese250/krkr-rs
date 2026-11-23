@@ -303,8 +303,8 @@ fn two_layers_with_children(env: &Env) {
          var a = new Layer(w, null); a.setSize(2, 2); a.name = 'src'; a.hasImage = false; \
          var ac = new Layer(w, a); ac.setSize(2, 2); ac.setImageSize(2, 2); \
          ac.fillRect(0, 0, 2, 2, 0xff0000ff); ac.visible = true; \
-         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; b.hasImage = false; \
-         b.type = ltOpaque; \
+         var b = new Layer(w, null); b.setSize(2, 2); b.visible = true; b.name = 'dest'; \
+         b.type = ltOpaque; b.hasImage = false; \
          var bc = new Layer(w, b); bc.setSize(2, 2); bc.setImageSize(2, 2); \
          bc.fillRect(0, 0, 2, 2, 0xffff0000); bc.visible = true; \
          b.beginTransition('crossfade', true, a, %[time: 100]);",

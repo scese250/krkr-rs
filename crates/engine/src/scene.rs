@@ -2288,6 +2288,55 @@ impl Scene {
         }
     }
 
+    /// Give the layer a main image of its rectangle's size when it has none.
+    ///
+    /// The image is filled with the layer's neutral colour, the image
+    /// offset is cleared and the clip rectangle is reset. A layer that
+    /// already holds an image keeps it.
+    ///
+    /// Returns whether the layer holds an image afterwards.
+    pub fn allocate_layer_image(&mut self, layer_id: u32) -> bool {
+        let Some(layer) = self.layer(layer_id) else {
+            return false;
+        };
+        if layer.bitmap.is_some() {
+            return true;
+        }
+        let (w, h) = (layer.rect.w, layer.rect.h);
+        let fill = argb_to_rgba(layer.neutral_color);
+        if !self.allocate_layer_bitmap(layer_id, w, h, fill) {
+            return false;
+        }
+        self.sync_layer_image(layer_id);
+        true
+    }
+
+    /// Drop the main image, so the layer carries no pixels.
+    ///
+    /// The container layer types — the binder, the effect and the filter
+    /// types — hold no image at all, and a layer whose image is gone reports
+    /// an image size of zero and no clip rectangle. The province plane goes
+    /// with it, because a plane without an image has nothing to mask.
+    ///
+    /// Returns whether the layer held an image to drop.
+    pub fn deallocate_layer_image(&mut self, layer_id: u32) -> bool {
+        let Some(layer) = self.layer_mut(layer_id) else {
+            return false;
+        };
+        let Some(bitmap_id) = layer.bitmap.take() else {
+            return false;
+        };
+        layer.image_left = 0;
+        layer.image_top = 0;
+        layer.image_width = 0;
+        layer.image_height = 0;
+        layer.clip = None;
+        layer.image_modified = true;
+        self.deallocate_province_image(layer_id);
+        self.remove_bitmap(bitmap_id);
+        true
+    }
+
     /// 0 when the plane is absent or the coordinate is outside it.
     ///
     /// A plane shorter than the size it declares reads as 0 and reports the

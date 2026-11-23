@@ -418,15 +418,53 @@ fn layer_type_reads_back_the_number_the_script_wrote() {
     }
 }
 
+/// Reference: `SetType` acts only when the type actually changes
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1689`). The container
+/// types deallocate the main image (`:1692-1698`) and every other type
+/// allocates one (`:1704-1705`), so writing the type a layer already holds
+/// must leave an image the script dropped dropped.
+#[test]
+fn writing_the_type_a_layer_already_holds_changes_nothing() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    layer_with_image(&env, 2, 2);
+    env.run("l.type = ltOpaque; l.hasImage = false;");
+    assert_eq!(
+        env.eval("l.hasImage").expect("hasImage read"),
+        TjsValue::Integer(0),
+        "the dropped image stays dropped"
+    );
+    // The same number again is not a change: the image stays away.
+    env.run("l.type = ltOpaque;");
+    assert_eq!(
+        env.eval("l.hasImage").expect("hasImage read"),
+        TjsValue::Integer(0),
+        "writing the same type does not give the image back"
+    );
+    // A different type does change it, and allocates the image.
+    env.run("l.type = ltAlpha;");
+    assert_eq!(
+        env.eval("l.hasImage").expect("hasImage read"),
+        TjsValue::Integer(1),
+        "a different type gives the layer its image"
+    );
+}
+
 /// Reference: the automatic operation mode follows the source layer's
 /// display type (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1621-1683`,
-/// `reference/krkr2/cpp/core/visual/LayerIntf.cpp:8963-8991`): the binder,
-/// the effect and the filter types display as the binder, whose operation
-/// mode is the opaque one. The opaque mode copies the source as an opaque
-/// image (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:174-178`),
-/// so the destination's alpha becomes opaque; the alpha mode reads the
+/// `reference/krkr2/cpp/core/visual/LayerIntf.cpp:8963-8991`). The opaque
+/// mode copies the source as an opaque image
+/// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:174-178`), so the
+/// destination's alpha becomes opaque; the alpha mode reads the
 /// destination's alpha instead
 /// (`reference/krkr2/cpp/core/visual/gl/blend_variation.h:109-149`).
+///
+/// The binder, the effect and the filter types display as the binder, whose
+/// operation mode is the opaque one, but they hold no image at all
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:1692-1698`, `:1738-1752`),
+/// so the source of such an operation has no pixels to copy and the call
+/// raises instead
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:8958-8971`).
 #[test]
 fn the_automatic_mode_follows_the_source_layers_display_type() {
     let _lock = vm_lock();
@@ -445,13 +483,24 @@ fn the_automatic_mode_follows_the_source_layers_display_type() {
     env.run("src.type = ltAlpha;");
     env.run("dst.operateRect(0, 0, src, 0, 0, 1, 1, omAuto);");
     assert_eq!(env.eval_int("dst.getMaskPixel(0, 0)"), 160);
-    // The effect type displays as the binder, whose mode is the opaque one:
-    // the source is copied as an opaque image and the destination's alpha
-    // becomes opaque.
-    env.run("src.type = ltEffect;");
+    // The opaque type's mode copies the source as an opaque image, so the
+    // destination's alpha becomes opaque.
+    env.run("src.type = ltOpaque;");
     env.run("dst.fillRect(0, 0, 1, 1, 0x400000ff);");
     env.run("dst.operateRect(0, 0, src, 0, 0, 1, 1, omAuto);");
     assert_eq!(env.eval_int("dst.getMaskPixel(0, 0)"), 255);
+    // The container types hold no image, so the source has no pixels to
+    // copy and the operation raises.
+    for kind in ["ltBinder", "ltEffect", "ltFilter"] {
+        env.run(&format!("src.type = {kind};"));
+        let error = env
+            .try_run("dst.operateRect(0, 0, src, 0, 0, 1, 1, omAuto);")
+            .expect_err("the operation of an image-less source raises");
+        assert!(
+            error.contains("no main image"),
+            "the {kind} source has no image to copy: {error}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

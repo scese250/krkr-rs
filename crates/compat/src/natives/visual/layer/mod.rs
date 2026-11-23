@@ -2152,8 +2152,9 @@ extern "C" fn layer_type_get(
     0
 }
 
-/// The `Layer.type` setter: the number is stored on the layer, and a type
-/// that names a blend replaces the layer's blend.
+/// The `Layer.type` setter: the number is stored on the layer, the type
+/// gives the layer its blend and its neutral colour, and the container types
+/// take the layer's image away while every other type gives it one.
 extern "C" fn layer_type_set(
     engine: *mut c_void,
     instance: *mut c_void,
@@ -2164,17 +2165,46 @@ extern "C" fn layer_type_set(
     // SAFETY: the trampoline passes a valid value slot.
     let value = unsafe { &*value };
     let number = value_as_i64(value);
-    let result = with_layer_write(engine, instance, value, |layer, value| {
-        let Some(new_blend) = blend::from_native(value_as_i64(value)) else {
-            // A type that names no blend leaves the layer's blend alone.
-            return false;
-        };
-        if layer.blend == new_blend {
-            return false;
+    let result = (|| {
+        // SAFETY: `instance` is the live `LayerInst` payload the VM allocated for this script object; no `&mut` to it is live in `layer_type_set`.
+        let inst = unsafe { &*(instance as *const LayerInst) };
+        let id = inst
+            .id
+            .ok_or_else(|| "Layer: this layer is not constructed".to_string())?;
+        let (_resolved, ctx) = bound(engine)?;
+        let scene = scene_mut(&ctx)?;
+        // A type the layer already holds changes nothing, so an image the
+        // script dropped stays dropped.
+        if inst.type_value == number {
+            return Ok(());
         }
-        layer.blend = new_blend;
-        true
-    });
+        let Some(facts) = blend::type_facts(number) else {
+            // A type that names no type at all leaves the layer alone.
+            return Ok(());
+        };
+        match scene.update_layer(id, |layer| {
+            if layer.blend == facts.blend && layer.neutral_color == facts.neutral_color {
+                return false;
+            }
+            layer.blend = facts.blend;
+            layer.neutral_color = facts.neutral_color;
+            true
+        }) {
+            Some(_) => {}
+            None => return Err("Layer: layer no longer exists".to_string()),
+        }
+        // The container types hold no image; every other type holds one of
+        // the layer's rectangle's size.
+        let held = if facts.carries_image {
+            scene.allocate_layer_image(id)
+        } else {
+            scene.deallocate_layer_image(id)
+        };
+        if !held && facts.carries_image {
+            return Err("Layer: could not give the layer its image".to_string());
+        }
+        Ok(())
+    })();
     if result.is_ok() {
         // SAFETY: the trampoline passes the live `LayerInst` payload the VM allocated for this script object.
         let inst = unsafe { &mut *(instance as *mut LayerInst) };
