@@ -27,8 +27,9 @@ use api::media::DecodedImage;
 use render::scene::{RenderContent, RenderNode};
 use render::{
     RenderPipeline, RenderState, RenderTarget, RenderTargetDesc, Texture, TextureDesc,
-    copy_render_target_to_texture, create_render_target, create_texture, destroy_render_target,
-    drop_texture, read_render_target, render_to_target, upload_texture,
+    copy_render_target_to_render_target, copy_render_target_to_texture, create_render_target,
+    create_texture, destroy_render_target, drop_texture, read_render_target, render_to_target,
+    upload_texture,
 };
 
 use crate::hasher::{Map, Set, map, set};
@@ -1126,6 +1127,17 @@ pub enum DeviceRequest {
     Composite(u32),
     /// Release the surface the layer's composite was drawn into.
     ReleaseSurface(u32),
+    /// Copy the pose of the source bitmap into the destination bitmap.
+    ///
+    /// The pose lives on the backend, so the copy stays there: the pixels
+    /// never reach the host. The two bitmaps are the source's and the
+    /// destination's own.
+    CopyPose {
+        /// The bitmap whose pose is copied.
+        source: u32,
+        /// The bitmap the pose is copied into.
+        dest: u32,
+    },
 }
 
 /// The offscreen surface a layer's draw list is drawn into.
@@ -1141,6 +1153,7 @@ pub enum DeviceRequest {
 /// pose's region outgrows it: the pose animates, so the region changes
 /// every frame, and a surface that followed the region would be created and
 /// destroyed every frame.
+#[derive(Clone)]
 struct PoseSurface {
     /// The surface the pose is drawn into.
     target: RenderTarget,
@@ -4870,6 +4883,50 @@ impl Scene {
         }
     }
 
+    /// Whether the bitmap shows a pose on the backend.
+    pub fn has_pose(&self, bitmap_id: u32) -> bool {
+        self.pose_surfaces.contains_key(&bitmap_id)
+    }
+
+    /// Copies the pose of `source` into the pose of `dest`, on the device.
+    ///
+    /// The pose lives on the backend, so the copy stays there: the pixels
+    /// never reach the host. The destination's pose surface is created when
+    /// it has none, and the source's pose is copied into it, so the
+    /// destination shows the same picture the source shows.
+    ///
+    /// Returns whether the destination shows the source's pose: a source
+    /// with no pose leaves the destination with none, and a copy that the
+    /// backend refuses leaves the destination's own pose alone.
+    pub fn copy_pose_on_device(
+        &mut self,
+        pipeline: &RenderPipeline,
+        state: &mut RenderState,
+        source: u32,
+        dest: u32,
+    ) -> Result<bool, RenderError> {
+        let Some(source_surface) = self.pose_surfaces.get(&source).cloned() else {
+            // The source shows no pose: the destination shows none either.
+            self.drop_pose_surface(pipeline, state, dest);
+            return Ok(true);
+        };
+        let (width, height) = (source_surface.width, source_surface.height);
+        // The destination's surface is the source's size: the copy fills it
+        // whole, and a surface of another size would hold the pose at the
+        // wrong scale.
+        let (target, texture) = self.pose_surface(pipeline, state, dest, width, height)?;
+        // The copy: the source's surface into the destination's surface, and
+        // that surface into the texture the destination's render tree samples.
+        copy_render_target_to_render_target(pipeline, state, &source_surface.target, &target)?;
+        copy_render_target_to_texture(pipeline, state, &target, &texture)?;
+        self.mark_surface_drawn(dest);
+        // The pose is new: the pixels a reader holds are the pose's only
+        // until it is drawn again.
+        let revision = self.pose_revisions.entry(dest).or_insert(0);
+        *revision = revision.wrapping_add(1);
+        Ok(true)
+    }
+
     /// The texture the layer's pose is sampled from, and the rectangle it
     /// covers in the layer's own pixels.
     ///
@@ -4889,6 +4946,15 @@ impl Scene {
     /// The pose lives on the backend, so the pixels are read back when a
     /// script asks for them. A layer that shows no pose reads nothing.
     pub fn read_pose_pixels(
+        &mut self,
+        pipeline: &RenderPipeline,
+        state: &mut RenderState,
+        bitmap_id: u32,
+    ) -> Result<Option<Vec<u8>>, RenderError> {
+        self.read_pose_pixels_inner(pipeline, state, bitmap_id)
+    }
+
+    fn read_pose_pixels_inner(
         &mut self,
         pipeline: &RenderPipeline,
         state: &mut RenderState,
@@ -4919,6 +4985,14 @@ impl Scene {
     /// pixels, so a second read brings the same pixels and the pose is not
     /// composited twice.
     pub fn compose_pose_pixels(
+        &mut self,
+        bitmap_id: u32,
+        pose: &[u8],
+    ) -> Result<Option<Vec<u8>>, RenderError> {
+        self.compose_pose_pixels_inner(bitmap_id, pose)
+    }
+
+    fn compose_pose_pixels_inner(
         &mut self,
         bitmap_id: u32,
         pose: &[u8],
@@ -5005,6 +5079,18 @@ impl Scene {
     /// The engine takes the requests and runs them with its device.
     pub fn take_device_requests(&mut self) -> Vec<DeviceRequest> {
         std::mem::take(&mut self.device_requests)
+    }
+
+    /// Asks the device to copy the source bitmap's pose into the
+    /// destination bitmap's.
+    ///
+    /// The pose lives on the backend, so the copy is the device's work: the
+    /// scene holds the request and the engine runs it with the device. The
+    /// request is served before the frame is projected, so the destination's
+    /// render tree samples the pose the copy put there.
+    pub fn request_pose_copy(&mut self, source: u32, dest: u32) {
+        self.device_requests
+            .push(DeviceRequest::CopyPose { source, dest });
     }
 
     /// The bitmap a layer's subtree composites into.

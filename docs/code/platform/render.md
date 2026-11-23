@@ -135,6 +135,10 @@ pub fn render_to_target(p: &RenderPipeline, state: &mut RenderState, target: &Re
                          scene: &RenderScene) -> Result<(), RenderError>;
 pub fn read_render_target(p: &RenderPipeline, state: &RenderState, target: &RenderTarget,
                            region: PixelRegion, out: &mut [u8]) -> Result<(), RenderError>;
+pub fn copy_render_target_to_render_target(p: &RenderPipeline, state: &mut RenderState,
+                                             source: &RenderTarget,
+                                             destination: &RenderTarget)
+    -> Result<(), RenderError>;
 pub fn render(p: &RenderPipeline, surface: &Surface, state: &mut RenderState,
               scene: &RenderScene) -> Result<Presentation, RenderError>;
 pub fn recover_surface(p: &RenderPipeline, surface: &mut Surface, state: &mut RenderState)

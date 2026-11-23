@@ -691,6 +691,34 @@ impl VulkanPipeline {
             .read_render_target(&self.memory_properties, target, region, out)
     }
 
+    /// Copies the pixels of one offscreen `target` into another.
+    ///
+    /// The copy stays on the device: the pixels never reach the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::InvalidArgument`] when the targets have
+    /// different formats, [`RenderError::Framebuffer`] when a target was
+    /// never rendered into, and [`RenderError::InvalidArgument`] for a
+    /// mismatched state.
+    pub(crate) fn copy_render_target_to_render_target(
+        &self,
+        state: &mut RenderState,
+        source: &RenderTarget,
+        destination: &RenderTarget,
+    ) -> Result<(), RenderError> {
+        let StateKind::Vulkan(vstate) = &mut state.kind else {
+            return Err(RenderError::InvalidArgument {
+                message: "the Vulkan backend received a null render state".to_owned(),
+            });
+        };
+        vstate.device_mut().copy_render_target_to_render_target(
+            &self.memory_properties,
+            source,
+            destination,
+        )
+    }
+
     /// Copies the pixels of an offscreen `target` into a `texture`.
     ///
     /// The copy stays on the device: the pixels never reach the host. The
@@ -1749,6 +1777,79 @@ impl VulkanDevice {
             fence: &self.offscreen_fence,
         };
         target::read(&submit, memory_properties, gpu, &mut readback, region, out)
+    }
+
+    /// Copies the pixels of one offscreen `target` into another.
+    ///
+    /// The copy stays on the device: the pixels never reach the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::InvalidArgument`] when the targets have
+    /// different formats, and [`RenderError::Framebuffer`] when a target was
+    /// never rendered into.
+    pub(crate) fn copy_render_target_to_render_target(
+        &mut self,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        source: &RenderTarget,
+        destination: &RenderTarget,
+    ) -> Result<(), RenderError> {
+        let submit = target::OffscreenSubmit {
+            device: &self.device,
+            queue: self.graphics_queue,
+            command_pool: self.offscreen_pool,
+            command_buffer: self.offscreen_command,
+            fence: &self.offscreen_fence,
+        };
+        // The destination's target is created when it has none: a target that
+        // was never rendered into holds no device resource, and the copy needs
+        // one to write into.
+        let destination_key = destination.key();
+        let destination_desc = *destination.desc();
+        if !self.render_targets.contains_key(&destination_key) {
+            let format = destination_desc.format;
+            if let hashbrown::hash_map::Entry::Vacant(entry) = self.offscreen.entry(format) {
+                entry.insert(target::OffscreenPass::create(
+                    &self.device,
+                    format,
+                    &self.resources,
+                )?);
+            }
+            let pass = self
+                .offscreen
+                .get(&format)
+                .ok_or_else(|| RenderError::Framebuffer {
+                    message: "offscreen pipeline state disappeared".to_owned(),
+                })?;
+            self.render_targets.insert(
+                destination_key,
+                target::VulkanRenderTarget::create(
+                    &self.device,
+                    memory_properties,
+                    pass,
+                    destination_desc,
+                )?,
+            );
+        }
+        // The two targets are taken out of the map one at a time: the map
+        // holds both, and the copy borrows each of them in turn. Their keys
+        // are the handles' own, so they go back where they came from.
+        let source_key = source.key();
+        let Some(mut source) = self.render_targets.remove(&source_key) else {
+            return Err(RenderError::Framebuffer {
+                message: "render target has not been rendered yet".to_owned(),
+            });
+        };
+        let Some(mut destination) = self.render_targets.remove(&destination_key) else {
+            self.render_targets.insert(source_key, source);
+            return Err(RenderError::Framebuffer {
+                message: "render target has not been rendered yet".to_owned(),
+            });
+        };
+        let result = target::copy_target_to_target(&submit, &mut source, &mut destination);
+        self.render_targets.insert(source_key, source);
+        self.render_targets.insert(destination_key, destination);
+        result
     }
 
     /// Copies the pixels of an offscreen `target` into a `texture`.

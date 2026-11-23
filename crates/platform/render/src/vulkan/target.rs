@@ -1064,6 +1064,115 @@ fn allocate_sampled_set(
 ///
 /// Returns [`RenderError::InvalidArgument`] when the texture and the
 /// target have different formats.
+pub(crate) fn copy_target_to_target(
+    submit: &OffscreenSubmit<'_>,
+    source: &mut VulkanRenderTarget,
+    destination: &mut VulkanRenderTarget,
+) -> Result<(), RenderError> {
+    let OffscreenSubmit { device, .. } = *submit;
+    if source.desc.format != destination.desc.format {
+        return Err(RenderError::InvalidArgument {
+            message: "the render targets have different formats".to_owned(),
+        });
+    }
+    // The copy fills the destination's own extent: the part of the source
+    // the destination cannot hold is left out.
+    let extent = vk::Extent3D {
+        width: source.desc.width.min(destination.desc.width),
+        height: source.desc.height.min(destination.desc.height),
+        depth: 1,
+    };
+    record_and_submit(submit, |command_buffer| {
+        // The source's image becomes a transfer source.
+        barrier_color(
+            device,
+            command_buffer,
+            source.image,
+            &Barrier {
+                old_layout: source.layout,
+                new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                src_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                dst_access: vk::AccessFlags::TRANSFER_READ,
+                src_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                dst_stage: vk::PipelineStageFlags::TRANSFER,
+            },
+        );
+        // The destination's image becomes a transfer destination.
+        barrier_color(
+            device,
+            command_buffer,
+            destination.image,
+            &Barrier {
+                old_layout: destination.layout,
+                new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                src_access: match destination.layout {
+                    vk::ImageLayout::UNDEFINED => vk::AccessFlags::empty(),
+                    _ => vk::AccessFlags::SHADER_READ,
+                },
+                dst_access: vk::AccessFlags::TRANSFER_WRITE,
+                src_stage: match destination.layout {
+                    vk::ImageLayout::UNDEFINED => vk::PipelineStageFlags::TOP_OF_PIPE,
+                    _ => vk::PipelineStageFlags::FRAGMENT_SHADER,
+                },
+                dst_stage: vk::PipelineStageFlags::TRANSFER,
+            },
+        );
+        let subresource = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0)
+            .base_array_layer(0)
+            .layer_count(1);
+        let copy = vk::ImageCopy::default()
+            .src_subresource(subresource)
+            .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .dst_subresource(subresource)
+            .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .extent(extent);
+        // SAFETY: the command buffer is recording and both handles are live.
+        unsafe {
+            device.cmd_copy_image(
+                command_buffer,
+                source.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                destination.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+        }
+        // The destination's image becomes a sampled image again.
+        barrier_color(
+            device,
+            command_buffer,
+            destination.image,
+            &Barrier {
+                old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                src_access: vk::AccessFlags::TRANSFER_WRITE,
+                dst_access: vk::AccessFlags::SHADER_READ,
+                src_stage: vk::PipelineStageFlags::TRANSFER,
+                dst_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+            },
+        );
+        destination.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        // The source's image is a render target again.
+        barrier_color(
+            device,
+            command_buffer,
+            source.image,
+            &Barrier {
+                old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                src_access: vk::AccessFlags::TRANSFER_READ,
+                dst_access: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                src_stage: vk::PipelineStageFlags::TRANSFER,
+                dst_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            },
+        );
+        source.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        Ok(())
+    })
+}
+
 pub(crate) fn copy_to_texture(
     submit: &OffscreenSubmit<'_>,
     target: &mut VulkanRenderTarget,

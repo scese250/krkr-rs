@@ -924,7 +924,23 @@ extern "C" fn layer_set_image_size(
 pub(super) fn resolved_bitmap_pixels(
     scene: &mut Scene,
     bitmap: u32,
-    operation: &str,
+    operation: &'static str,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    resolved_bitmap_pixels_with_pose(scene, bitmap, operation, true)
+}
+
+/// The pixels of a scene bitmap, with or without the pose the layer shows.
+///
+/// The pose the layer shows lives on the backend. A caller that reads the
+/// picture a script sees asks for the pose: the pixels are read back and the
+/// pose is composited over the image. A caller that copies the image alone
+/// asks for no pose: the image's own pixels are the answer, and the pose is
+/// copied on the device by the caller that owns the copy.
+pub(super) fn resolved_bitmap_pixels_with_pose(
+    scene: &mut Scene,
+    bitmap: u32,
+    operation: &'static str,
+    with_pose: bool,
 ) -> Result<(u32, u32, Vec<u8>), String> {
     // The decode has not landed yet: wait for it on the mutable scene borrow
     // the caller already holds.
@@ -948,15 +964,22 @@ pub(super) fn resolved_bitmap_pixels(
     let (width, height) = (state.width, state.height);
     // The pose the layer shows lives on the backend, so the pixels are read
     // back when a script asks for them.
-    let pixels = match scene.read_pixels(bitmap) {
-        Ok(Some(pixels)) => pixels,
-        Ok(None) => {
-            let Some(state) = scene.bitmap(bitmap) else {
-                return Err(format!("{operation}: the bitmap {bitmap} does not exist"));
-            };
-            state.rgba.clone()
+    let pixels = if with_pose {
+        match scene.read_pixels(bitmap) {
+            Ok(Some(pixels)) => pixels,
+            Ok(None) => {
+                let Some(state) = scene.bitmap(bitmap) else {
+                    return Err(format!("{operation}: the bitmap {bitmap} does not exist"));
+                };
+                state.rgba.clone()
+            }
+            Err(error) => return Err(format!("{operation}: {error}")),
         }
-        Err(error) => return Err(format!("{operation}: {error}")),
+    } else {
+        let Some(state) = scene.bitmap(bitmap) else {
+            return Err(format!("{operation}: the bitmap {bitmap} does not exist"));
+        };
+        state.rgba.clone()
     };
     Ok((width, height, pixels))
 }
@@ -982,9 +1005,18 @@ fn assign_images(scene: &mut Scene, dest: u32, source: u32) -> Result<(), String
     // Snapshot the source before touching the destination: the two may share
     // a bitmap id, and the copy must reflect the pre-write source. The source
     // may still be decoding, so the snapshot waits for its pixels.
-    let src_main = match scene.layer(source).and_then(|layer| layer.bitmap) {
-        Some(bitmap) => Some(resolved_bitmap_pixels(scene, bitmap, "Layer.assignImages")?),
-        None => None,
+    // The source's picture is its image with the pose the layer shows over
+    // it. The pose lives on the backend, so the copy of the two parts stays
+    // in the two spaces they live in: the image is copied here, and the pose
+    // is copied on the device. The pose's pixels never reach the host.
+    let (src_main, src_pose) = match scene.layer(source).and_then(|layer| layer.bitmap) {
+        Some(bitmap) => {
+            let pose = scene.has_pose(bitmap);
+            let image =
+                resolved_bitmap_pixels_with_pose(scene, bitmap, "Layer.assignImages", false)?;
+            (Some(image), pose.then_some(bitmap))
+        }
+        None => (None, None),
     };
     let src_province = scene.layer(source).map(|layer| {
         (
@@ -1019,6 +1051,15 @@ fn assign_images(scene: &mut Scene, dest: u32, source: u32) -> Result<(), String
                 if let Some(layer) = scene.layer_mut(dest) {
                     layer.bitmap = Some(bitmap_id);
                 }
+            }
+        }
+        // The pose the source shows travels with the image: it is copied into
+        // the destination's own pose on the device, so the destination shows
+        // the source's picture and the pose's pixels never reach the host.
+        if let Some(source_pose) = src_pose {
+            let destination = scene.layer(dest).and_then(|layer| layer.bitmap);
+            if let Some(destination) = destination {
+                scene.request_pose_copy(source_pose, destination);
             }
         }
     } else {

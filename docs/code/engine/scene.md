@@ -231,6 +231,9 @@ accumulates on it exactly as it accumulates on the CPU.
 | `read_pixels(bitmap_id)` | the pixels a script reads: the image's pixels with the pose over them. |
 | `read_pixel(bitmap_id, x, y)` | one pixel of those, borrowed out of the cached pixels. |
 | `drop_pose_surface(pipeline, state, bitmap_id)` | drops the pose surface, so the image carries the pose alone. |
+| `has_pose(bitmap_id)` | whether the bitmap shows a pose on the backend. |
+| `copy_pose_on_device(pipeline, state, source, dest)` | copies the source bitmap's pose into the destination bitmap's, on the backend. |
+| `request_pose_copy(source, dest)` | asks the device to copy one bitmap's pose into another's. |
 | `set_pose_sync(sync)` | installs the backend that reads a pose surface back. |
 
 ---

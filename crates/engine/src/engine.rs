@@ -1802,7 +1802,30 @@ impl Engine {
                 crate::scene::DeviceRequest::ReleaseSurface(layer) => {
                     release_device_surface(&mut self.device, layer);
                 }
+                crate::scene::DeviceRequest::CopyPose { source, dest } => {
+                    self.copy_pose_on_device(source, dest);
+                }
             }
+        }
+    }
+
+    /// The pose of the source bitmap, copied into the destination bitmap on
+    /// the device.
+    ///
+    /// The copy stays on the backend: the pixels never reach the host, so a
+    /// layer that takes over another's pose costs a device copy and not a
+    /// whole canvas through the bus.
+    fn copy_pose_on_device(&mut self, source: u32, dest: u32) {
+        let result = self.scene.copy_pose_on_device(
+            &self.device.pipeline,
+            &mut self.device.state,
+            source,
+            dest,
+        );
+        if let Err(error) = result {
+            log::warn!(
+                "engine.scene: the pose of bitmap {source} could not be copied into bitmap                  {dest}: {error}; the destination keeps its own pose"
+            );
         }
     }
 

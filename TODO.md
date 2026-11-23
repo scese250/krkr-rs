@@ -138,7 +138,43 @@ residuals:
    (`system/motion.tjs` in the game's data), so it plays the route where the
    motion player does not clear at all, and the per-frame clip offscreen is
    gone.
-5. **The title's movie raises in the game's own `onFrameUpdate` handler.**
+5. **The title's slow frames were the pose's read-back, not the movie.**
+   The 185 slow frames of item 4 above are not the movie's CPU composite.
+   The frame tail's own phases were not measured, so the cost was read as
+   `frame_tail` as a whole; measuring its three steps apart named it.
+   * The frame tail's three steps are the movie poll, the transition step
+     and the cached-layer composite (`crates/app/src/game.rs`, `frame_tail`).
+     Splitting them shows the transition step carries the whole 8.2 s and
+     the movie step carries none: this game never opens a movie. The
+     transition step runs the frame's `onPaint` dispatch, and the game's own
+     handler calls `Layer.assignImages` every frame.
+   * `Layer.assignImages` copies the source layer's picture into the
+     destination. The source is the motion player's render target, whose
+     picture is the layer's image with the **pose** over it, and the pose
+     lives on the backend. So the copy read the pose back from the GPU: a
+     whole-canvas device-to-host round trip (1920x1080 RGBA, 8.3 MB) plus a
+     whole-canvas copy of the image and a whole-canvas per-pixel composite,
+     every frame. Measured at 42 ms a call, 171 calls, 7.5 s of the run.
+     `perf` put 53 % of the process CPU in one libc `memcpy`, and the
+     read-back's own `copy_nonoverlapping` is the whole-buffer copy it
+     points at.
+   * The reference never pays it. The motion player renders into an
+     **internal render layer** and then calls `assignImages` on it
+     (`reference/cpp/plugins/motionplayer/PlayerRenderTargets.cpp:1107`
+     and `:1421-1494`): the pose is already in that layer's picture, so the
+     assign is a plain bitmap copy. The port's pose lives on the device
+     instead, so the same assign became a device round trip.
+   **Landed:** the pose is copied where it lives. `assignImages` copies the
+   image on the host and asks the device to copy the pose into the
+   destination's own pose surface (`Scene::request_pose_copy`,
+   `Scene::copy_pose_on_device`, and the render layer's new
+   `copy_render_target_to_render_target`): the pose's pixels never cross
+   the bus. The title's slow frames fell from 192 to 14 over the same run,
+   and the frame tail's cost from 8.2 s to 79 ms.
+   The regression is the device pose itself: `49961bf9` ("the pose lives on
+   the device", 2026-11-21) is in `v2.1.3` and not in `v2.1.2`, and the
+   versions before it ran the title smoothly.
+6. **The title's movie raises in the game's own `onFrameUpdate` handler.**
    The same device run logged 250 `onFrameUpdate` exceptions in about two
    seconds on the title screen. The port's video event dispatch is not the
    raiser - it calls the owner's member only when the owner has one

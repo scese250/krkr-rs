@@ -476,6 +476,34 @@ pub struct TextureUpload<'a> {
     pub pixels: &'a [u8],
 }
 
+/// Copies the pixels of one offscreen `target` into another.
+///
+/// The copy stays on the device: the pixels never reach the host, so a
+/// picture that is copied from one surface to another costs no bus traffic.
+/// The copy fills the destination from its top-left corner: the part of the
+/// source the destination cannot hold is left out.
+///
+/// # Errors
+///
+/// Returns [`RenderError::InvalidArgument`] when the targets have different
+/// formats, [`RenderError::Framebuffer`] when a target was never rendered
+/// into, and [`RenderError::Unsupported`] for an unimplemented backend.
+pub fn copy_render_target_to_render_target(
+    p: &RenderPipeline,
+    state: &mut RenderState,
+    source: &RenderTarget,
+    destination: &RenderTarget,
+) -> Result<(), RenderError> {
+    match &p.kind {
+        PipelineKind::Null(backend) => {
+            backend.copy_render_target_to_render_target(state, source, destination)
+        }
+        PipelineKind::Vulkan(backend) => {
+            backend.copy_render_target_to_render_target(state, source, destination)
+        }
+    }
+}
+
 /// Copies a sub-rectangle of pixels into `tex`.
 ///
 /// `pixels` is tightly packed, row-major, in the texture's format.

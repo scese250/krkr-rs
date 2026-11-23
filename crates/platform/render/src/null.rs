@@ -337,6 +337,73 @@ impl NullRenderPipeline {
     /// this backend or the texture and the target have different formats,
     /// and [`RenderError::Framebuffer`] when the target is not owned by the
     /// state.
+    /// Copies the pixels of one offscreen `target` into another.
+    ///
+    /// The copy fills the destination from its top-left corner: the part of
+    /// the source the destination cannot hold is left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::InvalidArgument`] when the targets have
+    /// different formats, and [`RenderError::Framebuffer`] when a target is
+    /// not owned by this render state.
+    pub fn copy_render_target_to_render_target(
+        &self,
+        state: &mut RenderState,
+        source: &RenderTarget,
+        destination: &RenderTarget,
+    ) -> Result<(), RenderError> {
+        let null = null_state_mut(state)?;
+        let NullState { render_targets, .. } = null;
+        // The two targets are taken out of the map one at a time: the map
+        // holds both, and the copy borrows each of them in turn. Their keys
+        // are the handles' own, so they go back where they came from.
+        let source_key = source.key();
+        let destination_key = destination.key();
+        let Some(source) = render_targets.remove(&source_key) else {
+            return Err(RenderError::Framebuffer {
+                message: "render target is not owned by this render state".to_owned(),
+            });
+        };
+        let Some(mut destination) = render_targets.remove(&destination_key) else {
+            render_targets.insert(source_key, source);
+            return Err(RenderError::Framebuffer {
+                message: "render target is not owned by this render state".to_owned(),
+            });
+        };
+        let source_desc = source.desc;
+        let destination_desc = destination.desc;
+        if source_desc.format != destination_desc.format {
+            render_targets.insert(source_key, source);
+            render_targets.insert(destination_key, destination);
+            return Err(RenderError::InvalidArgument {
+                message: "the render targets have different formats".to_owned(),
+            });
+        }
+        let bytes_per_pixel = source_desc.format.bytes_per_pixel() as usize;
+        // The copy fills the destination's own extent: the part of the source
+        // the destination cannot hold is left out.
+        let width = source_desc.width.min(destination_desc.width) as usize;
+        let height = source_desc.height.min(destination_desc.height) as usize;
+        let row_bytes = width * bytes_per_pixel;
+        for row in 0..height {
+            let start = row * source_desc.width as usize * bytes_per_pixel;
+            let offset = row * destination_desc.width as usize * bytes_per_pixel;
+            destination.pixels[offset..offset + row_bytes]
+                .copy_from_slice(&source.pixels[start..start + row_bytes]);
+        }
+        render_targets.insert(source_key, source);
+        render_targets.insert(destination_key, destination);
+        Ok(())
+    }
+
+    /// Copies the pixels of an offscreen `target` into a `texture`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::InvalidArgument`] when the texture and the
+    /// target have different formats, and [`RenderError::Framebuffer`] when
+    /// the target is not owned by this render state.
     pub fn copy_render_target_to_texture(
         &self,
         state: &mut RenderState,
