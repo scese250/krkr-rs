@@ -42,8 +42,8 @@ use std::ffi::{c_char, c_int, c_void};
 use api::blend::BlendMode;
 use api::geometry::PixelRegion;
 use tjs::{
-    NativeInstanceMembers, NativeObjThisMethodDef, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_NULL,
-    VAL_OBJECT, VAL_OCTET, VAL_REAL, VAL_STRING, VAL_VOID, Value,
+    NativeInstanceMembers, Tjs2Engine, TjsValue, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_OCTET,
+    VAL_REAL, VAL_STRING, VAL_VOID, Value,
 };
 
 use crate::engine_api::Scene;
@@ -124,7 +124,7 @@ pub(super) fn integer_value(value: &Value) -> Result<i64, String> {
 /// The argument at `index`, when the script passed it and it is not `void`.
 ///
 /// A `void` argument counts as not passed: the member keeps its default.
-pub(super) fn optional_argument<'a>(arguments: &'a [Value], index: usize) -> Option<&'a Value> {
+pub(super) fn optional_argument(arguments: &[Value], index: usize) -> Option<&Value> {
     let value = arguments.get(index)?;
     if value.ty == VAL_VOID {
         None

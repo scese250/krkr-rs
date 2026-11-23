@@ -117,9 +117,9 @@ fn copy_alpha_to_province(
     };
     let writes = match mode {
         ProvinceMode::Verbatim => true,
-        ProvinceMode::Thresholded { matched, otherwise } => {
-            matched.is_some() || otherwise.is_some()
-        }
+        ProvinceMode::Thresholded {
+            matched, otherwise, ..
+        } => matched.is_some() || otherwise.is_some(),
         ProvinceMode::AllOtherwise(otherwise) => otherwise.is_some(),
     };
     if !writes {

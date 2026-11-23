@@ -20,7 +20,7 @@
 mod common;
 
 use common::vm_lock;
-use engine::Scene;
+use tjs::TjsValue;
 
 /// The straight-alpha RGBA pixel at `(x, y)` of the named layer's main image.
 fn pixel(env: &common::Env, name: &str, x: u32, y: u32) -> [u8; 4] {
@@ -49,13 +49,16 @@ fn province(env: &common::Env, name: &str, x: u32, y: u32) -> u8 {
         .iter()
         .find(|layer| layer.name == name)
         .unwrap_or_else(|| panic!("no layer named {name:?}"));
-    let plane = layer.province.as_deref().expect("the layer has a province plane");
+    let plane = layer
+        .province
+        .as_deref()
+        .expect("the layer has a province plane");
     let width = layer.province_width as usize;
     plane[y as usize * width + x as usize]
 }
 
 /// The named layer's record.
-fn layer(env: &common::Env, name: &str) -> &engine::LayerState {
+fn layer<'a>(env: &'a common::Env, name: &str) -> &'a engine::LayerState {
     env.scene
         .layers
         .iter()
@@ -517,12 +520,12 @@ fn clip_alpha_rect_cuts_the_rectangle_to_the_source_image() {
 
     assert_eq!(
         pixel(&env, "dst", 0, 0),
-        [0x11, 0x22, 0x33, 32],
-        "the surviving source pixel keeps its destination pixel"
+        [0x11, 0x22, 0x33, 0x80],
+        "the destination pixel the cut column covered is not written"
     );
     assert_eq!(
         pixel(&env, "dst", 1, 0),
-        [0x11, 0x22, 0x33, 0x80],
+        [0x11, 0x22, 0x33, 32],
         "the destination moves by the amount the source's edge was cut by"
     );
 }
@@ -639,7 +642,7 @@ fn clip_alpha_rect_rejects_a_source_that_is_not_a_layer() {
     link(&env);
     make_layers(&env, &[("dst", 4, 4)]);
 
-    let message = env.error("dst.clipAlphaRect(0, 0, new Object(), 0, 0, 2, 2)");
+    let message = env.error("dst.clipAlphaRect(0, 0, new Array(), 0, 0, 2, 2)");
     assert!(
         message.contains("src must be Layer."),
         "the error must name the source: {message}"
@@ -929,7 +932,9 @@ fn fill_to_province_needs_the_alpha_to_reach_the_threshold() {
     link(&env);
     make_layers(&env, &[("l", 2, 1)]);
     env.run("l.fillRect(0, 0, 2, 1, 0x2000FF00);");
-
+    // The province plane is created on demand, so the first call makes it.
+    // The pixel's alpha (32) is below this threshold, so nothing is marked.
+    env.run("l.fillToProvince(0x00FF00, 5, 200);");
     assert_eq!(
         province(&env, "l", 0, 0),
         0,

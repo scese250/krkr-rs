@@ -1194,10 +1194,6 @@ is therefore unreachable from a script until it is implemented.
 * **One upstream function.** Each member's whole behaviour is in one upstream
   function, with no new format and no fixture.
   * `layerExRaster`: `Layer.copyRaster`.
-  * `layerExBTOA`: `Layer.copyRightBlueToLeftAlpha`,
-    `Layer.copyBottomBlueToTopAlpha`, `Layer.fillAlpha`,
-    `Layer.copyAlphaToProvince`, `Layer.clipAlphaRect`, `Layer.overwrapRect`,
-    `Layer.fillByProvince` and `Layer.fillToProvince`.
   * `layerExSave`: the analytic members — `Layer.clearAlpha`,
     `Layer.oozeColor`, `Layer.getAverageColor`, `Layer.getCropRect`,
     `Layer.getCropRectZero`, `Layer.getDiffPixel`, `Layer.getDiffRect`,

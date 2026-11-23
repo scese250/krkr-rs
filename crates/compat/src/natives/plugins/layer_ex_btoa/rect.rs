@@ -46,6 +46,23 @@ struct Surviving {
     source: (i64, i64, i64, i64),
 }
 
+/// The six integers a rectangle member reads from its arguments.
+#[derive(Clone, Copy)]
+struct RectArgs {
+    /// The left edge of the destination rectangle.
+    dest_left: i64,
+    /// The top edge of the destination rectangle.
+    dest_top: i64,
+    /// The left edge of the source rectangle.
+    source_left: i64,
+    /// The top edge of the source rectangle.
+    source_top: i64,
+    /// The width of both rectangles.
+    width: i64,
+    /// The height of both rectangles.
+    height: i64,
+}
+
 /// The rectangle a copy covers, after both cuts.
 ///
 /// The source rectangle is cut to the source image first, and the destination
@@ -55,21 +72,16 @@ struct Surviving {
 /// rectangle, and the source origin moves by the same amount. `None` means
 /// that nothing survived.
 fn intersect_rects(
-    dest_left: i64,
-    dest_top: i64,
-    source_left: i64,
-    source_top: i64,
-    width: i64,
-    height: i64,
+    rect: RectArgs,
     source_size: (i64, i64),
     clip: (i64, i64, i64, i64),
 ) -> Option<Surviving> {
-    let mut dest_x = dest_left;
-    let mut dest_y = dest_top;
-    let mut source_x = source_left;
-    let mut source_y = source_top;
-    let mut w = width;
-    let mut h = height;
+    let mut dest_x = rect.dest_left;
+    let mut dest_y = rect.dest_top;
+    let mut source_x = rect.source_left;
+    let mut source_y = rect.source_top;
+    let mut w = rect.width;
+    let mut h = rect.height;
 
     if source_x < 0 {
         dest_x -= source_x;
@@ -89,7 +101,7 @@ fn intersect_rects(
     }
 
     if dest_x < clip.0 {
-        source_x -= clip.0 - dest_x;
+        source_x += clip.0 - dest_x;
         w -= clip.0 - dest_x;
         dest_x = clip.0;
     }
@@ -97,7 +109,7 @@ fn intersect_rects(
         w = clip.2 - dest_x;
     }
     if dest_y < clip.1 {
-        source_y -= clip.1 - dest_y;
+        source_y += clip.1 - dest_y;
         h -= clip.1 - dest_y;
         dest_y = clip.1;
     }
@@ -164,12 +176,7 @@ fn clip_alpha_rect(
     scene: &mut Scene,
     dest_id: u32,
     source_id: u32,
-    dest_left: i64,
-    dest_top: i64,
-    source_left: i64,
-    source_top: i64,
-    width: i64,
-    height: i64,
+    rect: RectArgs,
     clear: Option<u8>,
 ) -> Result<(), String> {
     // The destination is inspected before the source.
@@ -181,12 +188,7 @@ fn clip_alpha_rect(
     let add_alpha = is_add_alpha(scene, dest_id);
 
     let surviving = intersect_rects(
-        dest_left,
-        dest_top,
-        source_left,
-        source_top,
-        width,
-        height,
+        rect,
         (i64::from(source_width), i64::from(source_height)),
         clip,
     );
@@ -298,12 +300,7 @@ fn overwrap_rect(
     scene: &mut Scene,
     dest_id: u32,
     source_id: u32,
-    dest_left: i64,
-    dest_top: i64,
-    source_left: i64,
-    source_top: i64,
-    width: i64,
-    height: i64,
+    request: RectArgs,
     threshold: u8,
 ) -> Result<(), String> {
     // The destination is inspected before the source.
@@ -313,13 +310,8 @@ fn overwrap_rect(
         layer_image(scene, source_id).map_err(|_| MUST_BE_SRC.to_string())?;
     let clip = layer_clip(scene, dest_id);
 
-    let Some(rect) = intersect_rects(
-        dest_left,
-        dest_top,
-        source_left,
-        source_top,
-        width,
-        height,
+    let Some(surviving) = intersect_rects(
+        request,
         (i64::from(source_width), i64::from(source_height)),
         clip,
     ) else {
@@ -327,10 +319,10 @@ fn overwrap_rect(
         return Ok(());
     };
 
-    let pixels = source_pixels(scene, source_bitmap, source_width, rect.source)?;
-    let region_width = usize::try_from(rect.dest.2 - rect.dest.0)
+    let pixels = source_pixels(scene, source_bitmap, source_width, surviving.source)?;
+    let region_width = usize::try_from(surviving.dest.2 - surviving.dest.0)
         .map_err(|_| "the rectangle is too wide".to_string())?;
-    let region_height = usize::try_from(rect.dest.3 - rect.dest.1)
+    let region_height = usize::try_from(surviving.dest.3 - surviving.dest.1)
         .map_err(|_| "the rectangle is too tall".to_string())?;
     {
         let bitmap = scene
@@ -342,8 +334,8 @@ fn overwrap_rect(
                 if pixels[start + 3] < threshold {
                     continue;
                 }
-                let x = rect.dest.0 + column as i64;
-                let y = rect.dest.1 + row as i64;
+                let x = surviving.dest.0 + column as i64;
+                let y = surviving.dest.1 + row as i64;
                 let Some(offset) = pixel_offset(dest_width, x, y) else {
                     continue;
                 };
@@ -354,7 +346,12 @@ fn overwrap_rect(
             }
         }
     }
-    let changed = super::region(rect.dest.0, rect.dest.1, rect.dest.2, rect.dest.3);
+    let changed = super::region(
+        surviving.dest.0,
+        surviving.dest.1,
+        surviving.dest.2,
+        surviving.dest.3,
+    );
     mark_region(scene, dest_bitmap, changed);
     mark_modified(scene, dest_id);
     Ok(())
@@ -406,7 +403,7 @@ extern "C" fn layer_clip_alpha_rect(
             Err(error) => return fail(out_error, &error),
         }
     }
-    let (dest_left, dest_top, source_left, source_top, width, height) = numbers;
+    let [dest_left, dest_top, source_left, source_top, width, height] = numbers;
     if width <= 0 || height <= 0 {
         return fail(out_error, "Invalid argument");
     }
@@ -415,12 +412,14 @@ extern "C" fn layer_clip_alpha_rect(
             scene,
             id,
             source,
-            dest_left,
-            dest_top,
-            source_left,
-            source_top,
-            width,
-            height,
+            RectArgs {
+                dest_left,
+                dest_top,
+                source_left,
+                source_top,
+                width,
+                height,
+            },
             clear,
         )
     });
@@ -459,10 +458,7 @@ extern "C" fn layer_overwrap_rect(
     // feature is not switched off by it.
     let threshold = match optional_argument(arguments, 7) {
         Some(value) => match integer_value(value) {
-            Ok(value) => match byte_option(value) {
-                Some(value) => value,
-                None => 1,
-            },
+            Ok(value) => byte_option(value).unwrap_or(1),
             Err(error) => return fail(out_error, &error),
         },
         None => 1,
@@ -481,7 +477,7 @@ extern "C" fn layer_overwrap_rect(
             Err(error) => return fail(out_error, &error),
         }
     }
-    let (dest_left, dest_top, source_left, source_top, width, height) = numbers;
+    let [dest_left, dest_top, source_left, source_top, width, height] = numbers;
     if width <= 0 || height <= 0 {
         return fail(out_error, "Invalid argument");
     }
@@ -490,12 +486,14 @@ extern "C" fn layer_overwrap_rect(
             scene,
             id,
             source,
-            dest_left,
-            dest_top,
-            source_left,
-            source_top,
-            width,
-            height,
+            RectArgs {
+                dest_left,
+                dest_top,
+                source_left,
+                source_top,
+                width,
+                height,
+            },
             threshold,
         )
     });

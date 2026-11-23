@@ -1243,6 +1243,16 @@ def _string_locals(code: str, raw: str, var: str) -> set[str]:
     return out
 
 
+def _declared_plugin_modules() -> set[str]:
+    """The plugin modules ``plugins/mod.rs`` declares.
+
+    A directory under ``natives/plugins/`` that no ``pub mod`` names is not
+    compiled, so the members it registers do not exist at run time.
+    """
+    text = (RUST_PLUGINS_DIR / "mod.rs").read_text(encoding="utf-8")
+    return set(re.findall(r"^pub mod (\w+);", text, re.MULTILINE))
+
+
 def _iter_rust_files() -> list[Path]:
     if not RUST_NATIVES_DIR.is_dir():
         raise SystemExit(
@@ -1250,10 +1260,30 @@ def _iter_rust_files() -> list[Path]:
             f"{RUST_NATIVES_DIR.relative_to(REPO_ROOT)}"
         )
     # Core native files (``natives/*.rs``) plus the plugin tree
-    # (``natives/plugins/**``): reference plugins attach members to core classes
-    # such as ``Storages`` / ``System`` / ``Scripts``.
+    # (``natives/plugins/**``): reference plugins attach members to core
+    # classes such as ``Storages`` / ``System`` / ``Scripts``.
     files = sorted(RUST_NATIVES_DIR.glob("*.rs"))
-    files += sorted(RUST_PLUGINS_DIR.rglob("*.rs"))
+    declared = _declared_plugin_modules()
+    undeclared: list[str] = []
+    for path in sorted(RUST_PLUGINS_DIR.rglob("*.rs")):
+        if path.parent == RUST_PLUGINS_DIR:
+            files.append(path)
+            continue
+        module = path.relative_to(RUST_PLUGINS_DIR).parts[0]
+        if module in declared:
+            files.append(path)
+        elif module not in undeclared:
+            undeclared.append(module)
+    if undeclared:
+        # An undeclared port is not compiled, so the members it names are
+        # not on the VM surface; counting them would report coverage the
+        # engine does not have.
+        raise SystemExit(
+            "plugin_parity: plugin port(s) present but not declared in "
+            f"{(RUST_PLUGINS_DIR / 'mod.rs').relative_to(REPO_ROOT)}: "
+            + ", ".join(sorted(undeclared))
+            + " — declare the module, or delete the port."
+        )
     if not files:
         raise SystemExit(
             "plugin_parity: no Rust native sources under "

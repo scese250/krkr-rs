@@ -67,6 +67,7 @@ trait impl.
 | `layerExAreaAverage.dll` | — | — | the `Layer.stretchCopyAA` member |
 | `layerExImage.dll` | — | — | the `Layer.colorize`, `Layer.modulate`, `Layer.noise` and `Layer.generateWhiteNoise` members |
 | `layerExLongExposure.dll` | — | — | the `Layer.initExposure`, `Layer.termExposure`, `Layer.snapExposure`, `Layer.statExposure` and `Layer.copyExposure` members |
+| `layerExBTOA.dll` | — | — | the `Layer.copyRightBlueToLeftAlpha`, `Layer.copyBottomBlueToTopAlpha`, `Layer.fillAlpha`, `Layer.copyAlphaToProvince`, `Layer.clipAlphaRect`, `Layer.overwrapRect`, `Layer.fillByProvince` and `Layer.fillToProvince` members |
 | `layerExDraw.dll` | `layerExMovie.dll`, `perspective.dll` | — | the layer drawing, movie and perspective members |
 | `menu.dll` | — | — | the `MenuItem` surface (registered by the core `MenuItem` module) |
 | `motionplayer.dll` | — | — | the `Motion` / `Player` classes |
