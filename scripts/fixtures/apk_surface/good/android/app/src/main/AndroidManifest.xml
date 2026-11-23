@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest>
+    <application>
+        <activity android:name="dev.krkr.rs.KrkrGameActivity" />
+        <activity android:name="dev.krkr.rs.MainActivity" />
+    </application>
+</manifest>

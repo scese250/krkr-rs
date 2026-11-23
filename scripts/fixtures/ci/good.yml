@@ -39,6 +39,8 @@ jobs:
         run: |
           bash ./crates/android/build-android.sh --ndk "$ANDROID_NDK_HOME"
           bash ./crates/android/check-jni-libs.sh app-release.apk
+      - name: Verify the APK surface
+        run: bash ./scripts/apk_surface_check.sh
       - name: Upload the APK
         uses: actions/upload-artifact@v7
         with:

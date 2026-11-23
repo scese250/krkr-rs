@@ -277,7 +277,7 @@ one of them would leave a package that installs, launches and dies on the
 device, with nothing in the build log to show for it. The release job
 therefore reads the rules out of the built package and checks every class and
 member they name, and separately checks that the rules name every field the
-native side reads (`scripts/apk_size_report.py`).
+native side reads (`scripts/apk_surface_check.py`).
 
 ### What is not possible here
 

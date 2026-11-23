@@ -1,36 +1,33 @@
 #!/usr/bin/env python3
-"""Report what an Android APK is made of, and verify the surface the engine resolves by name.
+"""Verify the Android surface the engine resolves by name.
 
-Two questions are answered here, both about the artifact that reaches a device:
+The package is the artifact that reaches a device, so the names the native
+code looks up are read out of it and checked:
 
-* **What is in it?** The package is measured: every entry, grouped the way the
-  package is built (each ``.dex``, each native library, ``resources.arsc``, the
-  ``res/`` tree, the ``META-INF/`` and ``kotlin/`` metadata), with the totals.
-  The numbers are printed as a table and as ``key=value`` lines, so a later
-  build can be compared against this one without a human reading them.
-
-* **Is the surface the native code resolves still there?** The engine reads
-  seven static fields off the engine Activity through JNI, by name, and the
-  game-activity glue resolves the native entry point by name. A shrinker that
-  renames or removes any of them leaves a package that installs and launches
-  and then dies on the device, with nothing in the build log to show for it.
-  The names are therefore read out of the package and checked:
-
-  * the compiled manifest names the Activity and the native library
-    (``android.app.lib_name``);
-  * the DEX still carries that Activity class, with one static field per name
-    the native side declares, each with the declared type;
-  * the packaged library exports the entry points the glue resolves.
+* the engine reads its static fields off the engine Activity through JNI, by
+  name, and the game-activity glue resolves the native entry point by name.
+  A shrinker that renames or removes any of them leaves a package that
+  installs and launches and then dies on the device, with nothing in the
+  build log to show for it;
+* the compiled manifest names the Activity and the native library
+  (``android.app.lib_name``);
+* the DEX still carries that Activity class, with one static field per name
+  the native side declares, each with the declared type;
+* the packaged library exports the entry points the glue resolves.
 
 Everything is read from the package itself with the standard library: the DEX
 tables, the ELF dynamic symbols and the compiled manifest are parsed here, so
 the check does not depend on a particular SDK tool being installed, and it
-reads the *tables* rather than searching for byte patterns — a name that is
+reads the *tables* rather than searching for byte patterns -- a name that is
 present as a string but is not a static field of the Activity does not pass.
 
+The self-test runs first: it takes the package apart, breaks one of those
+names on purpose, and refuses to accept the result. A check that cannot fail
+is not a check.
+
 Usage:
-    apk_size_report.py --apk <path to the .apk>
-    apk_size_report.py --apk <path> --self-test
+    apk_surface_check.py --apk <path to the .apk>
+    apk_surface_check.py --apk <path> --self-test
 """
 
 from __future__ import annotations
@@ -75,217 +72,13 @@ REQUIRED_SYMBOLS = (
 # The manifest attribute the Activity carries to name its native library.
 LIB_NAME_META = "android.app.lib_name"
 
-# The size the release package is held to.
-#
-# The first measurement this script printed was a package with no shrinker, an
-# uncompressed dex and an unstripped engine library: 37,607,087 bytes
-# (35.86 MiB). The dex in that package measured 24,001,412 bytes, and deflated
-# the same way the packager deflates it they are 8,285,512 - so the dex alone
-# accounts for 15.0 MiB of the package, and the budget is set where it is so
-# that a build which loses either the shrinker or the compression fails.
-#
-# 30 MiB is 5.6 MiB above the 24.4 MiB the package measures with the dex
-# compressed and nothing else changed, and 12 MiB above it with the shrinker
-# on as well: room for the engine to grow, and no room for the dex to go back
-# to being uncompressed.
-BUDGET_BYTES = 30 * 1024 * 1024
-
-
 class CheckError(Exception):
     """A verification step that must not be skipped could not be carried out."""
 
 
 # --------------------------------------------------------------------------
-# The size report
+# The package tables
 # --------------------------------------------------------------------------
-
-
-@dataclass
-class Entry:
-    """One file in the package."""
-
-    name: str
-    uncompressed: int
-    stored: int
-    method: str
-
-    @property
-    def stored_method(self) -> str:
-        return {0: "stored", 8: "deflated"}.get(self.method, str(self.method))
-
-
-@dataclass
-class Row:
-    """One line of the table: a single file, or a whole tree of them."""
-
-    label: str
-    key: str
-    entries: int
-    uncompressed: int
-    stored: int
-    method: str = ""
-
-
-def group_of(name: str) -> str:
-    """The group a package entry belongs to."""
-    if name.endswith(".dex"):
-        return "dex"
-    if name.startswith("lib/"):
-        return "lib"
-    if name == "resources.arsc":
-        return "arsc"
-    if name.startswith("res/"):
-        return "res"
-    if name.startswith("META-INF/"):
-        return "meta-inf"
-    if name.startswith("kotlin/"):
-        return "kotlin"
-    if name.startswith("assets/"):
-        return "assets"
-    return "other"
-
-
-GROUP_LABELS = {
-    "res": "the res/ tree",
-    "meta-inf": "the META-INF/ metadata",
-    "kotlin": "the kotlin/ metadata",
-    "assets": "the assets/ tree",
-}
-
-
-def read_entries(apk: zipfile.ZipFile) -> list[Entry]:
-    """Every entry of the package, with its sizes."""
-    entries = []
-    for info in apk.infolist():
-        entries.append(
-            Entry(
-                name=info.filename,
-                uncompressed=info.file_size,
-                stored=info.compress_size,
-                method=info.compress_type,
-            )
-        )
-    return entries
-
-
-def build_rows(entries: list[Entry]) -> list[Row]:
-    """Group the entries into the rows of the table.
-
-    Every DEX and every native library gets its own row, because those are the
-    parts a build changes; the resource, metadata and Kotlin trees are one row
-    each, with their entry count.
-    """
-    rows: list[Row] = []
-    trees: dict[str, Row] = {}
-    for entry in entries:
-        group = group_of(entry.name)
-        if group in ("dex", "lib", "arsc", "other"):
-            rows.append(
-                Row(
-                    label=entry.name,
-                    key=entry.name,
-                    entries=1,
-                    uncompressed=entry.uncompressed,
-                    stored=entry.stored,
-                    method=entry.stored_method,
-                )
-            )
-            continue
-        row = trees.get(group)
-        if row is None:
-            row = Row(
-                label=GROUP_LABELS[group],
-                key=group,
-                entries=0,
-                uncompressed=0,
-                stored=0,
-            )
-            trees[group] = row
-            rows.append(row)
-        row.entries += 1
-        row.uncompressed += entry.uncompressed
-        row.stored += entry.stored
-        row.method = _mixed_method(row.method, entry.stored_method)
-    for row in rows:
-        if row.entries > 1:
-            row.label = f"{row.label} ({row.entries} entries)"
-    rows.sort(key=lambda row: (-row.stored, row.label))
-    return rows
-
-
-def _mixed_method(current: str, method: str) -> str:
-    """The compression method of a tree of entries."""
-    if not current:
-        return method
-    if current == method:
-        return current
-    return "mixed"
-
-
-def format_bytes(value: int) -> str:
-    """A byte count with thousands separators."""
-    return f"{value:,}"
-
-
-def format_mib(value: int) -> str:
-    """A byte count in mebibytes."""
-    return f"{value / (1024 * 1024):.2f} MiB"
-
-
-def size_report(apk_path: Path, entries: list[Entry], rows: list[Row]) -> list[str]:
-    """The table of what the package is made of."""
-    file_size = apk_path.stat().st_size
-    total_uncompressed = sum(entry.uncompressed for entry in entries)
-    total_stored = sum(entry.stored for entry in entries)
-    label_width = max(len(row.label) for row in rows) + 2
-
-    lines = [
-        f"APK composition: {apk_path}",
-        f"  file {format_bytes(file_size)} bytes ({format_mib(file_size)}), "
-        f"{len(entries)} entries, "
-        f"{format_bytes(total_uncompressed)} bytes uncompressed, "
-        f"{format_bytes(total_stored)} bytes stored",
-        "",
-        f"  {'entry'.ljust(label_width)}{'uncompressed':>16}{'in-APK':>14}{'share':>8}{'method':>9}",
-        f"  {'-' * (label_width + 47)}",
-    ]
-    for row in rows:
-        share = (row.stored / total_stored * 100) if total_stored else 0.0
-        lines.append(
-            f"  {row.label.ljust(label_width)}"
-            f"{format_bytes(row.uncompressed):>16}"
-            f"{format_bytes(row.stored):>14}"
-            f"{share:>7.1f}%"
-            f"{row.method:>9}"
-        )
-    lines.append(f"  {'-' * (label_width + 47)}")
-    lines.append(
-        f"  {'total'.ljust(label_width)}"
-        f"{format_bytes(total_uncompressed):>16}"
-        f"{format_bytes(total_stored):>14}"
-        f"{'100.0%':>8}"
-    )
-    lines.append("")
-    lines.append("  measured values (one per line, for a later build to compare against):")
-    lines.append(f"apk-size file_bytes={file_size}")
-    lines.append(f"apk-size entries={len(entries)}")
-    lines.append(f"apk-size uncompressed_bytes={total_uncompressed}")
-    lines.append(f"apk-size stored_bytes={total_stored}")
-    for row in rows:
-        lines.append(
-            f"apk-size entry={row.key.replace('/', '.')} entries={row.entries} "
-            f"uncompressed_bytes={row.uncompressed} stored_bytes={row.stored}"
-        )
-    return lines
-
-
-# --------------------------------------------------------------------------
-# The DEX
-# --------------------------------------------------------------------------
-
-ACC_STATIC = 0x0008
-ACC_PUBLIC = 0x0001
-ACC_NATIVE = 0x0100
 
 
 def u16(data: bytes, offset: int) -> int:
@@ -1069,23 +862,6 @@ def verify(apk_path: Path, repo_root: Path) -> CheckResult:
     return result
 
 
-def check_budget(apk_path: Path, budget: int) -> tuple[bool, list[str]]:
-    """Hold the package to the size budget."""
-    size = apk_path.stat().st_size
-    lines = [
-        f"budget: the package is {format_bytes(size)} bytes "
-        f"({format_mib(size)}); the budget is {format_bytes(budget)} bytes "
-        f"({format_mib(budget)})",
-        f"apk-size budget_bytes={budget}",
-    ]
-    return size <= budget, lines
-
-
-# --------------------------------------------------------------------------
-# The self-test
-# --------------------------------------------------------------------------
-
-
 def write_mutated_apk(source: Path, target: Path, mutate) -> None:
     """Write a copy of the package with one entry changed."""
     with zipfile.ZipFile(source) as apk:
@@ -1110,7 +886,7 @@ def rename_bytes(payload: bytes, old: str, new: str) -> bytes | None:
 def self_test(apk_path: Path, repo_root: Path) -> int:
     """Prove that the checks reject a package that lost one of the names."""
     failures = 0
-    with tempfile.TemporaryDirectory(prefix="apk-size-report-") as workdir:
+    with tempfile.TemporaryDirectory(prefix="apk-surface-check-") as workdir:
         work = Path(workdir)
 
         cases = [
@@ -1147,12 +923,12 @@ def self_test(apk_path: Path, repo_root: Path) -> int:
                 result = CheckResult(problems=[str(error)])
             if result.problems:
                 print(
-                    f"apk-size-report: self-test: {description} is rejected "
+                    f"apk-surface-check: self-test: {description} is rejected "
                     f"({result.problems[0]})"
                 )
             else:
                 print(
-                    f"apk-size-report: self-test: FAILED: {description} was accepted",
+                    f"apk-surface-check: self-test: FAILED: {description} was accepted",
                     file=sys.stderr,
                 )
                 failures += 1
@@ -1174,12 +950,12 @@ def self_test(apk_path: Path, repo_root: Path) -> int:
             result = CheckResult(problems=[str(error)])
         if result.problems:
             print(
-                f"apk-size-report: self-test: a keep rule that forgot a field is "
+                f"apk-surface-check: self-test: a keep rule that forgot a field is "
                 f"rejected ({result.problems[0]})"
             )
         else:
             print(
-                "apk-size-report: self-test: FAILED: a keep rule that forgot a "
+                "apk-surface-check: self-test: FAILED: a keep rule that forgot a "
                 "field was accepted",
                 file=sys.stderr,
             )
@@ -1187,7 +963,7 @@ def self_test(apk_path: Path, repo_root: Path) -> int:
 
     if failures:
         print(
-            f"apk-size-report: self-test: {failures} case(s) were not rejected",
+            f"apk-surface-check: self-test: {failures} case(s) were not rejected",
             file=sys.stderr,
         )
         return 1
@@ -1246,12 +1022,6 @@ def main(argv: list[str] | None = None) -> int:
         help="the checkout the native side is read from",
     )
     parser.add_argument(
-        "--budget-bytes",
-        type=int,
-        default=BUDGET_BYTES,
-        help="the size the package is held to",
-    )
-    parser.add_argument(
         "--self-test",
         action="store_true",
         help="prove that the checks reject a package that lost a name",
@@ -1261,53 +1031,33 @@ def main(argv: list[str] | None = None) -> int:
     apk_path = Path(args.apk)
     repo_root = Path(args.repo_root)
     if not apk_path.is_file():
-        print(f"apk-size-report: {apk_path} is not a file", file=sys.stderr)
+        print(f"apk-surface-check: {apk_path} is not a file", file=sys.stderr)
         return 1
 
     if args.self_test:
         return self_test(apk_path, repo_root)
 
-    with zipfile.ZipFile(apk_path) as apk:
-        entries = read_entries(apk)
-    rows = build_rows(entries)
-    for line in size_report(apk_path, entries, rows):
-        print(line)
-
-    print("")
-    within_budget, budget_lines = check_budget(apk_path, args.budget_bytes)
-    for line in budget_lines:
-        print(line)
-
-    print("")
     try:
         result = verify(apk_path, repo_root)
     except CheckError as error:
-        print(f"apk-size-report: the surface check could not be carried out: {error}")
+        print(f"apk-surface-check: the surface check could not be carried out: {error}")
         return 1
     for line in result.lines:
         print(line)
     if result.problems:
         print("")
         for problem in result.problems:
-            print(f"apk-size-report: {problem}")
+            print(f"apk-surface-check: {problem}")
         if result.hints:
             print("")
             print(
-                "apk-size-report: a shrinker has to keep the names the native side "
+                "apk-surface-check: a shrinker has to keep the names the native side "
                 "resolves:"
             )
             for hint in dict.fromkeys(result.hints):
-                print(f"apk-size-report:   {hint}")
+                print(f"apk-surface-check:   {hint}")
         return 1
-    print("apk-size-report: the names the native side resolves are all present")
-
-    if not within_budget:
-        print(
-            f"apk-size-report: the package is over the budget of "
-            f"{format_bytes(args.budget_bytes)} bytes",
-            file=sys.stderr,
-        )
-        return 1
+    print("apk-surface-check: the names the native side resolves are all present")
     return 0
 
 

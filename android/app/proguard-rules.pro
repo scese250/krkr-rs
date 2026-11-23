@@ -9,8 +9,10 @@
 # library keeps the service interfaces it loads with ServiceLoader.
 
 # The engine Activity. The framework instantiates the class the manifest names,
-# and the native library reads the seven static fields below with
-# GetStaticFieldID.
+# and the native library reads the eight static fields below with
+# GetStaticFieldID. `scripts/apk_size_report.py` reads the field names from
+# `crates/android/src/jni_fields.rs` and fails the build when this list does not
+# name one of them, so the two cannot part silently.
 -keep class dev.krkr.rs.KrkrGameActivity {
     <init>();
 }
@@ -22,6 +24,7 @@
     static java.lang.String pendingFrameRate;
     static java.lang.String pendingPreloadArchives;
     static java.lang.String pendingDebugOverlay;
+    static java.lang.String pendingNativeResolution;
     static java.lang.String pendingLogLevel;
 }
 

@@ -240,7 +240,7 @@ It runs the ordered **static** gate: `cargo fmt --all -- --check`; the
 `native-instance-lookup` checks;
 `cargo clippy --workspace --all-targets -- -D warnings`;
 `cargo clippy -p platform --features platform-android --all-targets -- -D warnings`;
-`android-target`; `surface-lock`; `native-parity --no-doc`;
+`android-target`; `apk-surface`; `surface-lock`; `native-parity --no-doc`;
 `plugin-parity --no-doc`; `host-facts`; `ci`; `doc-lists`.
 
 The static gate does **not** run the test suites. Run them separately:

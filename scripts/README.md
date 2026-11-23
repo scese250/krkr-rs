@@ -24,7 +24,8 @@ The static gate sequence is `cargo fmt` → `stateless` → `error-handling` →
 `native-construction` → `lifecycle-order` → `storage-media` →
 `callback-objthis` → `native-arity` → `void-getter` →
 `native-instance-lookup` → `cargo clippy` →
-`cargo clippy platform-android` → `android-target` → `surface-lock` →
+`cargo clippy platform-android` → `android-target` → `apk-surface` →
+`surface-lock` →
 `native-parity --no-doc` → `plugin-parity --no-doc` → `host-facts` → `ci` →
 `doc-lists`. The ordered gate, the test suites and the CI release pipeline
 are documented in [`../docs/rules/gates.md`](../docs/rules/gates.md).
@@ -35,18 +36,18 @@ are documented in [`../docs/rules/gates.md`](../docs/rules/gates.md).
 - `krkr_gates/checks/` — one module per check, each exposing `run(argv) -> int`.
 - `fixtures/` — the checks' own test corpus; see below.
 - `allowlists/` — the reviewed exceptions, one file per check.
-- `apk_size_report.py` / `apk_size_report.sh` — the release job's APK report;
-  not a gate check, because it needs the built package. See below.
+- `apk_surface_check.py` / `apk_surface_check.sh` — the release job's
+  APK surface check; not a gate check, because it needs the built package. The
+  compile-free half of the same contract is `krkr-gate apk-surface`. See below.
 - `pyproject.toml` / `uv.lock` — the project metadata.
 
-### The APK size report
+### The APK surface check
 
-`apk_size_report.sh` runs in the release workflow's `apk` job, after the
-package is assembled and before it is uploaded. It reports what the package
-is made of (every entry, grouped, with the totals, and a `apk-size …` line per
-group for a later build to compare against) and verifies the names the native
-code resolves *by name* — the static fields the engine reads off its Activity
-through JNI, and the game-activity glue's lookup of the native entry point.
+`apk_surface_check.sh` runs in the release workflow's `apk` job, after the
+package is assembled and before it is uploaded. It verifies the names the
+native code resolves *by name* — the static fields the engine reads off its
+Activity through JNI, and the game-activity glue's lookup of the native entry
+point — and the classes and members the keep rules name.
 The check reads the DEX tables, the ELF symbol table and the compiled manifest
 directly, with the standard library only, so it needs no SDK tool and no
 device; `--self-test` mutates the real package four ways and asserts that each
@@ -111,8 +112,9 @@ Deleting one makes that check's self-test fail.
 `stateless`, `error-handling`, `house-style`, `log-format`, `layering`,
 `storage-boundary`, `native-construction`, `lifecycle-order`, `storage-media`,
 `callback-objthis`, `native-arity`, `void-getter`, `native-instance-lookup`,
-`host-facts`, `android-target`, `ci`, `surface-lock`, `native-parity`,
-`plugin-parity`, `doc-lists`, the `extract-xp3` helper, and `gate`.
+`host-facts`, `android-target`, `apk-surface`, `ci`, `surface-lock`,
+`native-parity`, `plugin-parity`, `doc-lists`, the `extract-xp3` helper, and
+`gate`.
 
 `stateless` fails a process-global mutable state in the bottom-core crates
 (`static mut`, `thread_local!`, `lazy_static!`, `LazyLock`, `OnceLock`,

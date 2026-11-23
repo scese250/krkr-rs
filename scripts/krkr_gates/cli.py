@@ -24,6 +24,7 @@ from pathlib import Path
 
 from .checks import (
     android_target,
+    apk_surface,
     callback_objthis,
     ci,
     doc_lists,
@@ -65,6 +66,7 @@ CHECKS: dict[str, Callable[[list[str]], int]] = {
     "native-instance-lookup": native_instance_lookup.main,
     "host-facts": host_facts.main,
     "android-target": android_target.main,
+    "apk-surface": apk_surface.main,
     "ci": ci.main,
     "surface-lock": surface_lock.main,
     "native-parity": native_parity.main,
@@ -122,6 +124,7 @@ GATE_SEQUENCE: list[tuple[str, str, str, list[str]]] = [
         ],
     ),
     ("android-target", "check", "android-target", []),
+    ("apk-surface", "check", "apk-surface", []),
     ("surface-lock", "check", "surface-lock", []),
     ("native-parity", "check", "native-parity", ["--no-doc"]),
     ("plugin-parity", "check", "plugin-parity", ["--no-doc"]),

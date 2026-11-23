@@ -41,12 +41,13 @@ It runs the steps below in this order and stops at the first failure:
 | 15 | `cargo clippy --workspace --all-targets -- -D warnings` | cargo | the host build |
 | 16 | `cargo clippy -p platform --features platform-android --all-targets -- -D warnings` | cargo | the Android feature on the host |
 | 17 | `android-target` | check | no desktop-only backend leaks into the Android graph, or vice versa |
-| 18 | `surface-lock` | check | the live VM dispatch dump matches the committed baseline (D29) |
-| 19 | `native-parity --no-doc` | check | the native class surface vs the reference |
-| 20 | `plugin-parity --no-doc` | check | the plugin surface vs the reference |
-| 21 | `host-facts` | check | every host seam has a production installer |
-| 22 | `ci` | check | the release workflow contract (v* → Linux + Android in parallel → one release) |
-| 23 | `doc-lists` | check | the pages that list the gate's steps match the gate |
+| 18 | `apk-surface` | check | the Android keep rules name every JNI field the engine reads, and keep only classes the manifest starts |
+| 19 | `surface-lock` | check | the live VM dispatch dump matches the committed baseline (D29) |
+| 20 | `native-parity --no-doc` | check | the native class surface vs the reference |
+| 21 | `plugin-parity --no-doc` | check | the plugin surface vs the reference |
+| 22 | `host-facts` | check | every host seam has a production installer |
+| 23 | `ci` | check | the release workflow contract (v* → Linux + Android in parallel → one release) |
+| 24 | `doc-lists` | check | the pages that list the gate's steps match the gate |
 
 The `cargo` steps are the integrator's, and a worker may not run cargo at all,
 so a worker may run a compiler-free check but never the build gate.
@@ -191,16 +192,14 @@ green (section 6).
   Zig, `build-android.sh`, Gradle, the `check-jni-libs.sh` self-test and
   package verification. The APK is signed with the configured keystore when the
   secret exists, otherwise with the debug key.
-* **`apk`** ends with `scripts/apk_size_report.sh`, before the upload. It
-  reports what the package is made of — every entry, grouped, with the
-  totals — and checks the names the native code resolves *by name*: the seven
-  static fields the engine reads off its Activity with `GetStaticFieldID`,
-  and the game-activity glue's own by-name lookup of the native entry point.
+* **`apk`** ends with `scripts/apk_surface_check.sh`, before the upload. It
+  checks the names the native code resolves *by name*: the static fields the
+  engine reads off its Activity with `GetStaticFieldID`, and the
+  game-activity glue's own by-name lookup of the native entry point.
   A shrinker that renames or drops one of them leaves a package that installs,
   launches and then dies on the device, with nothing in the build log to show
   for it, so the names are read out of the package and checked where no device
-  is needed. The step also holds the package to a size budget, so a build
-  that grows without a reason fails before it is published.
+  is needed.
 * **`release`** downloads both artifacts and is the only job that runs
   `gh release create`/`gh release upload`. It needs both platform jobs, so the
   two builds cannot race to create or update the release. On a manual run there

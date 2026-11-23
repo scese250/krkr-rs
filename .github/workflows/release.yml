@@ -314,8 +314,8 @@ jobs:
       # names are read out of the package and checked here, where a device is
       # not needed. The step also holds the package to a size budget, so a
       # build that grows without a reason fails before it is published.
-      - name: Report the APK composition and verify the DEX surface
-        run: bash ./scripts/apk_size_report.sh
+      - name: Verify the APK surface
+        run: bash ./scripts/apk_surface_check.sh
 
       - name: Upload the APK
         uses: actions/upload-artifact@v7

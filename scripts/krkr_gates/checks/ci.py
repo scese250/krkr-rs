@@ -14,7 +14,8 @@ the contract the repository relies on:
 * the Linux and Android jobs are independent (neither waits for the other);
 * the Linux job builds 'target/release/krkr' and packages it with the license
   and a run note;
-* the Android job invokes 'build-android.sh' and 'check-jni-libs.sh';
+* the Android job invokes 'build-android.sh' and 'check-jni-libs.sh', and
+  verifies the packaged surface with 'apk_surface_check.sh' before it uploads;
 * exactly one final job publishes the release and attaches both artifacts.
 
 The check deliberately validates names and commands, not a full YAML schema; a
@@ -264,6 +265,14 @@ def validate(text: str) -> list[Finding]:
                 (
                     "android-jni-check",
                     f"the '{ANDROID_JOB}' job must invoke 'crates/android/check-jni-libs.sh'",
+                )
+            )
+        if "scripts/apk_surface_check.sh" not in android:
+            findings.append(
+                (
+                    "android-surface-check",
+                    f"the '{ANDROID_JOB}' job must verify the packaged surface with "
+                    f"'scripts/apk_surface_check.sh' before it uploads the package",
                 )
             )
         if not (
