@@ -35,11 +35,10 @@ android {
 
     defaultConfig {
         applicationId = "dev.krkr.rs"
-        // Android 15+ only. The engine's native code is compiled against API 35
-        // (see crates/android/build-android.sh — the NDK r27c sysroot tops out
-        // there), and supporting older releases would mean carrying a lower
-        // native API level and the compatibility branches that come with it.
-        minSdk = 35
+        // Android 13+ (API 33+). The engine's native code is compiled against
+        // API 33 (see crates/android/build-android.sh) while still linking with
+        // 16 KB page-size alignment for Android 15+ devices.
+        minSdk = 33
         // Kept equal to `compileSdk` so the app is validated against the newest
         // behaviours it can be.
         targetSdk = 37
@@ -99,6 +98,16 @@ android {
     // experiment: no configuration should be able to produce a *broken* build,
     // only one signed with a throwaway key.
     signingConfigs {
+        // Shared debug keystore so debug APKs built on CI or locally always
+        // share the same signing certificate and can be installed over each
+        // other without uninstalling first.
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+
         // A blank value counts as unset. GitHub Actions passes an undefined
         // secret through as an *empty string*, so a plain `!= null` test would
         // build a "release" config with an empty alias/password whenever one of

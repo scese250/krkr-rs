@@ -148,18 +148,17 @@ checks every library of the package, not only the engine's.
 
 | value | |
 |---|---|
-| the native API level | `35` (Android 15) |
+| the native API level | `33` (Android 13) |
 | the Rust target | `aarch64-linux-android` |
 | the ABI | `arm64-v8a` |
 
 The native API level is baked into the C/C++ objects, so changing it changes
 the build. It must be a level the NDK ships a sysroot for: NDK r27c's
-`usr/lib/aarch64-linux-android/` tops out at 35, which is also the app's
-`minSdk`. Targeting a newer level therefore means moving to a newer NDK as
-well — **they must be raised together**.
+`usr/lib/aarch64-linux-android/` provides API 21..35, and API 33 matches the
+app's `minSdk`.
 
 The Gradle side is independent: `compileSdk = 37`, `targetSdk = 37`,
-`minSdk = 35`, `ndkVersion = "27.2.12479018"`, `abiFilters = ["arm64-v8a"]`.
+`minSdk = 33`, `ndkVersion = "27.2.12479018"`, `abiFilters = ["arm64-v8a"]`.
 
 Adding an ABI means adding it in three places: the script, `abiFilters` in
 `android/app/build.gradle.kts`, and the `jniLibs` directory the Gradle build

@@ -26,6 +26,9 @@ __pycache__/
 # release key lives outside the repo and CI gets it from a secret.
 *.jks
 *.keystore
+# Shared debug-only keystore so CI and local debug APKs update in place
+# without uninstalling (release keystores remain ignored above).
+!android/app/debug.keystore
 # The engine shared library is a build artifact, produced by
 # `cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build -p krkr-android`.
 # It must never be committed — it is architecture- and build-specific, and

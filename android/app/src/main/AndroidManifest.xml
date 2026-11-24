@@ -20,7 +20,7 @@
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
     <!-- No READ_EXTERNAL_STORAGE: it is a no-op from API 33 and the app is
-         Android 15+ (minSdk 35), so MANAGE_EXTERNAL_STORAGE is the only
+         Android 13+ (minSdk 33), so MANAGE_EXTERNAL_STORAGE is the only
          storage permission that does anything here. -->
 
     <!-- The engine renders with wgpu (Vulkan, falling back to GLES). -->

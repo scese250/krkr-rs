@@ -46,7 +46,11 @@ if [ -z "$apk" ]; then
     apk="$(find "$repo_root/android/app/build/outputs/apk/release" -maxdepth 1 \
         -name '*.apk' -print -quit 2>/dev/null || true)"
 fi
-[ -n "$apk" ] || die "no APK to check; the release package was not assembled"
+if [ -z "$apk" ]; then
+    apk="$(find "$repo_root/android/app/build/outputs/apk/debug" -maxdepth 1 \
+        -name '*.apk' -print -quit 2>/dev/null || true)"
+fi
+[ -n "$apk" ] || die "no APK to check; neither release nor debug package was assembled"
 [ -f "$apk" ] || die "$apk is not a file"
 
 report="$(mktemp)"

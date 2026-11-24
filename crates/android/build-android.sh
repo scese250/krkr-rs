@@ -69,11 +69,10 @@ RUST_TARGET="aarch64-linux-android"
 # Android API level for the native code. Must be a level the NDK ships a sysroot
 # for, and it is baked into the C/C++ objects, so changing it changes the build.
 #
-# 35 = Android 15, which is the app's `minSdk` (android/app/build.gradle.kts) and
-# the highest level NDK r27c provides a sysroot for (its `usr/lib/
-# aarch64-linux-android/` tops out at 35). Targeting a newer level therefore
-# means moving to a newer NDK as well — they must be raised together.
-API_LEVEL=35
+# 33 = Android 13, which matches the app's `minSdk` (android/app/build.gradle.kts).
+# NDK r27c ships per-API stubs for API 21..35, so API 33 works on Android 13+
+# while still linking with 16 KB page alignment for Android 15+ devices.
+API_LEVEL=33
 
 CRATE="android"
 # The cdylib name is fixed by `android.app.lib_name` in the manifest.

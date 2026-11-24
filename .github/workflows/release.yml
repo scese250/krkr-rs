@@ -10,10 +10,9 @@
 # cannot race each other. The repository static gate is a local pre-tag check,
 # not a release job: it is slow and repeats work these builds already compile.
 #
-# Scope of the Android build: `arm64-v8a` only, release build. No other ABIs,
-# no emulator, no real signing key (the APK is signed with the debug key when
-# no keystore secret is configured, so it installs — see
-# docs/code/android/build.md §5, "Signing").
+# Scope of the Android build: `arm64-v8a` only, debug build (`--debug` +
+# `assembleDebug`), signed with the shared `android/app/debug.keystore` so
+# successive CI builds can be installed over each other without uninstalling.
 #
 # The commands mirror builds that were run by hand and verified end to end on a
 # development machine; the orchestrations below are exercised by every `v*`
@@ -157,12 +156,24 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Zig and C++ dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/zig
+            ~/.cache/zig
+          key: zig-linux-${{ env.ZIG_VERSION }}-${{ hashFiles('deps/build.zig.zon') }}
+          restore-keys: |
+            zig-linux-${{ env.ZIG_VERSION }}-
+
       - name: Install Zig
         run: |
           ZIG_DIR="$RUNNER_TEMP/zig"
-          mkdir -p "$ZIG_DIR"
-          curl -sSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
-            | tar -xJ --strip-components=1 -C "$ZIG_DIR"
+          if [ ! -x "$ZIG_DIR/zig" ]; then
+            mkdir -p "$ZIG_DIR"
+            curl -sSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
+              | tar -xJ --strip-components=1 -C "$ZIG_DIR"
+          fi
           echo "$ZIG_DIR" >> "$GITHUB_PATH"
           "$ZIG_DIR/zig" version
 
@@ -226,7 +237,7 @@ jobs:
           retention-days: 14
 
   apk:
-    name: Release APK (arm64-v8a)
+    name: Debug APK (arm64-v8a)
     runs-on: ubuntu-latest
     # A build takes about seven minutes. The default is six hours, so a hung
     # step would bill for hours before failing; this fails fast instead.
@@ -257,6 +268,27 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      - name: Resolve Android SDK root
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          # `crates/android/build-android.sh` reads this to locate the toolchain,
+          # and Gradle resolves `ndkVersion` under $SDK_ROOT/ndk.
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Cache Android NDK and SDK packages
+        id: cache-android-sdk
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.NDK_VERSION }}
+            ${{ env.ANDROID_SDK_ROOT }}/platforms/${{ env.PLATFORM_VERSION }}
+            ${{ env.ANDROID_SDK_ROOT }}/platforms/${{ env.AGP_PLATFORM_VERSION }}
+            ${{ env.ANDROID_SDK_ROOT }}/build-tools/${{ env.BUILD_TOOLS_VERSION }}
+            ${{ env.ANDROID_SDK_ROOT }}/build-tools/${{ env.AGP_BUILD_TOOLS_VERSION }}
+          key: android-sdk-${{ env.NDK_VERSION }}-${{ env.PLATFORM_VERSION }}-${{ env.BUILD_TOOLS_VERSION }}-${{ env.AGP_PLATFORM_VERSION }}-${{ env.AGP_BUILD_TOOLS_VERSION }}
+
       # No `android-actions/setup-android` step: it installs the legacy `tools`
       # package, which no longer exists in Google's repository, so it fails with
       # "Failed to find package 'tools'". The runner image already ships an SDK
@@ -264,41 +296,28 @@ jobs:
       # what is missing — which also makes the SDK root explicit rather than
       # implicit in the action's behaviour.
       - name: Install the NDK, platform and build-tools
+        if: steps.cache-android-sdk.outputs.cache-hit != 'true'
         run: |
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
-          SDKMANAGER="$(command -v sdkmanager || ls -d "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager | tail -1)"
+          SDKMANAGER="$(command -v sdkmanager || ls -d "$ANDROID_SDK_ROOT"/cmdline-tools/*/bin/sdkmanager | tail -1)"
           echo "using $SDKMANAGER"
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --install \
             "ndk;$NDK_VERSION" "platforms;$PLATFORM_VERSION" "build-tools;$BUILD_TOOLS_VERSION" \
             "platforms;$AGP_PLATFORM_VERSION" "build-tools;$AGP_BUILD_TOOLS_VERSION"
-          # `crates/android/build-android.sh` reads this to locate the toolchain,
-          # and Gradle resolves `ndkVersion` under $SDK_ROOT/ndk, which
-          # sdkmanager has just populated.
-          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
-
-      # The release signing key, base64-encoded in a secret so the keystore is
-      # never in the repository. Written to $GITHUB_ENV, so it reaches the
-      # Gradle step. Deliberately *not* an `if:` on the secret — the `secrets`
-      # context is not available there — and the absence of the secret is a
-      # normal case that the build handles (it falls back to the debug key).
-      - name: Decode the release keystore (when a secret is configured)
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          if [ -n "$KEYSTORE_B64" ]; then
-            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
-            echo "KRKR_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
-            echo "Signing the release APK with the configured keystore."
-          else
-            echo "No ANDROID_KEYSTORE_BASE64 secret; the release APK will be signed with the debug key."
-          fi
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
+
+      - name: Cache Zig and C++ dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/zig
+            ~/.cache/zig
+          key: zig-android-${{ env.ZIG_VERSION }}-${{ hashFiles('deps/build.zig.zon') }}
+          restore-keys: |
+            zig-android-${{ env.ZIG_VERSION }}-
 
       # Zig is needed before the Rust build, not for compiling —
       # `crates/tjs/build.rs` fetches its C/C++ dependencies (fmt, spdlog,
@@ -309,9 +328,11 @@ jobs:
       - name: Install Zig
         run: |
           ZIG_DIR="$RUNNER_TEMP/zig"
-          mkdir -p "$ZIG_DIR"
-          curl -sSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
-            | tar -xJ --strip-components=1 -C "$ZIG_DIR"
+          if [ ! -x "$ZIG_DIR/zig" ]; then
+            mkdir -p "$ZIG_DIR"
+            curl -sSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
+              | tar -xJ --strip-components=1 -C "$ZIG_DIR"
+          fi
           echo "$ZIG_DIR" >> "$GITHUB_PATH"
           "$ZIG_DIR/zig" version
 
@@ -321,34 +342,19 @@ jobs:
           key: android-arm64
 
       # Builds and stages libkrkr_android.so into the Gradle module's jniLibs.
-      # The script owns every Android-specific detail (toolchain paths, the
-      # triple-prefixed clang driver, the linker variable, ANDROID_NDK_HOME for
-      # opusic-sys's cmake) so the engine crates stay platform-neutral — and it
-      # verifies the .so really is arm64 before staging it, because a host
-      # toolchain otherwise produces a silently wrong library.
-      #
-      # Note: deliberately *not* `cargo ndk`, which does not provide CXX in the
-      # form crates/tjs/build.rs reads and therefore falls back to a host
-      # compiler. See the header of the script.
-      - name: Build the engine for arm64-v8a
-        run: bash ./crates/android/build-android.sh --ndk "$ANDROID_NDK_HOME"
+      # `--debug` avoids thin-LTO / codegen-units=1 overhead for faster CI
+      # builds while still stripping debug symbols from the staged .so.
+      - name: Build the engine for arm64-v8a (debug)
+        run: bash ./crates/android/build-android.sh --ndk "$ANDROID_NDK_HOME" --debug
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: ${{ env.GRADLE_VERSION }}
 
-      - name: Assemble the release APK
+      - name: Assemble the debug APK
         working-directory: android
-        env:
-          # `KRKR_KEYSTORE_PATH` arrives via $GITHUB_ENV from the decode step
-          # above; the rest come straight from the secrets. When any are absent
-          # the Gradle build falls back to the debug key and still produces an
-          # installable APK — see app/build.gradle.kts.
-          KRKR_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KRKR_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KRKR_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: gradle :app:assembleRelease --no-daemon --stacktrace
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
 
       # The APK is the artifact that reaches a device, so it is the thing that
       # is checked: every native library it ships must have its dependencies
@@ -363,7 +369,7 @@ jobs:
           # second run checks the package that reaches the device.
           bash ./crates/android/check-jni-libs.sh --self-test
           bash ./crates/android/check-jni-libs.sh \
-            android/app/build/outputs/apk/release/app-release.apk
+            android/app/build/outputs/apk/debug/app-debug.apk
 
       # Whether the names the native code resolves are still in the package.
       #
@@ -374,13 +380,13 @@ jobs:
       # nothing in this log to show for it — so the names are read out of the
       # package and checked here, where a device is not needed.
       - name: Verify the APK surface
-        run: bash ./scripts/apk_surface_check.sh
+        run: bash ./scripts/apk_surface_check.sh android/app/build/outputs/apk/debug/app-debug.apk
 
       - name: Upload the APK
         uses: actions/upload-artifact@v7
         with:
           name: krkr-rs-release-arm64-v8a
-          path: android/app/build/outputs/apk/release/*.apk
+          path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
 
@@ -433,6 +439,6 @@ jobs:
           else
             gh release create "$tag" "$linux" "$apk" \
               --title "krkr-rs $tag" \
-              --notes "Linux x86_64 binary and Android APK (arm64-v8a, Android 15+) built from $GITHUB_SHA." \
+              --notes "Linux x86_64 binary and Android APK (arm64-v8a, Android 13+) built from $GITHUB_SHA." \
               --verify-tag
           fi
