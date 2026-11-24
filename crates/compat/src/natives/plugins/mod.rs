@@ -11,6 +11,7 @@ pub mod add_font;
 pub mod csv_parser;
 pub mod dirlist;
 pub mod emote_player;
+pub mod ext_nagano;
 pub mod extrans;
 pub mod fft_graph;
 pub mod fstat;
@@ -22,6 +23,7 @@ pub mod layer_ex_area_average;
 pub mod layer_ex_btoa;
 pub mod layer_ex_image;
 pub mod layer_ex_long_exposure;
+pub mod layer_ex_raster;
 pub mod motion_player;
 pub mod psb_file;
 pub mod psd_file;
@@ -93,6 +95,12 @@ pub const BUILTIN_PLUGINS: &[BuiltinPluginDef] = &[
         register: emote_player::register,
     },
     BuiltinPluginDef {
+        name: "extNagano.dll",
+        aliases: &[],
+        dependencies: &[],
+        register: ext_nagano::register,
+    },
+    BuiltinPluginDef {
         name: "extrans.dll",
         aliases: &[],
         dependencies: &[],
@@ -160,6 +168,12 @@ pub const BUILTIN_PLUGINS: &[BuiltinPluginDef] = &[
         aliases: &[],
         dependencies: &[],
         register: layer_ex_image::register,
+    },
+    BuiltinPluginDef {
+        name: "layerExRaster.dll",
+        aliases: &[],
+        dependencies: &[],
+        register: layer_ex_raster::register,
     },
     BuiltinPluginDef {
         name: "layerExLongExposure.dll",

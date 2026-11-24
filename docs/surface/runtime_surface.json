@@ -984,6 +984,7 @@
       "copyBottomBlueToTopAlpha",
       "copyExposure",
       "copyFromBitmapToMainImage",
+      "copyRaster",
       "copyRect",
       "copyRightBlueToLeftAlpha",
       "copyToBitmapFromMainImage",

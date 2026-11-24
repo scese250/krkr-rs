@@ -69,6 +69,7 @@ use crate::layer_ops::{RectI, blit_copy, blit_copy_clipped, intersect, intersect
 use crate::scene::{BitmapState, Rect};
 
 mod effect;
+mod extnagano;
 mod extrans_mosaic;
 mod extrans_ripple;
 mod extrans_rotate;
@@ -243,6 +244,31 @@ pub enum TransKind {
         /// than both source dimensions).
         max_drift: i32,
     },
+    /// `blurfade`: cross-fade while blurring source 1 in and source 2 out.
+    BlurFade {
+        /// Peak horizontal blur radius for source 1 (`blur1x` / `blur1`, default 0).
+        blur1_x: i32,
+        /// Peak vertical blur radius for source 1 (`blur1y` / `blur1`, default 0).
+        blur1_y: i32,
+        /// Peak horizontal blur radius for source 2 (`blur2x` / `blur2`, default 0).
+        blur2_x: i32,
+        /// Peak vertical blur radius for source 2 (`blur2y` / `blur2`, default 0).
+        blur2_y: i32,
+        /// Progress easing exponent (`exponent`, default 1.0; must be positive
+        /// and finite).
+        exponent: f64,
+    },
+    /// `rgbfade`: per-channel cross-fade with staggered channel delays.
+    RgbFade {
+        /// Delay for the red channel (`delayR` / `delayr`, default 0.0; non-negative).
+        delay_r: f64,
+        /// Delay for the green channel (`delayG` / `delayg`, default 0.0; non-negative).
+        delay_g: f64,
+        /// Delay for the blue channel (`delayB` / `delayb`, default 0.0; non-negative).
+        delay_b: f64,
+        /// Delay for the alpha channel (`delayA` / `delaya`, default 0.0; non-negative).
+        delay_a: f64,
+    },
 }
 
 impl TransKind {
@@ -263,6 +289,8 @@ impl TransKind {
             TransKind::RotateVanish { .. } => "rotatevanish",
             TransKind::RotateSwap { .. } => "rotateswap",
             TransKind::Ripple { .. } => "ripple",
+            TransKind::BlurFade { .. } => "blurfade",
+            TransKind::RgbFade { .. } => "rgbfade",
         }
     }
 }
@@ -855,6 +883,45 @@ impl Trans {
                     max_drift,
                 },
             )?,
+            TransKind::BlurFade {
+                blur1_x,
+                blur1_y,
+                blur2_x,
+                blur2_y,
+                exponent,
+                ..
+            } => extnagano::apply_blur_fade(
+                self,
+                dst,
+                src1,
+                src2,
+                region,
+                extnagano::BlurFadeParams {
+                    blur1_x,
+                    blur1_y,
+                    blur2_x,
+                    blur2_y,
+                    exponent,
+                },
+            )?,
+            TransKind::RgbFade {
+                delay_r,
+                delay_g,
+                delay_b,
+                delay_a,
+            } => extnagano::apply_rgb_fade(
+                self,
+                dst,
+                src1,
+                src2,
+                region,
+                extnagano::RgbFadeParams {
+                    delay_r,
+                    delay_g,
+                    delay_b,
+                    delay_a,
+                },
+            )?,
         }
         Ok(())
     }
@@ -930,7 +997,7 @@ impl Trans {
     /// the kind that owns the endpoints does not run it twice. A source that
     /// does not cover the destination's columns is read as transparent there,
     /// so the blend draws the part of the source that is there.
-    fn blend_cross_fade(
+    pub(crate) fn blend_cross_fade(
         &self,
         phase: i32,
         dst: &mut BitmapState,
@@ -1227,6 +1294,50 @@ fn validate_options(kind: TransKind) -> Result<(), TransError> {
             }
             Ok(())
         }
+        TransKind::BlurFade {
+            blur1_x,
+            blur1_y,
+            blur2_x,
+            blur2_y,
+            exponent,
+        } => {
+            if blur1_x < 0 {
+                return invalid("blur1x", "must be non-negative");
+            }
+            if blur1_y < 0 {
+                return invalid("blur1y", "must be non-negative");
+            }
+            if blur2_x < 0 {
+                return invalid("blur2x", "must be non-negative");
+            }
+            if blur2_y < 0 {
+                return invalid("blur2y", "must be non-negative");
+            }
+            if !exponent.is_finite() || exponent <= 0.0 {
+                return invalid("exponent", "must be positive and finite");
+            }
+            Ok(())
+        }
+        TransKind::RgbFade {
+            delay_r,
+            delay_g,
+            delay_b,
+            delay_a,
+        } => {
+            if !delay_r.is_finite() || delay_r < 0.0 {
+                return invalid("delayR", "must be non-negative and finite");
+            }
+            if !delay_g.is_finite() || delay_g < 0.0 {
+                return invalid("delayG", "must be non-negative and finite");
+            }
+            if !delay_b.is_finite() || delay_b < 0.0 {
+                return invalid("delayB", "must be non-negative and finite");
+            }
+            if !delay_a.is_finite() || delay_a < 0.0 {
+                return invalid("delayA", "must be non-negative and finite");
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -1400,7 +1511,7 @@ fn coverage(table: &[u8], source: u32, destination: u32) -> u8 {
 /// The row blend and the per-pixel blend share this expression, so the two
 /// cannot drift apart.
 #[inline(always)]
-fn blend_channel(s1: u8, s2: u8, opa: i32) -> u8 {
+pub(crate) fn blend_channel(s1: u8, s2: u8, opa: i32) -> u8 {
     let s1 = i32::from(s1);
     let s2 = i32::from(s2);
     let value = s1 + (((s2 - s1) * opa) >> 8);

@@ -192,7 +192,9 @@ impl Trans {
             | TransKind::RotateZoom { .. }
             | TransKind::RotateVanish { .. }
             | TransKind::RotateSwap { .. }
-            | TransKind::Ripple { .. } => None,
+            | TransKind::Ripple { .. }
+            | TransKind::BlurFade { .. }
+            | TransKind::RgbFade { .. } => None,
         }
     }
 }

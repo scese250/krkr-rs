@@ -507,6 +507,44 @@ fn build_transition(
             }
             Ok(trans)
         }
+        "blurfade" => {
+            let duration = time()?;
+            let blur1 = option_int(host, options, &["blur1"])?.unwrap_or(0);
+            let blur1_x = option_int(host, options, &["blur1x"])?.unwrap_or(blur1);
+            let blur1_y = option_int(host, options, &["blur1y"])?.unwrap_or(blur1);
+            let blur2 = option_int(host, options, &["blur2"])?.unwrap_or(0);
+            let blur2_x = option_int(host, options, &["blur2x"])?.unwrap_or(blur2);
+            let blur2_y = option_int(host, options, &["blur2y"])?.unwrap_or(blur2);
+            let exponent = option_float(host, options, &["exponent"])?.unwrap_or(1.0);
+            // Accepted for compatibility with `extNagano.dll` scripts; CPU
+            // rendering computes the current frame's blur on demand.
+            let _prerender = option_int(host, options, &["prerender"])?;
+            let _blur_type = option_int(host, options, &["type"])?;
+            Trans::new(
+                TransKind::BlurFade {
+                    blur1_x,
+                    blur1_y,
+                    blur2_x,
+                    blur2_y,
+                    exponent,
+                },
+                duration,
+            )
+            .map_err(|error| error.to_string())
+        }
+        "rgbfade" => {
+            let duration = time()?;
+            Trans::new(
+                TransKind::RgbFade {
+                    delay_r: option_float(host, options, &["delayR", "delayr"])?.unwrap_or(0.0),
+                    delay_g: option_float(host, options, &["delayG", "delayg"])?.unwrap_or(0.0),
+                    delay_b: option_float(host, options, &["delayB", "delayb"])?.unwrap_or(0.0),
+                    delay_a: option_float(host, options, &["delayA", "delaya"])?.unwrap_or(0.0),
+                },
+                duration,
+            )
+            .map_err(|error| error.to_string())
+        }
         other => {
             // A name no provider answers is drawn as the cross-fade, the way
             // the provider lookup falls back, and the fallback is reported.
