@@ -102,6 +102,16 @@ def uleb128(data: bytes, offset: int) -> tuple[int, int]:
         shift += 7
 
 
+# The access-flag bits the class data and the field tables are read against.
+#
+# The values are the DEX format's own: a field the native side reads off the
+# Activity is kept only when the shrinker was told to, so the check tells a
+# static field from an instance one and a native method from a regular one.
+ACC_PUBLIC = 0x0001
+ACC_STATIC = 0x0008
+ACC_NATIVE = 0x0100
+
+
 @dataclass
 class DexClass:
     """One class of a DEX file."""

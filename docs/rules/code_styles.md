@@ -417,7 +417,7 @@ page states in §2–§8 and in [`arch_rules.md`](arch_rules.md).
 | `void-getter` | a native getter never hands the script a raw `void` where the reference returns a value |
 | `native-instance-lookup` | an invalidated native instance resolves by class, and the dispatch keeps the invalidation guard |
 | `android-target` | no backend-feature leak into the Android target, and the two backends are never enabled together |
-| `apk-surface` | the Android keep rules name every JNI field the engine reads, and keep only classes the manifest starts |
+| `apk-surface` | the Android keep rules name every JNI field the engine reads, keep only classes the manifest starts, and the release script resolves |
 | `surface-lock` | the script-visible surface is the committed baseline |
 | `native-parity`, `plugin-parity` | reports: what the reference has that the port does not |
 | `host-facts` | every host-fact seam is installed by production code |

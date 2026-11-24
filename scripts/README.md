@@ -50,7 +50,7 @@ Activity through JNI, and the game-activity glue's lookup of the native entry
 point — and the classes and members the keep rules name.
 The check reads the DEX tables, the ELF symbol table and the compiled manifest
 directly, with the standard library only, so it needs no SDK tool and no
-device; `--self-test` mutates the real package four ways and asserts that each
+device; `--self-test` mutates the real package five ways and asserts that each
 mutation is caught.
 
 ### The slow-frame statistics

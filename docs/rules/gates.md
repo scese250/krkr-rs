@@ -41,7 +41,7 @@ It runs the steps below in this order and stops at the first failure:
 | 15 | `cargo clippy --workspace --all-targets -- -D warnings` | cargo | the host build |
 | 16 | `cargo clippy -p platform --features platform-android --all-targets -- -D warnings` | cargo | the Android feature on the host |
 | 17 | `android-target` | check | no desktop-only backend leaks into the Android graph, or vice versa |
-| 18 | `apk-surface` | check | the Android keep rules name every JNI field the engine reads, and keep only classes the manifest starts |
+| 18 | `apk-surface` | check | the Android keep rules name every JNI field the engine reads, keep only classes the manifest starts, and the release script it cannot run resolves |
 | 19 | `surface-lock` | check | the live VM dispatch dump matches the committed baseline (D29) |
 | 20 | `native-parity --no-doc` | check | the native class surface vs the reference |
 | 21 | `plugin-parity --no-doc` | check | the plugin surface vs the reference |

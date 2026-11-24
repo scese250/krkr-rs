@@ -14,7 +14,10 @@ drift before a tag is spent:
   named in `android/app/proguard-rules.pro`, or the shrinker may rename it
   and the engine reads a field that is not there;
 * the engine Activity the keep rule names is the one the manifest starts, or
-  the rule keeps a class the package never loads.
+  the rule keeps a class the package never loads;
+* the release script reads no name it does not define. It runs nowhere but a
+  tag build, so a name the tree no longer defines is a failure that costs a
+  tag to find.
 
 The field names are read through `scripts/apk_surface_check.py`'s own reader,
 which is their one owner: a second copy of the list here is a table that can
@@ -31,6 +34,8 @@ Exit status is non-zero on any finding.
 from __future__ import annotations
 
 import argparse
+import ast
+import builtins
 import re
 import sys
 from pathlib import Path
@@ -38,6 +43,7 @@ from pathlib import Path
 from ..common import FIXTURES_DIR, REPO_ROOT
 
 KEEP_RULES_SOURCE = "android/app/proguard-rules.pro"
+SCRIPT_SOURCE = "scripts/apk_surface_check.py"
 MANIFEST_SOURCE = "android/app/src/main/AndroidManifest.xml"
 # The Activity class the launcher starts is the one carrying the field names.
 ENGINE_ACTIVITY = "dev.krkr.rs.KrkrGameActivity"
@@ -61,6 +67,55 @@ def _apk_surface_check():
     import apk_surface_check
 
     return apk_surface_check
+
+
+def undefined_names(source: str) -> list[str]:
+    """The names 'source' reads that nothing in it binds.
+
+    A name bound anywhere in the module counts as bound, which keeps the check
+    free of false findings; what it catches is the name that is defined
+    nowhere, which is what a deletion leaves behind.
+    """
+    tree = ast.parse(source)
+    bound = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__spec__"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            bound.add(node.id)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.alias):
+            bound.add((node.asname or node.name).split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+    used = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    return sorted(used - bound)
+
+
+def check_script(root: Path) -> list[Finding]:
+    """Validate the release script under 'root'."""
+    path = root / SCRIPT_SOURCE
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError as error:
+        return [("script", f"cannot read {SCRIPT_SOURCE}: {error}")]
+    missing = undefined_names(source)
+    if not missing:
+        return []
+    return [
+        (
+            "script-names",
+            f"{SCRIPT_SOURCE} reads {', '.join(missing)}, which nothing in it binds; "
+            f"the release job is the only place it runs, so it would fail a tag build",
+        )
+    ]
 
 
 def check_tree(root: Path) -> list[Finding]:
@@ -189,8 +244,23 @@ def self_test(verbose: bool = True) -> int:
         print(f"  fired:    {sorted(fired)}")
         return 1
 
+    # The name check is what keeps a deletion in the release script from
+    # reaching a tag build, so the self-test proves it fires.
+    if undefined_names("def f():\n    return NOT_DEFINED\n") != ["NOT_DEFINED"]:
+        print("check-apk-surface: self-test FAILED: the name check fires on nothing")
+        return 1
+    script_problems = check_script(REPO_ROOT)
+    if script_problems:
+        print(f"check-apk-surface: self-test FAILED: {SCRIPT_SOURCE} does not resolve")
+        for rule, message in script_problems:
+            print(f"  {rule}: {message}")
+        return 1
+
     if verbose:
-        print(f"check-apk-surface: self-test ok ({len(expected)} rule(s) fired)")
+        print(
+            f"check-apk-surface: self-test ok ({len(expected)} rule(s) fired, "
+            f"{SCRIPT_SOURCE} resolves)"
+        )
     return 0
 
 
@@ -208,12 +278,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return self_test()
 
-    findings = check_tree(Path(args.repo_root))
+    root = Path(args.repo_root)
+    findings = check_tree(root) + check_script(root)
     if not findings:
         if not args.quiet:
             print(
-                "check-apk-surface: clean (the Android keep rules name every JNI field "
-                "and keep only classes the manifest starts)"
+                "check-apk-surface: clean (the Android keep rules name every JNI field, "
+                "keep only classes the manifest starts, and the release script resolves)"
             )
         return 0
     for rule, message in findings:

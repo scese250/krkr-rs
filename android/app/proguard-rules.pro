@@ -10,7 +10,7 @@
 
 # The engine Activity. The framework instantiates the class the manifest names,
 # and the native library reads the eight static fields below with
-# GetStaticFieldID. `scripts/apk_size_report.py` reads the field names from
+# GetStaticFieldID. `scripts/apk_surface_check.py` reads the field names from
 # `crates/android/src/jni_fields.rs` and fails the build when this list does not
 # name one of them, so the two cannot part silently.
 -keep class dev.krkr.rs.KrkrGameActivity {
