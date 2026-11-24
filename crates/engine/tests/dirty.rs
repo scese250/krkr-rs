@@ -127,6 +127,38 @@ fn a_changed_frame_draws_again() {
     );
 }
 
+/// A move changes the picture: the layer is drawn at its new offset, so the
+/// frame draws again.
+///
+/// reference/krkr2/cpp/core/visual/LayerIntf.cpp:2203-2218 — `SetPosition`
+/// updates the parent's region for the place the layer leaves and the place
+/// it takes.
+#[test]
+fn a_move_marks_the_scene_changed() {
+    let mut engine = headless_engine((64, 64));
+    let mut hook = NoopFrame;
+    let window = engine.scene_mut().add_window("t", (64, 64));
+    let parent = primary_layer(&mut engine, window);
+    let child = engine.scene_mut().add_layer(window, Some(parent));
+    engine
+        .scene_mut()
+        .update_layer(child, |layer| {
+            layer.rect = Rect::new(4, 4, 8, 8);
+            true
+        })
+        .expect("the child");
+    engine.frame(0, &mut hook).expect("frame");
+    assert!(!engine.scene().dirty());
+
+    assert_eq!(
+        engine.scene_mut().set_layer_offset(child, 24, 16),
+        Some(true)
+    );
+    assert!(engine.scene().dirty(), "a move changes the picture");
+    let report = engine.frame(16, &mut hook).expect("frame");
+    assert!(report.presented, "the moved frame draws");
+}
+
 /// A pixel write changes the picture.
 #[test]
 fn a_bitmap_write_marks_the_scene_changed() {

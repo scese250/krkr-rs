@@ -193,8 +193,8 @@ the ancestor chain, converted into each ancestor's space on the way:
   — the layer itself and the ancestors that hold its contribution — keeps the
   region, caching or not: the content they hold is no longer current;
 * a layer that moved marks the old place and the new one in its parent
-  (`Scene::update_layer`), the way the reference updates the parent before
-  and after the move
+  (`Scene::set_layer_offset`) and leaves its own content current, the way the
+  reference updates the parent before and after the move
   (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6370-6381`);
 * a hidden layer marks nothing above itself: it contributes nothing to the
   composite of its ancestors

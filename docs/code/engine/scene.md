@@ -110,7 +110,8 @@ bitmaps and fonts are released with them.
 | lifetime | `remove_layer` (detach), `destroy_layer` (destroy the subtree), `invalidate_layer` |
 | focus | `set_focus`, `clear_focus`, `focused_in`, `set_domain_focus`, `window_input_root`, `next_focusable`, `prev_focusable`, `node_focusable` |
 | visibility / hit-test | `node_visible`, `node_enabled`, `layer_hit_next`, `layer_hit_outcome` |
-| caches | `inc_cache_enabled_count`, `dec_cache_enabled_count`, `set_cache_bitmap`, `set_transition_self_image`, `set_effect`, `update_layer` |
+| caches | `inc_cache_enabled_count`, `dec_cache_enabled_count`, `set_cache_bitmap`, `set_transition_self_image`, `set_effect` |
+| content / placement | `update_layer` (what the layer draws changed), `set_layer_offset` (the layer moved) |
 | pixels | `main_image_pixel_buffer`, `main_image_pixel_buffer_for_write`, `province_image_pixel_buffer`, `province_image_pixel_buffer_for_write`, `with_main_image_pixels`, `with_main_image_pixels_mut`, `with_province_pixels`, `with_province_pixels_mut`, `allocate_province_image`, `resize_province_image`, `deallocate_province_image`, `province_pixel`, `set_province_pixel` |
 
 ### Bitmaps
@@ -348,7 +349,7 @@ accumulates on it exactly as it accumulates on the CPU.
 L3 native (script call)
    │  marshalled to an engine id
    ▼
-Scene::add_layer / update_layer / layer_mut / bitmap_mut …
+Scene::add_layer / update_layer / set_layer_offset / layer_mut / bitmap_mut …
    │  bumps structure_revision or content_revision
    ▼
 Scene  ──► projection::project_scene_report ──► RenderScene (VM pixels)
@@ -380,7 +381,9 @@ enabled; a change to the pixels a layer draws from marks the area the layer
 draws from that image (`Scene::bitmap_mut`), and every layer that holds those
 pixels keeps the region, caching or not, because the content they hold is no
 longer current; a layer that moved marks the old place and the new one in its
-parent (`Scene::update_layer`); a hidden layer marks nothing above itself.
+parent (`Scene::set_layer_offset`) and leaves its own content current, which
+is a rectangle of the layer's own size in the layer's own space and does not
+depend on where the layer sits; a hidden layer marks nothing above itself.
 The composite reconstructs the region alone — the backdrop is filled over the
 region and every draw writes only the part of it that lands inside — and an
 empty region leaves the content untouched.

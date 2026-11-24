@@ -1221,3 +1221,142 @@ fn a_z_order_write_moves_no_parent_contribution() {
         "the parent's own area does not change: only the child's does"
     );
 }
+
+/// A move marks the parent with the place the layer leaves and the place it
+/// takes, and leaves the layer's own content current.
+///
+/// reference/krkr2/cpp/core/visual/LayerIntf.cpp:2203-2218 — `SetPosition`
+/// calls `ParentUpdate()` before and after it assigns the offsets and never
+/// updates the layer itself; `ParentUpdate` (`:6370-6382`, "called when layer
+/// moves") ORs the layer's rectangle into the parent's region. A layer keeps
+/// a recalculation region of its own only while it caches
+/// (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`).
+#[test]
+fn a_move_marks_the_parent_and_leaves_the_layer_content_alone() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (320, 240));
+    let parent = scene.add_layer(win, None);
+    let child = scene.add_layer(win, Some(parent));
+    // Both layers have an area and cache, so a region a change marks is kept.
+    for (id, size) in [(parent, 320u32), (child, 32u32)] {
+        scene
+            .update_layer(id, |layer| {
+                layer.rect = engine::Rect::new(0, 0, size, size);
+                layer.visible = true;
+                true
+            })
+            .expect("the layer is there");
+        scene.inc_cache_enabled_count(id);
+    }
+    // The setup marked the layers; the test starts from a clean tree.
+    for id in [parent, child] {
+        let _ = scene.take_layer_content_region(id);
+    }
+    let revision = scene.structure_revision();
+
+    // reference/krkr2/cpp/core/visual/LayerIntf.cpp:2203-2218
+    assert_eq!(
+        scene.set_layer_offset(child, 12, 8),
+        Some(true),
+        "the child moved"
+    );
+    assert_eq!(
+        scene.layer(child).expect("the child").rect,
+        engine::Rect::new(12, 8, 32, 32),
+        "the move lands"
+    );
+    assert!(
+        scene.structure_revision() > revision,
+        "the projection reads the offset, so the move re-projects"
+    );
+    assert_eq!(
+        scene.layer_content_region(child),
+        None,
+        "the moved layer draws the same content at a new offset"
+    );
+    assert_eq!(
+        scene.layer_content_region(parent),
+        Some(engine::Rect::new(0, 0, 44, 40)),
+        "the parent redraws the area both placements cover"
+    );
+
+    let _ = scene.take_layer_content_region(parent);
+
+    // A move to the place the layer already holds is free.
+    // reference/krkr2/cpp/core/visual/LayerIntf.cpp:2203
+    let revision = scene.structure_revision();
+    assert_eq!(
+        scene.set_layer_offset(child, 12, 8),
+        Some(false),
+        "the offset did not change"
+    );
+    assert_eq!(
+        scene.structure_revision(),
+        revision,
+        "a move to the place the layer holds bumps no revision"
+    );
+    assert_eq!(
+        scene.layer_content_region(parent),
+        None,
+        "a move to the place the layer holds marks no region"
+    );
+}
+
+/// A move that also changes what the layer draws marks both: the parent's two
+/// placements and the layer's own content.
+///
+/// reference/krkr2/cpp/core/visual/LayerIntf.cpp:2138-2159 —
+/// `InternalSetBounds` runs the offset half and then the size half, each with
+/// its own guard, so a move that also resizes redraws the moved layer as well
+/// as the parent's area.
+#[test]
+fn a_move_that_changes_the_content_marks_both() {
+    let mut scene = Scene::default();
+    let win = scene.add_window("t", (320, 240));
+    let parent = scene.add_layer(win, None);
+    let child = scene.add_layer(win, Some(parent));
+    for (id, size) in [(parent, 320u32), (child, 32u32)] {
+        scene
+            .update_layer(id, |layer| {
+                layer.rect = engine::Rect::new(0, 0, size, size);
+                layer.visible = true;
+                true
+            })
+            .expect("the layer is there");
+        scene.inc_cache_enabled_count(id);
+    }
+    for id in [parent, child] {
+        let _ = scene.take_layer_content_region(id);
+    }
+
+    // The offset half, then the size half.
+    // reference/krkr2/cpp/core/visual/LayerIntf.cpp:2144-2159
+    assert_eq!(
+        scene.set_layer_offset(child, 40, 16),
+        Some(true),
+        "the child moved"
+    );
+    assert_eq!(
+        scene.update_layer(child, |layer| {
+            if layer.rect.w == 16 && layer.rect.h == 16 {
+                return false;
+            }
+            layer.rect.w = 16;
+            layer.rect.h = 16;
+            true
+        }),
+        Some(true),
+        "the resize is a change"
+    );
+
+    assert_eq!(
+        scene.layer_content_region(child),
+        Some(engine::Rect::new(0, 0, 16, 16)),
+        "the resized layer reconstructs its own content"
+    );
+    assert_eq!(
+        scene.layer_content_region(parent),
+        Some(engine::Rect::new(0, 0, 72, 48)),
+        "the parent redraws the placements the move left and took"
+    );
+}

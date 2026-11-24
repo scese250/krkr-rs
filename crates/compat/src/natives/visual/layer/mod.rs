@@ -640,28 +640,26 @@ extern "C" fn layer_set_pos(
     }
     // The position guard and the size guard are independent: a repeated
     // position write does not run `layer_size_changed`, and a repeated size
-    // write does not re-run the position half.
-    let mut size_changed = false;
-    let _ = scene.update_layer(id, |layer| {
-        let mut changed = false;
-        if layer.rect.x != x || layer.rect.y != y {
-            layer.rect.x = x;
-            layer.rect.y = y;
-            changed = true;
-        }
-        if let Some((w, h)) = size {
-            let (w, h) = (w as u32, h as u32);
-            if layer.rect.w != w || layer.rect.h != h {
-                layer.rect.w = w;
-                layer.rect.h = h;
-                size_changed = true;
-                changed = true;
+    // write does not re-run the position half. The position is the layer's
+    // placement, which redraws the parent's area and leaves the layer's own
+    // content alone; the extent is what the layer draws, which redraws the
+    // layer.
+    if scene.set_layer_offset(id, x, y).is_none() {
+        return report_error(out_error, "Layer.setPos: this layer is not constructed");
+    }
+    if let Some((w, h)) = size {
+        let (w, h) = (w as u32, h as u32);
+        if scene.update_layer(id, |layer| {
+            if layer.rect.w == w && layer.rect.h == h {
+                return false;
             }
+            layer.rect.w = w;
+            layer.rect.h = h;
+            true
+        }) == Some(true)
+        {
+            scene.layer_size_changed(id);
         }
-        changed
-    });
-    if size_changed {
-        scene.layer_size_changed(id);
     }
     set_void(out);
     0
@@ -2221,23 +2219,17 @@ layer_int_prop_scene!(
     |l: &LayerState| i64::from(l.rect.x),
     |scene: &mut Scene, id: u32, v: &Value| {
         let left = value_as_i64(v) as i32;
-        let current = scene
+        let (current_left, current_top) = scene
             .layer(id)
-            .map(|layer| layer.rect.x)
+            .map(|layer| (layer.rect.x, layer.rect.y))
             .ok_or_else(|| "Layer: layer no longer exists".to_string())?;
         // A primary layer refuses a real move to a nonzero left; writing
         // the value the layer already holds stores nothing and raises
         // nothing.
-        if current != left && scene.is_primary_layer(id) && left != 0 {
+        if current_left != left && scene.is_primary_layer(id) && left != 0 {
             return Err("Layer: Cannot move primary layer".to_string());
         }
-        match scene.update_layer(id, |layer| {
-            if layer.rect.x == left {
-                return false;
-            }
-            layer.rect.x = left;
-            true
-        }) {
+        match scene.set_layer_offset(id, left, current_top) {
             Some(_) => Ok(()),
             None => Err("Layer: layer no longer exists".to_string()),
         }
@@ -2249,23 +2241,17 @@ layer_int_prop_scene!(
     |l: &LayerState| i64::from(l.rect.y),
     |scene: &mut Scene, id: u32, v: &Value| {
         let top = value_as_i64(v) as i32;
-        let current = scene
+        let (current_left, current_top) = scene
             .layer(id)
-            .map(|layer| layer.rect.y)
+            .map(|layer| (layer.rect.x, layer.rect.y))
             .ok_or_else(|| "Layer: layer no longer exists".to_string())?;
         // A primary layer refuses a real move to a nonzero top; writing
         // the value the layer already holds stores nothing and raises
         // nothing.
-        if current != top && scene.is_primary_layer(id) && top != 0 {
+        if current_top != top && scene.is_primary_layer(id) && top != 0 {
             return Err("Layer: Cannot move primary layer".to_string());
         }
-        match scene.update_layer(id, |layer| {
-            if layer.rect.y == top {
-                return false;
-            }
-            layer.rect.y = top;
-            true
-        }) {
+        match scene.set_layer_offset(id, current_left, top) {
             Some(_) => Ok(()),
             None => Err("Layer: layer no longer exists".to_string()),
         }

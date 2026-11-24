@@ -2029,45 +2029,63 @@ impl Scene {
         }
     }
 
+    /// Set the offset a layer holds inside its parent: the layer moves, the
+    /// content it draws does not.
+    ///
+    /// The parent holds the layer's contribution at the layer's offset, so
+    /// the parent's region comes to cover both the place the layer leaves and
+    /// the place it takes. The layer's own content is a rectangle of the
+    /// layer's own size in the layer's own space, so the move leaves it
+    /// current: a composite of the parent that finds it current draws it at
+    /// its new offset instead of reconstructing it.
+    ///
+    /// Bumps [`Scene::structure_revision`] because the projection reads the
+    /// offset. Returns `Some(false)` when the layer is already at that offset,
+    /// so a move to the place the layer already holds is free, and `None` when
+    /// the layer is absent.
+    pub fn set_layer_offset(&mut self, id: u32, left: i32, top: i32) -> Option<bool> {
+        let layer = self.layer(id)?;
+        let before = layer.rect;
+        if before.x == left && before.y == top {
+            return Some(false);
+        }
+        let (parent, visible) = (layer.parent, layer.visible);
+        if let Some(layer) = self.layer_mut_untracked(id) {
+            layer.rect.x = left;
+            layer.rect.y = top;
+        }
+        if let Some(parent) = parent {
+            let old_at = Rect::new(0, 0, before.w, before.h).offset(before.x, before.y);
+            let new_at = Rect::new(0, 0, before.w, before.h).offset(left, top);
+            self.extend_region_chain(parent, old_at.union(&new_at), visible, ChangeScope::Layer);
+        }
+        self.touch_structure();
+        Some(true)
+    }
+
     /// Apply `f` to a layer and invalidate only when `f` reports a change.
     ///
     /// `f` returns true when it actually mutated the layer. Only then is the
-    /// layer's subtree cache, and every caching ancestor's, marked stale and
-    /// [`Scene::structure_revision`] bumped; an unchanged write touches
-    /// neither, so a property setter that receives its current value is free.
-    /// Returns `None` when the layer is absent, which lets a caller
-    /// distinguish a missing layer from a no-op write.
+    /// layer's content — and every caching ancestor's, which holds that
+    /// content — marked stale and [`Scene::structure_revision`] bumped; an
+    /// unchanged write touches neither, so a property setter that receives
+    /// its current value is free. Returns `None` when the layer is absent,
+    /// which lets a caller distinguish a missing layer from a no-op write.
     ///
     /// The property write is guarded by comparing the requested value with
     /// the stored one before it invalidates.
+    ///
+    /// The write is the content the layer draws, not the place it is drawn
+    /// at: a layer that moves is placed through [`Scene::set_layer_offset`],
+    /// which marks the parent and leaves the layer's own content alone.
     pub fn update_layer(
         &mut self,
         id: u32,
         f: impl FnOnce(&mut LayerState) -> bool,
     ) -> Option<bool> {
-        let before = self.layer(id).map(|layer| (layer.rect, layer.parent));
         let changed = f(self.layer_mut_untracked(id)?);
         if changed {
-            let after = self.layer(id).map(|layer| (layer.rect, layer.parent));
             self.mark_layer_changed(id);
-            // A layer that moved leaves its old place and its new one to
-            // redraw in the parent: the parent's region holds both, so the
-            // parent is marked before and after the move.
-            if let (Some((old, old_parent)), Some((new, new_parent))) = (before, after)
-                && (old.x != new.x || old.y != new.y)
-                && old_parent == new_parent
-                && let Some(parent) = new_parent
-            {
-                let old_at = Rect::new(0, 0, old.w, old.h).offset(old.x, old.y);
-                let new_at = Rect::new(0, 0, new.w, new.h).offset(new.x, new.y);
-                let visible = self.layer(id).is_some_and(|layer| layer.visible);
-                self.extend_region_chain(
-                    parent,
-                    old_at.union(&new_at),
-                    visible,
-                    ChangeScope::Layer,
-                );
-            }
             self.touch_structure();
         }
         Some(changed)

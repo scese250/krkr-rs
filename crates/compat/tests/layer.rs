@@ -751,6 +751,12 @@ fn unchanged_unguarded_property_write_still_invalidates() {
 /// (`reference/cpp/core/visual/LayerIntf.cpp:2203-2204`), so writing back the
 /// stored position bumps no revision and advances no contribution, while a real
 /// move still invalidates. A negative offset is legal on a non-primary layer.
+///
+/// A move redraws the parent and not the layer: `SetPosition` calls
+/// `ParentUpdate()` before and after it assigns the offsets and never updates
+/// the layer itself (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:2203-2218`),
+/// and `ParentUpdate` ORs the layer's rectangle into the parent's region
+/// (`:6370-6382`, "called when layer moves").
 #[test]
 fn unchanged_set_pos_write_does_not_invalidate() {
     let _lock = vm_lock();
@@ -758,26 +764,44 @@ fn unchanged_set_pos_write_does_not_invalidate() {
     env.run(
         "var w = new Window(); \
          var base = new Layer(w, null); \
-         var l = new Layer(w, null);",
+         base.setSize(100, 100); \
+         var l = new Layer(w, base); \
+         l.visible = true;",
     );
     let id = env.scene.layers.last().expect("the layer").id;
+    let parent = env
+        .scene
+        .layer(id)
+        .and_then(|layer| layer.parent)
+        .expect("the layer's parent");
     // The reference's shape: a layer keeps a recalculation region only while
     // its caching is enabled (`reference/krkr2/cpp/core/visual/LayerIntf.cpp:6318-6331`),
-    // so the layer caches here.
+    // so both layers cache here.
     env.scene.inc_cache_enabled_count(id);
+    env.scene.inc_cache_enabled_count(parent);
+    for layer in [id, parent] {
+        let _ = env.scene.take_layer_content_region(layer);
+    }
 
     // A real move invalidates and reads back.
     // reference/cpp/core/visual/LayerIntf.cpp:2204-2216
-    let _ = env.scene.take_layer_content_region(id);
     env.run("l.setPos(5, 7);");
     assert_eq!(env.eval_int("l.left"), 5);
     assert_eq!(env.eval_int("l.top"), 7);
-    assert!(
-        env.scene.layer_content_region(id).is_some(),
-        "the write marks the layer's region"
+    assert_eq!(
+        env.scene.layer_content_region(id),
+        None,
+        "a move leaves the moved layer's own content current"
+    );
+    assert_eq!(
+        env.scene.layer_content_region(parent),
+        Some(engine::Rect::new(0, 0, 37, 39)),
+        "the parent redraws the area the old and the new placement cover"
     );
 
-    let _ = env.scene.take_layer_content_region(id);
+    for layer in [id, parent] {
+        let _ = env.scene.take_layer_content_region(layer);
+    }
     let revision = env.scene.structure_revision();
     env.run("l.setPos(5, 7);");
     // reference/cpp/core/visual/LayerIntf.cpp:2203
@@ -786,9 +810,15 @@ fn unchanged_set_pos_write_does_not_invalidate() {
         revision,
         "an unchanged setPos bumps no revision"
     );
-    assert!(
-        env.scene.layer_content_region(id).is_none(),
+    assert_eq!(
+        env.scene.layer_content_region(id),
+        None,
         "an unchanged setPos marks no region"
+    );
+    assert_eq!(
+        env.scene.layer_content_region(parent),
+        None,
+        "an unchanged setPos marks no region in the parent either"
     );
 
     // The position guard is not a clamp: a negative move still invalidates.
