@@ -1180,11 +1180,17 @@ impl VulkanPipeline {
                 (presentation.frame_in_flight + 1) % MAX_FRAMES_IN_FLIGHT;
             presentation.frame_index = presentation.frame_index.wrapping_add(1);
 
-            let mut needs_recreate = suboptimal;
+            let ignore_suboptimal = presentation.swapchain.compositor_rotated;
+            let mut needs_recreate = suboptimal && !ignore_suboptimal;
             match present_recovery(present_result)
                 .map_err(|error| device::result_error("failed to present the frame", error))?
             {
                 SwapchainRecovery::None => {}
+                SwapchainRecovery::Suboptimal => {
+                    if !ignore_suboptimal {
+                        needs_recreate = true;
+                    }
+                }
                 SwapchainRecovery::RebuildSwapchain => needs_recreate = true,
                 SwapchainRecovery::RecreateSurface => {
                     // The present did not take the image: it is still held,
@@ -2415,6 +2421,9 @@ fn create_offscreen_resources(
 enum SwapchainRecovery {
     /// The operation succeeded without a suboptimal result.
     None,
+    /// `VK_SUBOPTIMAL_KHR`: rebuild unless the compositor is intentionally
+    /// rotating an `IDENTITY` swapchain.
+    Suboptimal,
     /// The swapchain must be rebuilt; the surface is still valid.
     RebuildSwapchain,
     /// The surface is lost; recreate the surface and the swapchain.
@@ -2510,7 +2519,7 @@ fn swapchain_fault(ready: bool, image_count: usize, held: bool) -> Option<Presen
 fn present_recovery(result: Result<bool, vk::Result>) -> Result<SwapchainRecovery, vk::Result> {
     match result {
         Ok(false) => Ok(SwapchainRecovery::None),
-        Ok(true) => Ok(SwapchainRecovery::RebuildSwapchain),
+        Ok(true) => Ok(SwapchainRecovery::Suboptimal),
         Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(SwapchainRecovery::RebuildSwapchain),
         Err(vk::Result::ERROR_SURFACE_LOST_KHR) => Ok(SwapchainRecovery::RecreateSurface),
         Err(error) => Err(error),
@@ -3095,7 +3104,7 @@ mod tests {
         assert_eq!(present_recovery(Ok(false)), Ok(SwapchainRecovery::None));
         assert_eq!(
             present_recovery(Ok(true)),
-            Ok(SwapchainRecovery::RebuildSwapchain)
+            Ok(SwapchainRecovery::Suboptimal)
         );
         assert_eq!(
             present_recovery(Err(vk::Result::ERROR_OUT_OF_DATE_KHR)),

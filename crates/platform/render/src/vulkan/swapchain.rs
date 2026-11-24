@@ -35,6 +35,11 @@ pub(crate) struct SwapchainState {
     pub(crate) present_mode: vk::PresentModeKHR,
     /// Single-attachment render pass used by every frame.
     pub(crate) render_pass: vk::RenderPass,
+    /// True when the swapchain uses `IDENTITY` while the surface reports a
+    /// rotated `current_transform` (e.g. Android landscape on a portrait panel),
+    /// so `VK_SUBOPTIMAL_KHR` is expected on every frame and must not trigger
+    /// an endless swapchain rebuild loop.
+    pub(crate) compositor_rotated: bool,
 }
 
 impl SwapchainState {
@@ -281,6 +286,8 @@ pub(crate) fn create(
         extent,
         present_mode,
         render_pass,
+        compositor_rotated: pre_transform == vk::SurfaceTransformFlagsKHR::IDENTITY
+            && capabilities.current_transform != vk::SurfaceTransformFlagsKHR::IDENTITY,
     })
 }
 

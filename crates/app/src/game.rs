@@ -810,6 +810,14 @@ pub struct GameHost {
     reporting: SlowReporting,
     /// Whether the first frame's timing has been logged.
     first_frame_logged: bool,
+    /// Start of the current 1-second real-time FPS reporting window.
+    fps_window_start: Instant,
+    /// Total frames stepped in the current FPS reporting window.
+    fps_frames: u32,
+    /// Presented frames in the current FPS reporting window.
+    fps_presented: u32,
+    /// Accumulated per-frame active work time (ms) in the current window.
+    fps_work_ms: f64,
 }
 
 /// The engine's frame hook for a running game: the VM tick, the audio drain it
@@ -1179,6 +1187,10 @@ impl GameHost {
             last_frame: FrameAttribution::default(),
             reporting: SlowReporting::default(),
             first_frame_logged: false,
+            fps_window_start: Instant::now(),
+            fps_frames: 0,
+            fps_presented: 0,
+            fps_work_ms: 0.0,
         })
     }
 
@@ -1333,10 +1345,35 @@ impl GameHost {
 
         if !self.first_frame_logged {
             self.first_frame_logged = true;
+            self.fps_window_start = Instant::now();
             log::info!(
                 "app.startup: first frame after open frame_ms={:.1}",
                 self.open_start.elapsed().as_secs_f64() * 1000.0
             );
+        } else {
+            self.fps_frames = self.fps_frames.saturating_add(1);
+            if report.presented {
+                self.fps_presented = self.fps_presented.saturating_add(1);
+            }
+            self.fps_work_ms += total_ms;
+            let elapsed = self.fps_window_start.elapsed().as_secs_f64();
+            if elapsed >= 1.0 {
+                let fps = f64::from(self.fps_frames) / elapsed;
+                let presented_fps = f64::from(self.fps_presented) / elapsed;
+                let avg_ms = if self.fps_frames > 0 {
+                    self.fps_work_ms / f64::from(self.fps_frames)
+                } else {
+                    0.0
+                };
+                log::info!(
+                    "app.frame: fps={fps:.1} presented_fps={presented_fps:.1} avg_ms={avg_ms:.1} frames={}",
+                    self.fps_frames
+                );
+                self.fps_window_start = Instant::now();
+                self.fps_frames = 0;
+                self.fps_presented = 0;
+                self.fps_work_ms = 0.0;
+            }
         }
         Ok(report)
     }
