@@ -80,7 +80,10 @@ use crate::{FrameTimings, TextureFormat, UploadTimings};
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 /// Size of the push-constant block shared with the shaders.
-pub(crate) const PUSH_CONSTANT_SIZE: u32 = 112;
+///
+/// Vulkan guarantees at least 128 bytes of push constants, so the block is as
+/// large as the specification allows and needs no capability check.
+pub(crate) const PUSH_CONSTANT_SIZE: u32 = 128;
 
 /// Immutable Vulkan mechanism held by [`crate::RenderPipeline`].
 ///

@@ -192,15 +192,24 @@ residuals:
 
 ## 4. Rendering and layers
 
-### 4.1 The transition's subtree composite is a CPU full-frame blend
+### 4.1 The transition's subtree composite on the device
 
-The subtree composite runs on the CPU even on the Vulkan backend, where the
-reference's `IsGPU()` path draws the transition with the GPU
-(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7615-7621`). Every pixel of
-every transition frame goes through the software rasterizer. The device path
-that would draw it on the backend exists and reconstructs the region that
-changed, but the real games' trees are refused, so the CPU is the path they
-take (§4.3).
+The device path draws a transition's subtree composite on the backend and
+reconstructs the region that changed, as the reference's `IsGPU()` path does
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:7615-7621`). Landed: a node
+carries the fact that its source is read as an opaque image, so the copy of
+an opaque source is no longer refused (§4.3), and a layer that moves no
+longer recomposites its own content (§4.4). What is left is the held
+draw: a draw that keeps the destination's alpha writes a straight colour,
+and the surface the device composites into holds premultiplied pixels, so
+the read-back would brighten it. Those draws stay on the CPU (typed refusal
+in `subtree_render_tree`). The fix is a keep-alpha slot that scales the
+source by the destination's alpha (`DST_ALPHA` as the source colour factor),
+which leaves the present path unchanged because a window's alpha is one.
+
+The other refusals stand for their own reasons, and each names itself in the
+error: a coverage plane, a scaled image, a source without a texture, a face
+that stores its alpha differently.
 
 * **R8b/R9/R10** `hasImage = true` must raise `TVPLayerCannotHaveImage` when the
   layer type cannot carry an image (`LayerIntf.cpp:2489-2493`): the three
@@ -614,49 +623,48 @@ The pacing, the presentation budget and the skip behaviour stay as they are:
 a frame with nothing to show does not draw, and a frame that gets no image is
 reported the way it is today.
 
-### 4.3 The device composite is refused in the real games
+### 4.3 The device composite draws the games' trees
 
-The device composite of a layer's subtree draws the tree on the backend and
-reconstructs the region that changed; the CPU composite is the fallback for
-every tree the device path refuses
-(`crates/engine/src/layer_ops.rs`, `composite_subtree_on_device`; the
-fallback is `crates/engine/src/engine.rs`, `composite_subtree_on_cpu`). The
-real games' trees are refused: the refusal names "a copy that takes the
-source's alpha", so the CPU composite draws them, and there the region and
-the area are both the whole plane.
+Landed: a node carries the fact that its source is read as an opaque image —
+`RenderNode::opaque_source` — honoured by the software compositor
+(`crates/platform/render/src/cpu.rs`) and by the Vulkan program (the `flags`
+member of the push-constant block, read by `textured.frag` and
+`solid.frag`), and `subtree_render_tree` (`crates/engine/src/layer_ops.rs`)
+maps the copy of an opaque source onto `BlendMode::Replace` at full opacity
+and `BlendMode::SourceOver` below it, which is the reference's
+`CopyOpaqueImage` and its constant-alpha twin. The refusal that sent the real
+games' trees to the CPU composite is gone; the CPU composite is now the
+fallback for the trees the device names itself and cannot draw: a coverage
+plane, a scaled image, a source without a texture, a face that stores its
+alpha differently, and a draw that holds the destination's alpha (§4.1).
 
-* **Closing the refusal needs a blend the pipeline does not have.** The
-  refused draw is the copy of a source that is read as an opaque image — the
-  reference's `CopyOpaqueImage`
-  (`reference/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`, the CPU
-  kernel at `reference/cpp/core/visual/gl/blend_functor_c.h:174-178`), the
-  port's `ModeKernel::CopyOpaque` (`crates/engine/src/layer_ops.rs`) — and
-  the blend enum lives in `crates/platform/api`
-  (`crates/platform/api/src/blend.rs`, `BlendMode`), so the change reaches
-  the shared blend vocabulary and not the composite alone. Until that blend
-  exists, the device path cannot composite a layer's subtree, and the CPU
-  path is the one the games take.
-* **The region's reconstruction is what makes the device path worth
-  taking.** Measured on the device path alone (the Vulkan backend, a debug
-  build, a 640×480 plane with a 64×64 sprite, on a quiet machine): the
-  composite of the whole plane costs **15.71 ms** and the composite of the
-  96×64 region costs **0.44 ms** — the region's own composite cost
-  **15.68 ms** while the device path still drew the whole tree for it. The
-  upload follows the region: 24 KB against the whole plane's 1.2 MB.
+* **What the change is worth is not measured yet.** The transition routes'
+  frame times decide it; the run in §17.2 of
+  [`docs/perf.md`](docs/perf.md) is the one to repeat.
+* **The region's reconstruction is what makes the device path worth taking.**
+  Measured on the device path alone (the Vulkan backend, a debug build, a
+  640×480 plane with a 64×64 sprite, on a quiet machine): the composite of
+  the whole plane costs **15.71 ms** and the composite of the 96×64 region
+  costs **0.44 ms**. The upload follows the region: 24 KB against the whole
+  plane's 1.2 MB.
 
-### 4.4 A move invalidates the moved layer's own content
+### 4.4 A move marks the parent alone
 
-The reference's `SetPosition` updates the parent alone
-(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:2203-2218`; `ParentUpdate`
-at `:6370-6382`, "called when layer moves"), while the port marks the moved
-layer's own region with its whole rectangle (`crates/engine/src/scene.rs`,
-`Scene::update_layer` → `mark_layer_changed`). The picture is the same either
-way, but the moved layer's own content is recomposited for nothing.
+Landed: a layer moves through `Scene::set_layer_offset`, which marks the
+parent's region with the old placement and the new one and leaves the
+layer's own content current, the way the reference's `SetPosition` does
+(`reference/krkr2/cpp/core/visual/LayerIntf.cpp:2203-2218`; `ParentUpdate` at
+`:6370-6382`, "called when layer moves"). `Scene::update_layer` is
+content-only again, and the compat's `setPos`, `left` and `top` use the seam.
 
-The port's behaviour is pinned by `crates/compat/tests/layer.rs`
-(`unchanged_set_pos_write_does_not_invalidate`, "the write marks the layer's
-region"), so the change is a behaviour change and not a cleanup: it needs its
-own decision and its own test.
+What is left is three movers that still write the offset through
+`Scene::layer_mut`: that marks the layer's own content and travels up the
+chain at the *new* offset, so the place the layer left is never marked.
+They are the video overlay's `setPos` (`crates/compat/src/natives/video.rs`),
+the PSD placement (`crates/compat/src/natives/plugins/psd_file/mod.rs`) and
+the transition `Swap` (`crates/compat/src/natives/visual/layer/transitions.rs`).
+Each is the shape just fixed, and the seam each needs exists; the swap also
+moves layers between parents, which `set_layer_offset` does not cover.
 
 ### 4.5 The motion pose still allocates and uploads an offscreen per frame
 

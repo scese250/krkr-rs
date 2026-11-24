@@ -71,12 +71,25 @@ pub struct RenderNode {
     pub blend: BlendMode,
     pub clip: Option<Clip>,
     pub hold_alpha: bool,
+    pub opaque_source: bool,
 }
 
 pub enum RenderContent { None, Solid([f32; 4]), Texture(Texture), Glyphs(GlyphRun) }
 pub enum Clip { Rect(RectF), Mask(Texture) }
 pub struct RenderNodeId(pub u32);
 ```
+
+`opaque_source` is the one fact about a draw that no blend can express: the
+node does not read its source's alpha, so the source's colour lands as it is
+and the node's composed opacity is the coverage. A node that replaces its
+destination at full opacity therefore writes an opaque pixel whatever alpha the
+source carries. Both backends honour it — the software rasterizer replaces the
+sample's alpha with one before it composites, and the Vulkan fragment stages
+output the composed opacity instead of the sampled alpha — so the two draw the
+same picture. It cannot be combined with a blend that reads the destination:
+those blends take the weight of the source's colour from the source's alpha, so
+a node that carries both is refused with `RenderError::Unsupported` by both
+backends rather than drawn differently by each.
 
 Two free functions carry the space math, and **both backends call them**, so
 the backends cannot drift:
@@ -447,6 +460,20 @@ Blend state is not a shader concern; it is a per-pipeline
 | `Multiply` | `DST_COLOR` / `ZERO` / `ADD` |
 | `Screen` | `ONE_MINUS_DST_COLOR` / `ONE` / `ADD` |
 
+The two blends that write an alpha name the source's: the source-over writes
+`src·a + dst·(1 - a)` and the plain copy writes the source's alpha outright. A
+held copy — `Replace` with `hold_alpha` — runs the **keep-alpha copy** slot
+instead: the source's colour goes to the destination and the destination's
+alpha stays. Every other blend is colour-only, so its alpha factors are `ZERO`
+and `ONE`.
+
+A node that reads its source as an opaque image changes the fragment stage's
+alpha, not the blend state: the plain copy's source alpha is then the composed
+opacity, which is `1` at full opacity, so the destination becomes the source's
+colour and an opaque alpha. Below the full opacity the engine resolves the copy
+to a source-over — a plain replace only replaces at full opacity — and the
+blend mixes the source's colour in by the opacity.
+
 The destination-dependent modes need to read the destination colour, which
 fixed-function blend state cannot express. The Vulkan backend draws them with
 a third program, the **destination blend**: it samples the source and a copy of
@@ -516,6 +543,30 @@ and a frame must not write the target the other one is presenting.
 
 Three base programs are prebuilt (a textured quad, a solid quad and the
 destination blend), so a frame never builds pipeline state.
+
+### Push constants
+
+The three scene programs share one push-constant block, and both pipeline
+layouts reserve it whole. The block is **128 bytes** — the most the
+specification guarantees a device to provide, so no capability check is
+needed:
+
+| offset | field | bytes |
+|---|---|---|
+| 0 | `mat4 mvp` | 64 |
+| 64 | `vec4 tint` | 16 |
+| 80 | `vec4 uv_rect` | 16 |
+| 96 | `uint mode` | 4 |
+| 100 | `float opacity` | 4 |
+| 104 | `vec2 target_size` | 8 |
+| 112 | `uvec4 flags` | 16 |
+
+`tint.a` is the tint's own alpha times the composed opacity, and `opacity` is
+the composed opacity alone. Lane 0 of `flags` carries the draw's facts; bit 0
+is the node's `opaque_source`, and the textured and solid fragment stages
+output `opacity` as the fragment's alpha when it is set. The destination blend
+program declares the first 112 bytes: it reads no flag, and a stage that
+declares less than the layout reserves is a suffix it never reads.
 
 ### Descriptor sets
 
@@ -671,6 +722,12 @@ L2-side registry is documented in [`../engine/shader.md`](../engine/shader.md).
   on a machine with no device).
 * `crates/platform/render/tests/null.rs` — the null pipeline round trip
   counting the draws, and the partial upload touching only its region.
+* `crates/platform/render/tests/opaque_source.rs` — a source read as an opaque
+  image: the copy replacing the destination with the source's colour and an
+  opaque alpha, the copy below the full opacity blending by the opacity, the
+  held copy keeping the destination's alpha, the refusal of the fact with a
+  blend that reads the destination, and the device drawing the software
+  rasterizer's picture (or a skip on a machine with no device).
 * `crates/platform/render/tests/pipeline.rs` — the default headless
   configuration, the Vulkan backend being either available or reporting
   `Unsupported`, and the presentation budget: two frame periods, a zero frame

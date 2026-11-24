@@ -157,6 +157,20 @@ pub struct RenderNode {
     pub clip: Option<Clip>,
     /// `holdAlpha` / main-vs-province selection hook.
     pub hold_alpha: bool,
+    /// Whether the node's source is read as an opaque image.
+    ///
+    /// A node that carries this fact does not read its source's alpha: the
+    /// source's colour lands as it is and the node's composed opacity is the
+    /// coverage, so a full-opacity node writes an opaque pixel whatever alpha
+    /// the source carries. Without it the source's own alpha is read, as it is
+    /// for every ordinary draw.
+    ///
+    /// The fact is a property of the source read, not of the blend: no blend
+    /// of the source with the destination can express it. Both backends honour
+    /// it for the fixed-function blends; a blend that reads the destination
+    /// derives the weight of its source colour from the source's alpha, so a
+    /// node cannot carry both and the backends refuse the combination.
+    pub opaque_source: bool,
 }
 
 impl Default for RenderNode {
@@ -176,6 +190,7 @@ impl Default for RenderNode {
             blend: BlendMode::default(),
             clip: None,
             hold_alpha: false,
+            opaque_source: false,
         }
     }
 }

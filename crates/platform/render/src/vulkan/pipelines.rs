@@ -586,7 +586,10 @@ fn blend_state_for_slot(slot: usize) -> vk::PipelineColorBlendAttachmentState {
 
     match slot {
         // The plain copy: the source's colour and the source's alpha replace
-        // the destination's.
+        // the destination's. A copy that reads its source as an opaque image
+        // comes here too: the fragment stage writes the composed opacity as
+        // its alpha, which is one at full opacity, so the destination becomes
+        // the source's colour and an opaque alpha.
         1 => base
             .src_color_blend_factor(vk::BlendFactor::ONE)
             .dst_color_blend_factor(vk::BlendFactor::ZERO)

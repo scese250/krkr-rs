@@ -6745,9 +6745,9 @@ pub fn subtree_composite_size(scene: &Scene, root: u32) -> Option<(u32, u32, boo
 ///
 /// Returns [`RenderError::Unsupported`] when the tree holds a draw this path
 /// cannot reproduce on the device — a coverage plane, an opaque or
-/// additive-alpha face, a scaled image, a copy that takes the source's
-/// alpha — and the backend's own errors otherwise. A refused tree is not a
-/// failure: the caller falls back to the CPU composite.
+/// additive-alpha face, a scaled image — and the backend's own errors
+/// otherwise. A refused tree is not a failure: the caller falls back to the
+/// CPU composite.
 pub fn composite_subtree_on_device<F>(
     scene: &mut Scene,
     root: u32,
@@ -6901,7 +6901,9 @@ fn write_region(bitmap: &mut BitmapState, region: PixelRegion, pixels: &[u8]) ->
 /// approximated: a coverage plane has no bitmap to sample, a scaled image
 /// would be sampled with the backend's own sampler where the CPU composite
 /// resamples it, and the opaque and additive-alpha faces store their alpha
-/// differently than the device's straight-alpha surface.
+/// differently than the device's straight-alpha surface. A copy that takes
+/// the source's alpha is not one of them: it is the copy of a source read as
+/// an opaque image, which is an existing blend with that fact on the node.
 fn subtree_render_tree<F>(
     scene: &Scene,
     draws: &[SubtreeDraw],
@@ -6925,9 +6927,6 @@ where
             return Err(device_unsupported(
                 "a layer whose face stores its alpha differently",
             ));
-        }
-        if draw.treat_as_opaque {
-            return Err(device_unsupported("a copy that takes the source's alpha"));
         }
         let id = match &draw.source {
             SubtreeSource::Cache(id) | SubtreeSource::Bitmap(id) => *id,
@@ -6965,6 +6964,29 @@ where
             SubtreeKind::Plain => BlendMode::SourceOver,
             SubtreeKind::Image => draw.blend,
         };
+        // The copy of an opaque source reads the source as an opaque image:
+        // the source's alpha is not read and the layer's opacity is the
+        // coverage. At full opacity the copy replaces the destination — the
+        // source's colour and an opaque alpha — and below it the copy blends
+        // by the opacity, which the plain replace degrades to. The held
+        // spelling of the copy is its full-opacity one: below full opacity the
+        // blend writes the alpha it leaves, so the destination's alpha is not
+        // held.
+        let opaque_source = draw.kind == SubtreeKind::Image && draw.treat_as_opaque;
+        let hold_alpha = draw.hold_alpha && !(opaque_source && draw.opa != 255);
+        // The held draws write the source's colour as it stands and leave the
+        // destination's alpha in place. The surface the device composites into
+        // holds premultiplied pixels, so a colour written as it stands is
+        // divided by the alpha that was kept when the region is read back, and
+        // the result comes out brightened. The CPU composite holds the alpha
+        // in the space the content is stored in, so it draws these; the device
+        // takes them once the keep-alpha slot scales the source by the
+        // destination's alpha.
+        if hold_alpha {
+            return Err(device_unsupported(
+                "a draw that holds the destination's alpha",
+            ));
+        }
         // The placement clamps the source rectangle to the bitmap, so its
         // origin and its extent are inside it.
         let Ok(source_x) = u32::try_from(source.0) else {
@@ -6993,7 +7015,8 @@ where
             visible: true,
             z,
             blend: crate::projection::resolve_blend(blend, opacity),
-            hold_alpha: draw.hold_alpha,
+            hold_alpha,
+            opaque_source,
             ..RenderNode::default()
         };
         let node = out.push(node);

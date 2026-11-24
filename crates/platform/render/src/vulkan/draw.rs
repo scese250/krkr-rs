@@ -34,13 +34,14 @@ use crate::scene::{
     children_are_sorted, node_spaces,
 };
 
-/// Push-constant block shared with the shaders (112 bytes).
+/// Push-constant block shared with the shaders (128 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PushConstants {
     /// Column-major matrix mapping the unit quad to NDC.
     mvp: [f32; 16],
-    /// RGBA tint; alpha carries the composed opacity.
+    /// RGBA tint; alpha carries the tint's own alpha times the composed
+    /// opacity.
     tint: [f32; 4],
     /// `(u, v, width, height)` source rectangle inside the texture.
     uv_rect: [f32; 4],
@@ -50,6 +51,24 @@ struct PushConstants {
     opacity: f32,
     /// The size of the target the scene is composed into, in device pixels.
     target_size: [f32; 2],
+    /// The draw's flags, one lane per flag the fragment stages test.
+    flags: [u32; 4],
+}
+
+/// The push-constant lane and bit a draw sets when it reads its source as an
+/// opaque image.
+///
+/// The fragment stages carry the same number: the textured and the solid
+/// program read the composed opacity as the coverage when the bit is set.
+const FLAG_OPAQUE_SOURCE: u32 = 1;
+
+/// The draw's flags for one node.
+fn draw_flags(opaque_source: bool) -> [u32; 4] {
+    if opaque_source {
+        [FLAG_OPAQUE_SOURCE, 0, 0, 0]
+    } else {
+        [0; 4]
+    }
 }
 
 /// The push-constant block shared with the shaders must match the size the
@@ -249,6 +268,7 @@ pub(crate) fn record_present(
         mode: 0,
         opacity: 1.0,
         target_size: [extent.width as f32, extent.height as f32],
+        flags: [0; 4],
     };
     // SAFETY: `constants` is a live, fully initialized push-constant block.
     let bytes = unsafe {
@@ -289,9 +309,13 @@ struct QuadDraw<'a> {
     blend: api::blend::BlendMode,
     /// Whether the draw holds the destination's alpha.
     hold_alpha: bool,
+    /// Whether the draw reads its source as an opaque image.
+    opaque_source: bool,
+    /// The composed opacity of the node the draw belongs to.
+    opacity: f32,
     /// Transform from the node's local space to device pixels.
     world: &'a Affine2,
-    /// RGBA tint; alpha carries the composed opacity.
+    /// RGBA tint; alpha carries the tint's alpha times the composed opacity.
     tint: [f32; 4],
     /// `(u, v, width, height)` source rectangle inside the texture.
     uv_rect: [f32; 4],
@@ -384,6 +408,8 @@ impl Recorder<'_> {
             program: Program::Solid,
             blend: api::blend::BlendMode::Replace,
             hold_alpha: false,
+            opaque_source: false,
+            opacity: 1.0,
             world: &Affine2::IDENTITY,
             tint: self.pass.clear,
             uv_rect: [0.0, 0.0, 1.0, 1.0],
@@ -473,7 +499,11 @@ impl Recorder<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`RenderError::Unsupported`] for a GPU glyph run.
+    /// Returns [`RenderError::Unsupported`] for a GPU glyph run, and for a
+    /// source read as an opaque image on a draw that cannot honour it: a blend
+    /// that reads the destination takes the weight of the source's colour from
+    /// the source's alpha, and a custom effect program owns its own source
+    /// read.
     fn draw(
         &mut self,
         node: &RenderNode,
@@ -491,6 +521,8 @@ impl Recorder<'_> {
                     program: Program::Solid,
                     blend: node.blend,
                     hold_alpha: node.hold_alpha,
+                    opaque_source: node.opaque_source,
+                    opacity,
                     world,
                     tint,
                     uv_rect: [0.0, 0.0, 1.0, 1.0],
@@ -504,6 +536,16 @@ impl Recorder<'_> {
                 };
                 if !gpu.uploaded {
                     return Ok(());
+                }
+                // A source read as an opaque image carries no alpha, and the
+                // destination blend derives the weight of its colour from the
+                // source's alpha: the two cannot combine.
+                if node.opaque_source && dst_blend_mode(node.blend).is_some() {
+                    return Err(RenderError::Unsupported {
+                        message: "an opaque source with a blend that reads the destination is \
+                                  not implemented by the Vulkan backend"
+                            .to_owned(),
+                    });
                 }
                 let uv = uv_rect(texture.width(), texture.height(), node.src);
                 if dst_blend_mode(node.blend).is_some() {
@@ -521,8 +563,8 @@ impl Recorder<'_> {
                     })
                 } else {
                     // The per-node tint carries the text colour; the alpha is
-                    // the composed opacity. Ordinary textures keep the
-                    // default `[1, 1, 1, 1]`.
+                    // the tint's alpha times the composed opacity. Ordinary
+                    // textures keep the default `[1, 1, 1, 1]`.
                     let tint = [
                         node.color[0],
                         node.color[1],
@@ -533,6 +575,8 @@ impl Recorder<'_> {
                         program: Program::Textured,
                         blend: node.blend,
                         hold_alpha: node.hold_alpha,
+                        opaque_source: node.opaque_source,
+                        opacity,
                         world,
                         tint,
                         uv_rect: uv,
@@ -545,6 +589,15 @@ impl Recorder<'_> {
                 message: "GPU glyph runs are not implemented by the Vulkan backend".to_owned(),
             }),
             RenderContent::Effect(effect) => {
+                // A custom program owns its own blending and its own source
+                // read, so the fact cannot reach it.
+                if node.opaque_source {
+                    return Err(RenderError::Unsupported {
+                        message: "an opaque source on an effect draw is not implemented by the \
+                                  Vulkan backend"
+                            .to_owned(),
+                    });
+                }
                 // Copy the borrowed fields out before the mutable borrow of the
                 // effect state below.
                 let device = self.pass.device;
@@ -584,6 +637,8 @@ impl Recorder<'_> {
             program,
             blend,
             hold_alpha,
+            opaque_source,
+            opacity,
             world,
             tint,
             uv_rect,
@@ -620,8 +675,9 @@ impl Recorder<'_> {
                 tint,
                 uv_rect,
                 mode: 0,
-                opacity: 1.0,
+                opacity,
                 target_size: target_size(self.extent),
+                flags: draw_flags(opaque_source),
             };
             push_constants(
                 self.pass.device,
@@ -692,6 +748,7 @@ impl Recorder<'_> {
             mode,
             opacity,
             target_size: target_size(self.extent),
+            flags: [0; 4],
         };
         // SAFETY: the command buffer is recording and every handle is live.
         unsafe {

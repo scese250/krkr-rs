@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 
+use api::blend::BlendMode;
 use api::geometry::PixelRegion;
 use engine::layer_ops::{composite_subtree_on_device, render_layer_subtree};
 use engine::{BitmapState, Rect, Scene};
@@ -111,6 +112,71 @@ fn channel_gap(left: &[u8], right: &[u8]) -> u32 {
         .unwrap_or(0)
 }
 
+/// The child layer of `root`'s subtree.
+fn child_of(scene: &Scene, root: u32) -> u32 {
+    scene
+        .layer(root)
+        .and_then(|layer| layer.children.first().copied())
+        .expect("the root layer has a child")
+}
+
+/// The subtree's scene with its child drawing with `blend` at `opacity`, so a
+/// layer can reach the copy family the device path used to refuse.
+fn scene_with_a_copy(blend: BlendMode, opacity: f32) -> (Scene, u32, u32, u32) {
+    let (mut scene, root, root_image, child_image) = scene_with_subtree();
+    let child = child_of(&scene, root);
+    scene
+        .update_layer(child, |state| {
+            state.blend = blend;
+            state.opacity = opacity;
+            true
+        })
+        .expect("the child layer is updated");
+    (scene, root, root_image, child_image)
+}
+
+/// The CPU composite of `scene`'s subtree, as pixels.
+fn cpu_content_pixels(scene: &mut Scene, root: u32) -> Vec<u8> {
+    let content = render_layer_subtree(scene, root).expect("the CPU composite");
+    scene
+        .bitmap(content)
+        .expect("the content bitmap")
+        .rgba
+        .clone()
+}
+
+/// The device composite of `scene`'s subtree, as pixels.
+///
+/// The composite runs on the null backend, whose rasterizer is the pipeline's
+/// own software renderer.
+fn device_content_pixels(scene: &mut Scene, root: u32, images: &[u32]) -> Vec<u8> {
+    let pipeline =
+        create_render_pipeline(PipelineConfig::null()).expect("the null pipeline is created");
+    let mut state =
+        begin_offscreen_render_state(&pipeline).expect("the offscreen state is created");
+    let textures = source_textures(&pipeline, &mut state, scene, images);
+    let target = create_render_target(&pipeline, RenderTargetDesc::new(SIZE.0, SIZE.1))
+        .expect("the surface is created");
+    let content =
+        composite_subtree_on_device(scene, root, &pipeline, &mut state, &target, &mut |id| {
+            textures.get(&id).cloned()
+        })
+        .expect("the device composite runs")
+        .expect("the device composite produced a content");
+    scene
+        .bitmap(content)
+        .expect("the content bitmap")
+        .rgba
+        .clone()
+}
+
+/// The offset of the child layer's first pixel in the content.
+fn child_pixel_offset() -> usize {
+    let rect = child_rect();
+    let content_y = (rect.y + (rect.h / 2) as i32) as u32;
+    ((content_y * SIZE.0 + rect.x as u32) * 4) as usize
+}
+
 /// The device composite draws the picture the CPU composite draws.
 ///
 /// The two paths differ by the blend's rounding: the CPU path works in the
@@ -159,6 +225,79 @@ fn the_device_composite_draws_the_picture_the_cpu_composite_draws() {
     assert!(
         gap <= 2,
         "the two composites agree within one level: the worst gap was {gap}"
+    );
+}
+
+/// A layer that copies its source is drawn on the device, not refused.
+///
+/// The copy of a source read as an opaque image forces the source's alpha to
+/// one (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:174-178`) and the
+/// method built for it is `CopyOpaqueImage`
+/// (`reference/krkr2/cpp/core/visual/ogl/RenderManager_ogl.cpp:3141-3147`),
+/// which `bmCopyOnAlpha` selects at the full opacity
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2398-2399`). The subtree
+/// tree therefore carries the fact and the replace blend, and the two
+/// composites draw the same picture.
+#[test]
+fn a_copy_at_the_full_opacity_is_drawn_on_the_device() {
+    let (mut cpu, root, _, _) = scene_with_a_copy(BlendMode::Replace, 1.0);
+    let cpu_pixels = cpu_content_pixels(&mut cpu, root);
+
+    let (mut scene, root, root_image, child_image) = scene_with_a_copy(BlendMode::Replace, 1.0);
+    let device_pixels = device_content_pixels(&mut scene, root, &[root_image, child_image]);
+
+    assert_eq!(
+        device_pixels.len(),
+        cpu_pixels.len(),
+        "the content holds the same pixels"
+    );
+    let gap = channel_gap(&cpu_pixels, &device_pixels);
+    assert!(
+        gap <= 2,
+        "the two composites agree within one level: the worst gap was {gap}"
+    );
+
+    // The copy replaced the destination under the child, so the child's own
+    // alpha of 200 is not read: the pixel is the child's colour at an opaque
+    // alpha.
+    let offset = child_pixel_offset();
+    assert_eq!(
+        &device_pixels[offset..offset + 4],
+        &[10, 220, 30, 255],
+        "the copy writes the source's colour and an opaque alpha"
+    );
+}
+
+/// A copy below the full opacity blends on the device by the layer's opacity.
+///
+/// Below the full opacity `bmCopyOnAlpha` selects `ConstAlphaBlend_d`
+/// (`reference/krkr2/cpp/core/visual/RenderManager.cpp:2398-2399`), whose
+/// program mixes the destination towards the source by the opacity and writes
+/// the composed alpha
+/// (`reference/krkr2/cpp/core/visual/ogl/RenderManager_ogl.cpp:3184-3193`):
+/// the destination's alpha is not held.
+#[test]
+fn a_copy_below_the_full_opacity_blends_on_the_device() {
+    let (mut cpu, root, _, _) = scene_with_a_copy(BlendMode::Replace, 0.5);
+    let cpu_pixels = cpu_content_pixels(&mut cpu, root);
+
+    let (mut scene, root, root_image, child_image) = scene_with_a_copy(BlendMode::Replace, 0.5);
+    let device_pixels = device_content_pixels(&mut scene, root, &[root_image, child_image]);
+
+    let gap = channel_gap(&cpu_pixels, &device_pixels);
+    assert!(
+        gap <= 2,
+        "the two composites agree within one level: the worst gap was {gap}"
+    );
+
+    // The opacity of 128/255 over the root's alpha of 128/255 leaves the
+    // composed alpha, 255 - (255 - 128) * (255 - 128) / 255 = 192, and not the
+    // destination's 128.
+    let offset = child_pixel_offset();
+    assert_eq!(
+        device_pixels[offset + 3],
+        192,
+        "the blend writes the alpha it leaves"
     );
 }
 

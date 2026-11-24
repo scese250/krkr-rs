@@ -2145,14 +2145,28 @@ dirty mark - the same work costs:
 
 ### 17.4 What is left
 
-The device composite is still refused in the real games - the backend
-reports a copy that takes the source's alpha - so the CPU path composites
-the subtree. Closing it needs a blend the pipeline does not have, and the
-blend's vocabulary lives in the shared API crate, so the change is wider
-than the composite.
+**The device composite draws the trees these routes refused.** A render-tree
+node now carries the fact that its source is read as an opaque image, which is
+the difference the copy of an opaque source needs, and the engine maps it onto
+the replace and source-over blends the pipeline already had (§17.3 measured
+why it matters: the region's own composite is 0.44 ms against the whole
+plane's 15.71 ms). Two things bound it: a draw that keeps the destination's
+alpha still goes to the CPU, because the device surface holds premultiplied
+pixels and a straight colour would be brightened by the read-back; and a
+transition that moves layers now marks the parent alone, where the moved
+layer's own content used to be recomposited for nothing.
 
-A move also invalidates the moved layer's own content, where the
-reference's `SetPosition` updates the parent alone. The picture is the
-same either way; the moved layer's own content is recomposited for
-nothing. That is a behaviour change of its own, and it is left for the
-next round.
+**Not measured yet.** The transition routes of §17.2 are the ones the change
+is for, and they have not been re-run since it landed. The numbers to compare
+are the p99 and the 1% low of the settings and extras routes at the 120 Hz
+pacing, with the load average reported beside them:
+
+    cargo run -p app --release --example gameplay_frames_vulkan \
+      --backend vulkan --headless --frames 3600 --fps 120
+
+**The upload and the prune are the next levers, in that order.** A copy that
+stops being needed is retired and freed at the next frame's sync start, so the
+prune no longer destroys a texture in the middle of a frame that may still
+sample it. The wait the profile saw is the one `VulkanDevice::drop_texture`
+takes before the destroy, and it is still there. The staging write (42.3 ms in
+§16) has not been touched.

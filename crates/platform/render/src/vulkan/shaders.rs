@@ -20,6 +20,10 @@
 //! | 96     | `uint mode`| 4    |
 //! | 100    | `float opacity`| 4 |
 //! | 104    | `vec2 target_size`| 8 |
+//! | 112    | `uvec4 flags`| 16  |
+//!
+//! The block is 128 bytes, the smallest maximum push-constant size the
+//! Vulkan specification guarantees, so no device needs to be asked.
 
 /// Vertex stage for the unit quad.
 pub(crate) const QUAD_VERT: &[u8] = include_bytes!("../../shaders/quad.vert.spv");

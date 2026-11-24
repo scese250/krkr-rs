@@ -207,6 +207,14 @@ impl<P: TextureProvider> Canvas<'_, P> {
     }
 
     /// Rasterizes the node's payload, if it has one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RenderError::Unsupported`] for a payload this rasterizer does
+    /// not draw (a GPU glyph run or an effect), and for a source read as an
+    /// opaque image with a blend that reads the destination: those blends take
+    /// the weight of the source's colour from the source's alpha, which the
+    /// fact does not read.
     fn draw(
         &mut self,
         node: &RenderNode,
@@ -214,6 +222,19 @@ impl<P: TextureProvider> Canvas<'_, P> {
         opacity: f32,
         scissor: PixelRegion,
     ) -> Result<(), RenderError> {
+        // A source read as an opaque image carries no alpha, and a blend that
+        // reads the destination derives the weight of its colour from the
+        // source's alpha: a node cannot carry both.
+        if node.opaque_source
+            && !matches!(node.content, RenderContent::None)
+            && node.blend.is_destination_dependent()
+        {
+            return Err(RenderError::Unsupported {
+                message: "an opaque source with a blend that reads the destination is not \
+                          implemented by the CPU renderer"
+                    .to_owned(),
+            });
+        }
         match &node.content {
             RenderContent::None => Ok(()),
             RenderContent::Solid(color) => {
@@ -392,6 +413,13 @@ impl<P: TextureProvider> Canvas<'_, P> {
             self.pixels[index + 2],
             self.pixels[index + 3],
         ];
+        // A source read as an opaque image carries no alpha of its own: its
+        // colour lands as it is and the composed opacity is the coverage.
+        let src = if node.opaque_source {
+            [src[0], src[1], src[2], 1.0]
+        } else {
+            src
+        };
         let out = composite(node.blend, dst, src, opacity);
         let alpha = if node.hold_alpha { dst[3] } else { out[3] };
         self.pixels[index] = out[0];
