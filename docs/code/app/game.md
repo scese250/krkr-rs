@@ -279,7 +279,11 @@ with the wait attributed to the GPU `acquire` instead of the VM; the five
 poll phases and their sum; the VM tick and its three input segments, plus the
 tick residual; the engine frame's sync, upload, prune, project and render
 costs, the GPU acquire/present/submit/fence costs, and the host residual; the
-audio drain; and the total. The current step's `platform_wait` and `input`
+audio drain; and the total. The frame tail is also reported by its parts —
+`tail.movie`, `tail.paint`, `tail.transition`, `tail.cached_layer` and
+`tail.drains` — because the remedies differ: the movie step, the game's own
+paint handlers, the transition's blend, the cached layers' composite, and the
+host drains the engine consumes. The current step's `platform_wait` and `input`
 come from the platform loop's own pacing measurement, and `unaccounted`
 closes the accounting.
 

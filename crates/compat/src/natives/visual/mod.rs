@@ -113,8 +113,8 @@ pub(crate) fn timer_count(services: &crate::CompatServices) -> usize {
 // requests, advances transitions and composites the script-cached layers from
 // its `frame_tail` step.
 pub use layer::{
-    advance_self_updating_transitions, advance_transitions, paint_poll, refresh_cached_layers,
-    take_capture_releases,
+    advance_self_updating_transitions, advance_transitions, advance_transitions_timed, paint_poll,
+    refresh_cached_layers, take_capture_releases,
 };
 pub use window::{take_bring_to_front_requests, take_update_requests};
 

@@ -36,7 +36,9 @@ pub use focus::take_capture_releases;
 pub(crate) use focus::{
     blur_tree, clear_domain_focus, clear_layer_focus, focus_layer, focus_layer_in_input_domain,
 };
-pub use transitions::{advance_self_updating_transitions, advance_transitions};
+pub use transitions::{
+    advance_self_updating_transitions, advance_transitions, advance_transitions_timed,
+};
 
 /// The neutral colour of a window's primary layer: opaque white, so the
 /// region its image grows into is an opaque backdrop.

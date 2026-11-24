@@ -19,6 +19,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};
+use std::time::Instant;
 
 use crate::engine_api::Scene;
 use crate::engine_api::{
@@ -945,8 +946,28 @@ fn layer_within(scene: &Scene, node: u32, root: u32) -> bool {
 /// Returns the failure of one transition step as a message; the remaining
 /// transitions still advance.
 pub fn advance_transitions(ctx: &crate::CompatCtx) -> Result<(), String> {
+    advance_transitions_timed(ctx).map(|_| ())
+}
+
+/// [`advance_transitions`], with the paint handlers' own duration and the
+/// transition step's.
+///
+/// The frame body takes the two apart because they are different work with
+/// different remedies: a paint handler runs the game's own script, while the
+/// step blends the transition's endpoints. Returned in milliseconds, in the
+/// order the two run.
+///
+/// # Errors
+///
+/// Returns the failure as [`advance_transitions`] does.
+pub fn advance_transitions_timed(ctx: &crate::CompatCtx) -> Result<(f64, f64), String> {
+    let started = Instant::now();
     super::paint_poll(ctx)?;
-    advance(ctx, None)
+    let painted = started.elapsed().as_secs_f64() * 1000.0;
+    let started = Instant::now();
+    advance(ctx, None)?;
+    let advanced = started.elapsed().as_secs_f64() * 1000.0;
+    Ok((painted, advanced))
 }
 
 /// Advance the self-updating transitions whose layer the projection drew.

@@ -105,8 +105,9 @@ pub use natives::async_trigger::async_trigger_poll;
 // the after-projection step advances the self-updating transitions whose layer
 // was drawn. The body also drains the host's window/capture requests.
 pub use natives::visual::{
-    advance_self_updating_transitions, advance_transitions, paint_poll, refresh_cached_layers,
-    take_bring_to_front_requests, take_capture_releases, take_update_requests,
+    advance_self_updating_transitions, advance_transitions, advance_transitions_timed, paint_poll,
+    refresh_cached_layers, take_bring_to_front_requests, take_capture_releases,
+    take_update_requests,
 };
 // The `LayerExMovie` frame body: an L4 [`FrameBody`] forwards its per-frame
 // movie step here, and `set_movie_source` installs the host's decoded source

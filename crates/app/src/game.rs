@@ -95,6 +95,13 @@ struct FramePhases {
     async_trigger_ms: f64,
     continuous_handler_ms: f64,
     frame_tail_ms: f64,
+    /// The frame tail's parts: the movie step, the paint handlers, the
+    /// transition step, the cached layers' composite and the host drains.
+    movie_ms: f64,
+    paint_ms: f64,
+    transition_ms: f64,
+    cached_layer_ms: f64,
+    frame_drain_ms: f64,
     body_ms: f64,
 }
 
@@ -205,22 +212,32 @@ impl FrameBody for Polls {
 
     #[allow(unsafe_code)]
     fn frame_tail(&mut self, ctx: &mut CompatCtx) -> Result<(), CompatError> {
+        let ms = |started: Instant| started.elapsed().as_secs_f64() * 1000.0;
         // The movie frame body advances its overlays and copies the current
         // frame into the layer before the transition step composites it.
+        let started = Instant::now();
         compat::movie_poll(ctx, self.max_step_ms)?;
+        self.phases.movie_ms = ms(started);
         // The frame body owns the per-frame transition step; the remaining
         // hand-offs are host drains the engine frame consumes after this poll
         // returns.
-        compat::advance_transitions(ctx).map_err(CompatError::Engine)?;
+        let (painted, advanced) =
+            compat::advance_transitions_timed(ctx).map_err(CompatError::Engine)?;
+        self.phases.paint_ms = painted;
+        self.phases.transition_ms = advanced;
         // The script-cached layers composite after the transition step, so a
         // cache that contains a transition takes the frame just blended, and
         // before the engine frame uploads and projects.
+        let started = Instant::now();
         compat::refresh_cached_layers(ctx).map_err(CompatError::Engine)?;
+        self.phases.cached_layer_ms = ms(started);
+        let started = Instant::now();
         // SAFETY: `ctx` is bound to a live engine for the callback.
         let services = unsafe { ctx.services() };
         let _ = compat::take_bring_to_front_requests(services);
         let _ = compat::take_update_requests(services);
         let _ = compat::take_capture_releases(ctx);
+        self.phases.frame_drain_ms = ms(started);
         Ok(())
     }
 
@@ -541,6 +558,31 @@ impl FrameAttribution {
                 section: "phases",
                 name: "frame_tail",
                 ms: self.phases.frame_tail_ms,
+            },
+            MeasuredCost {
+                section: "tail",
+                name: "movie",
+                ms: self.phases.movie_ms,
+            },
+            MeasuredCost {
+                section: "tail",
+                name: "paint",
+                ms: self.phases.paint_ms,
+            },
+            MeasuredCost {
+                section: "tail",
+                name: "transition",
+                ms: self.phases.transition_ms,
+            },
+            MeasuredCost {
+                section: "tail",
+                name: "cached_layer",
+                ms: self.phases.cached_layer_ms,
+            },
+            MeasuredCost {
+                section: "tail",
+                name: "drains",
+                ms: self.phases.frame_drain_ms,
             },
             MeasuredCost {
                 section: "vm",
@@ -1930,7 +1972,7 @@ mod tests {
         );
 
         let costs = ranked_costs(&report);
-        assert_eq!(costs.len(), 23, "every measured cost is listed: {report}");
+        assert_eq!(costs.len(), 28, "every measured cost is listed: {report}");
         assert_eq!(costs[0].0, "phases.frame_tail");
         assert_eq!(costs[1].0, "pool.elapsed");
         assert_eq!(costs[2].0, "host.render");
@@ -1992,7 +2034,7 @@ mod tests {
         // The phases are the breakdown of that one cost, not costs of their
         // own, so they are not in the ranked list.
         let costs = ranked_costs(&report);
-        assert_eq!(costs.len(), 24, "every measured cost is listed: {report}");
+        assert_eq!(costs.len(), 29, "every measured cost is listed: {report}");
         assert!(
             !costs.iter().any(|(name, _)| name.starts_with("front_end")),
             "the phases are no costs of their own: {report}"
