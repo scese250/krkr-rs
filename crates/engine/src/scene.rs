@@ -263,6 +263,12 @@ pub struct LayerState {
     /// image keeps the content the pose is drawn over. `None` clears nothing,
     /// and the pose accumulates on the surface the way the frames left it.
     pub pose_clear: Option<[u8; 4]>,
+    /// Whether [`Self::draws`] or [`Self::pose_clear`] changed since the last
+    /// GPU pose draw.
+    ///
+    /// When `false`, the pose surface already holds the current pose and
+    /// [`Scene::draw_layer_draws_gpu`] skips redundant offscreen re-rendering.
+    pub draws_dirty: bool,
     /// The region of the layer's own composited content that must be
     /// reconstructed, in the layer's own coordinate space.
     ///
@@ -1484,6 +1490,7 @@ impl Scene {
             effect: None,
             draws: Vec::new(),
             pose_clear: None,
+            draws_dirty: false,
             content_region: None,
             hint: String::new(),
             show_parent_hint: false,
@@ -4196,10 +4203,10 @@ impl Scene {
     /// converts to a huge unsigned quantity — is clamped to the system limit.
     /// Entries are then evicted down to the new limit.
     ///
-    /// The system limit is a fixed 512 MiB: there is no physical-memory
+    /// The system limit is a fixed 128 MiB: there is no physical-memory
     /// probe, so the cap is the whole limit.
     pub fn set_graphic_cache_limit(&mut self, limit: i64) {
-        const SYSTEM_LIMIT: u64 = 512 * 1024 * 1024;
+        const SYSTEM_LIMIT: u64 = 128 * 1024 * 1024;
         self.set_decoded_image_cache_limit(match limit {
             0 => CacheLimit::Disabled,
             -1 => CacheLimit::bytes(SYSTEM_LIMIT),
@@ -4647,6 +4654,7 @@ impl Scene {
     pub fn set_layer_draws(&mut self, layer_id: u32, draws: Vec<crate::layer_ops::DrawOp>) {
         if let Some(layer) = self.layer_mut_untracked(layer_id) {
             layer.draws = draws;
+            layer.draws_dirty = true;
         }
     }
 
@@ -4663,6 +4671,7 @@ impl Scene {
     pub fn set_layer_pose_clear(&mut self, layer_id: u32, clear: Option<[u8; 4]>) {
         if let Some(layer) = self.layer_mut_untracked(layer_id) {
             layer.pose_clear = clear;
+            layer.draws_dirty = true;
         }
     }
 
@@ -4713,12 +4722,18 @@ impl Scene {
         let Some(layer_index) = self.layer_position(layer_id) else {
             return Ok(false);
         };
+        if !self.layers[layer_index].draws_dirty {
+            return Ok(!self.layers[layer_index].draws.is_empty());
+        }
         // The list is taken out for the call, because the call writes the
         // scene's own fields while the list is read.
         let ops = std::mem::take(&mut self.layers[layer_index].draws);
         let clear = self.layers[layer_index].pose_clear;
         let drawn = self.draw_ops_gpu(pipeline, state, &ops, bitmap_id, clear);
         self.layers[layer_index].draws = ops;
+        if matches!(drawn, Ok(true)) {
+            self.layers[layer_index].draws_dirty = false;
+        }
         drawn
     }
 
@@ -6079,18 +6094,18 @@ mod tests {
         assert_eq!(decodes.get(), 6, "the re-enabled cache hits again");
     }
 
-    /// Nonzero limits are clamped to the 512 MiB system cap. A negative
+    /// Nonzero limits are clamped to the 128 MiB system cap. A negative
     /// value below -1 reaches the reference's `tjs_uint64` parameter as a
     /// huge unsigned quantity and clamps the same way
     /// (`reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2423-2441`), and
     /// a value within the cap is kept as-is.
     #[test]
     fn cache_limit_clamps_to_the_system_cap() {
-        const SYSTEM_LIMIT: u64 = 512 * 1024 * 1024;
+        const SYSTEM_LIMIT: u64 = 128 * 1024 * 1024;
         let mut scene = Scene::default();
 
         // reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2428-2430: -1
-        // selects the system limit; :2438-2439 caps it at 512 MiB.
+        // selects the system limit; capped at 128 MiB.
         scene.set_graphic_cache_limit(-1);
         assert_eq!(scene.graphic_cache_limit(), SYSTEM_LIMIT);
 

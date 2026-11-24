@@ -462,6 +462,32 @@ pub fn drop_texture(p: &RenderPipeline, state: &mut RenderState, tex: Texture) {
     }
 }
 
+/// Releases the render state slots associated with every texture in `textures`.
+///
+/// On the Vulkan backend the device waits for in-flight work at most once for
+/// the whole batch before freeing the textures, instead of once per texture.
+/// Handles that have no live resource in `state` are skipped without waiting.
+pub fn drop_textures(p: &RenderPipeline, state: &mut RenderState, textures: &[Texture]) {
+    match &p.kind {
+        PipelineKind::Null(backend) => {
+            for tex in textures {
+                backend.drop_texture(state, tex.clone());
+            }
+        }
+        PipelineKind::Vulkan(backend) => backend.drop_textures(state, textures),
+    }
+}
+
+/// Releases idle host-visible staging buffers held in `state` to reclaim RAM.
+///
+/// The null backend keeps no staging buffers, so this is a no-op there.
+pub fn shrink_staging_buffers(p: &RenderPipeline, state: &mut RenderState) {
+    match &p.kind {
+        PipelineKind::Null(_) => {}
+        PipelineKind::Vulkan(backend) => backend.shrink_staging_buffers(state),
+    }
+}
+
 /// One texture update in a batch uploaded by [`upload_textures`].
 ///
 /// `pixels` is tightly packed, row-major, for `region` in the texture's

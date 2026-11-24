@@ -532,6 +532,12 @@ impl Host {
         Ok(self.engine.resize(size)?)
     }
 
+    /// Reclaims transient caches and idle GPU staging buffers in response to a
+    /// platform low-memory warning.
+    pub fn handle_low_memory(&mut self) {
+        self.engine.handle_low_memory();
+    }
+
     /// Returns the backend the pipeline was created with.
     pub fn backend(&self) -> BackendKind {
         self.engine.backend()

@@ -535,6 +535,26 @@ impl VulkanPipeline {
         vstate.device_mut().drop_texture(tex);
     }
 
+    /// Releases the GPU resources and state slots for `textures` with a single
+    /// device idle wait.
+    pub(crate) fn drop_textures(&self, state: &mut RenderState, textures: &[Texture]) {
+        if textures.is_empty() {
+            return;
+        }
+        let StateKind::Vulkan(vstate) = &mut state.kind else {
+            return;
+        };
+        vstate.device_mut().drop_textures(textures);
+    }
+
+    /// Releases idle host-visible staging and readback buffers to reclaim RAM.
+    pub(crate) fn shrink_staging_buffers(&self, state: &mut RenderState) {
+        let StateKind::Vulkan(vstate) = &mut state.kind else {
+            return;
+        };
+        vstate.device_mut().shrink_staging_buffers();
+    }
+
     /// Copies a sub-rectangle of `pixels` into `tex`.
     pub(crate) fn upload_texture(
         &self,
@@ -1586,6 +1606,37 @@ impl VulkanDevice {
             let _ = device.device_wait_idle();
         }
         texture.destroy(&device, self.resources.descriptor_pool);
+    }
+
+    /// Releases the GPU resources and state slots for every texture in
+    /// `textures` with at most one device idle wait.
+    pub(crate) fn drop_textures(&mut self, textures: &[Texture]) {
+        let mut removed = Vec::with_capacity(textures.len());
+        for tex in textures {
+            if let Some(texture) = self.textures.remove(&tex.key()) {
+                removed.push(texture);
+            }
+        }
+        if removed.is_empty() {
+            return;
+        }
+        let device = self.device.clone();
+        // SAFETY: wait for in-flight work once before freeing the batch; the
+        // device is idle afterwards.
+        unsafe {
+            let _ = device.device_wait_idle();
+        }
+        for texture in removed {
+            texture.destroy(&device, self.resources.descriptor_pool);
+        }
+    }
+
+    /// Releases idle host-visible staging and readback buffers to reclaim RAM.
+    pub(crate) fn shrink_staging_buffers(&mut self) {
+        self.upload.shrink_staging_buffers(&self.device);
+        if !self.offscreen_fence.in_flight() {
+            self.readback.get_mut().release(&self.device);
+        }
     }
 
     /// Releases the GPU resources and the state slot for `target`.

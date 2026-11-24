@@ -89,6 +89,15 @@ impl Default for StagingBuffer {
     }
 }
 
+/// Host-visible staging capacity above which a buffer is shrunk when a smaller
+/// upload arrives, so a single loading burst does not permanently pin tens of
+/// megabytes of host-visible RAM.
+const STAGING_SHRINK_THRESHOLD: vk::DeviceSize = 16 * 1024 * 1024;
+
+/// Maximum upload size that triggers shrinking an oversized staging buffer
+/// (hysteresis gap below [`STAGING_SHRINK_THRESHOLD`] to prevent thrashing).
+const STAGING_SHRINK_TARGET_MAX: vk::DeviceSize = 8 * 1024 * 1024;
+
 impl StagingBuffer {
     /// Destroys the staging buffer and its memory, if any.
     pub(crate) fn destroy(&self, device: &ash::Device) {
@@ -103,7 +112,17 @@ impl StagingBuffer {
         }
     }
 
-    /// Grows the buffer to hold at least `size` bytes.
+    /// Destroys the staging buffer and resets this handle to empty so its
+    /// host-visible memory is returned to the allocator immediately.
+    pub(crate) fn release(&mut self, device: &ash::Device) {
+        self.destroy(device);
+        self.buffer = vk::Buffer::null();
+        self.memory = vk::DeviceMemory::null();
+        self.capacity = 0;
+    }
+
+    /// Grows (or shrinks when oversized) the buffer to hold at least `size`
+    /// bytes.
     ///
     /// `usage` is the buffer usage the caller will use it for. A staging
     /// buffer is only ever a transfer source and a readback buffer only a
@@ -117,7 +136,9 @@ impl StagingBuffer {
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
     ) -> Result<(), RenderError> {
-        if self.capacity >= size {
+        let should_shrink =
+            self.capacity > STAGING_SHRINK_THRESHOLD && size <= STAGING_SHRINK_TARGET_MAX;
+        if self.capacity >= size && !should_shrink {
             return Ok(());
         }
         let capacity = staging_capacity(size)?;
@@ -243,6 +264,22 @@ impl UploadRing {
     pub(crate) fn destroy(&self, device: &ash::Device) {
         for slot in &self.slots {
             destroy_upload_slot(device, slot);
+        }
+    }
+
+    /// Releases the host-visible staging buffer of every slot whose GPU work
+    /// has completed, without blocking on in-flight uploads.
+    pub(crate) fn shrink_staging_buffers(&mut self, device: &ash::Device) {
+        for slot in &mut self.slots {
+            if slot.in_flight {
+                // SAFETY: `slot.fence` was created by `device`.
+                let signaled = unsafe { device.get_fence_status(slot.fence) }.unwrap_or(false);
+                if !signaled {
+                    continue;
+                }
+                slot.in_flight = false;
+            }
+            slot.staging.release(device);
         }
     }
 

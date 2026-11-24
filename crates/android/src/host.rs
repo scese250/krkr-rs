@@ -100,6 +100,14 @@ impl AndroidHost {
         self.running = None;
     }
 
+    /// Reclaims transient caches and idle GPU staging buffers when Android
+    /// reports low memory.
+    pub(crate) fn handle_low_memory(&mut self) {
+        if let Some(game) = self.running.as_mut() {
+            game.host_mut().handle_low_memory();
+        }
+    }
+
     /// Records a fatal error for the state file and ends the loop.
     fn fail(&mut self, message: String) -> Flow {
         log::error!("android.host: {message}");
@@ -400,7 +408,10 @@ pub(crate) fn run_loop(
                 MainEvent::SaveState { .. } => {
                     state::write_state(state::State::Running, None);
                 }
-                MainEvent::LowMemory => log::warn!("android.host: the system reported low memory"),
+                MainEvent::LowMemory => {
+                    log::warn!("android.host: the system reported low memory");
+                    handler.handle_low_memory();
+                }
                 MainEvent::InputAvailable => {
                     let input_started = Instant::now();
                     translate_input(&app, &mut handler);

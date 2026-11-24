@@ -38,9 +38,10 @@ use api::host::{PresentSkip, Presentation, SurfaceEvent};
 use render::{
     BackendKind, FrameStats, FrameTimings, RenderNode, RenderPipeline, RenderScene, RenderState,
     RenderTarget, RenderTargetDesc, Surface, Texture, TextureDesc, TextureFilter, TextureUpload,
-    UploadTimings, create_render_target, create_texture, destroy_render_target, drop_texture,
+    UploadTimings, create_render_target, create_texture, destroy_render_target, drop_textures,
     last_frame_timings, last_upload_timings, read_render_target, recover_surface, render,
-    render_to_target, resize as resize_render, supports_effect_pipelines, upload_textures,
+    render_to_target, resize as resize_render, shrink_staging_buffers, supports_effect_pipelines,
+    upload_textures,
 };
 
 use crate::clock::{FrameClock, FrameTimeSource, InjectedFrameTime};
@@ -1834,6 +1835,14 @@ impl Engine {
         self.overlay.is_some()
     }
 
+    /// Reclaims transient caches and idle GPU staging buffers in response to a
+    /// platform low-memory warning.
+    pub fn handle_low_memory(&mut self) {
+        self.scene.clear_decoded_image_cache();
+        shrink_staging_buffers(&self.device.pipeline, &mut self.device.state);
+        log::info!("engine.frame: reclaimed caches on low memory");
+    }
+
     /// Uploads every bitmap whose dirty flag is set and clears the flag.
     ///
     /// The scene keeps the bitmaps whose pixels may have changed, so the pass
@@ -2244,10 +2253,11 @@ impl Engine {
     /// Frees every copy in the retire batch: the backend gives the image, its
     /// memory and its descriptor set back.
     fn free_retired(&mut self) {
-        let batch = std::mem::take(&mut self.retired);
-        for texture in batch {
-            drop_texture(&self.device.pipeline, &mut self.device.state, texture);
+        if self.retired.is_empty() {
+            return;
         }
+        let batch = std::mem::take(&mut self.retired);
+        drop_textures(&self.device.pipeline, &mut self.device.state, &batch);
     }
 }
 
