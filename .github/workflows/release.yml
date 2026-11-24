@@ -120,16 +120,24 @@ jobs:
           attempt=1
           while true; do
             echo "apt attempt $attempt at $(date -u +%H:%M:%S)"
-            if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
-                 apt-get "${options[@]}" update \
-               && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
-                 apt-get "${options[@]}" install -y --no-install-recommends \
-                 "${missing[@]}"; then
+            # The image carries a valid index, so the packages usually resolve
+            # and download without a refresh: the refresh is the request a
+            # degraded mirror stalls on, so it is the fallback, not the first
+            # move.
+            install=("${options[@]}" install -y --no-install-recommends "${missing[@]}")
+            if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get "${install[@]}"; then
               break
+            fi
+            echo "refreshing the index at $(date -u +%H:%M:%S)"
+            update=("${options[@]}" update)
+            if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get "${update[@]}"; then
+              if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get "${install[@]}"; then
+                break
+              fi
             fi
             attempt=$((attempt + 1))
             if [ "$attempt" -gt 3 ]; then
-              echo 'the install failed three times; the reason is above' >&2
+              echo "the install failed three times; the reason is above" >&2
               exit 1
             fi
             sleep 20
