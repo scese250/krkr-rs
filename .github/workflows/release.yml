@@ -73,6 +73,10 @@ jobs:
       # The release build compiles the workspace, the C++ TJS2 VM and its
       # Zig-fetched dependencies.
       - name: Install the Linux build dependencies
+        # An install that has not finished in a quarter of an hour is not
+        # installing anything: fail the step so the log says why, instead of
+        # leaving a job that looks like it never started.
+        timeout-minutes: 15
         run: |
           # apt must not wait for an answer that never comes on a runner:
           # the frontend must not prompt, needrestart must not offer to
@@ -80,10 +84,23 @@ jobs:
           # waits), and Dpkg::Use-Pty=0 keeps dpkg off a pty so it cannot
           # ask. `sudo` resets the environment, so the variables are
           # passed on the command line rather than in the step's env.
+          #
+          # The two waits that are left are the ones that hold this step for
+          # minutes with nothing printed: the package lock another process
+          # on the runner holds, and a mirror that stops answering in the
+          # middle of a download. Both are bounded, so a stuck install fails
+          # and names its reason.
+          options=(
+            -o Dpkg::Use-Pty=0
+            -o DPkg::Lock::Timeout=180
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+            -o Acquire::Retries=2
+          )
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
-            apt-get -o Dpkg::Use-Pty=0 update
+            apt-get "${options[@]}" update
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
-            apt-get -o Dpkg::Use-Pty=0 install -y --no-install-recommends \
+            apt-get "${options[@]}" install -y --no-install-recommends \
             bison build-essential clang cmake libclang-dev \
             libavcodec-dev libavformat-dev libavutil-dev \
             libswresample-dev libswscale-dev \
