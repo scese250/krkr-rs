@@ -1306,15 +1306,18 @@ fn mounting_does_not_scan_for_archives() {
     assert!(!storage.exists("inside.txt").unwrap());
 }
 
-/// `find` is file-only, but `exists` reports directories as existing, matching
-/// `TVPIsExistentStorage` (review 1.10).
+/// Both `find` and `exists` are file-only, matching reference
+/// `TVPIsExistentStorage` (`reference/cpp/core/base/impl/StorageImpl.cpp`,
+/// which rejects `FILE_ATTRIBUTE_DIRECTORY`): a directory must not report as
+/// an existing storage file.
 #[test]
-fn directories_exist_but_do_not_find() {
+fn directories_do_not_exist_or_find() {
     let storage = mount_memory(&[("savedata/keep.dat", b"x")]);
 
     assert_eq!(storage.find("savedata").unwrap(), None);
-    assert!(storage.exists("savedata").unwrap());
-    assert!(storage.exists("SAVEDATA").unwrap());
+    assert!(!storage.exists("savedata").unwrap());
+    assert!(!storage.exists("SAVEDATA").unwrap());
+    assert!(storage.exists("savedata/keep.dat").unwrap());
     assert!(!storage.exists("missing-dir").unwrap());
 }
 
@@ -1826,4 +1829,89 @@ fn a_shared_read_skips_the_names_that_do_not_resolve() {
         storage.read("data/missing.bin"),
         Err(StorageReadError::NotFound(_))
     ));
+}
+
+/// Adding a duplicate auto path or removing an absent one is a no-op that
+/// keeps the placed cache and per-entry auto-path tables intact; adding a new
+/// auto path rebuilds only the inverted index without re-listing previously
+/// cached auto-path directories.
+#[test]
+fn add_and_remove_auto_path_preserve_cached_tables_and_skip_noops() {
+    let fs = memory_with(&[("game/ap1/one.txt", b"one"), ("game/ap2/two.txt", b"two")]);
+    let mut storage =
+        Storage::mount_archives(fs, "/game", std::iter::empty::<&str>()).expect("mount");
+    storage.add_auto_path("ap1/");
+
+    assert_eq!(storage.read("one.txt").unwrap(), b"one");
+    let after_first = storage.probe_counts();
+
+    // Duplicate add and absent remove must not invalidate `placed` or tables.
+    storage.add_auto_path("ap1/");
+    storage.remove_auto_path("nonexistent/");
+    assert_eq!(storage.read("one.txt").unwrap(), b"one");
+    assert_eq!(
+        storage.probe_counts(),
+        after_first,
+        "no-op add/remove must not trigger re-probes"
+    );
+
+    // Adding a new auto path must list only the new directory (`ap2/`),
+    // reusing the cached table for `ap1/`.
+    storage.add_auto_path("ap2/");
+    assert_eq!(storage.read("two.txt").unwrap(), b"two");
+    let after_second = storage.probe_counts();
+    // 1 list for app_dir (live disk walk for `two.txt`) + 1 list for `ap2/`.
+    // `ap1/` must NOT be re-listed.
+    assert_eq!(
+        after_second.list,
+        after_first.list + 2,
+        "adding ap2/ must not re-list ap1/: before={after_first:?} after={after_second:?}"
+    );
+}
+
+/// Missing auto-path directories do not issue a second `fs::list` after
+/// `stat` reports `NotFound`, and multi-component relative auto paths whose
+/// top-level folder does not exist under `app_dir` skip deep probes.
+#[test]
+fn missing_auto_path_directories_skip_list_and_deep_probes() {
+    let fs = memory_with(&[("game/present/a.txt", b"a")]);
+    let mut storage =
+        Storage::mount_archives(fs, "/game", std::iter::empty::<&str>()).expect("mount");
+    storage.add_auto_path("absent/");
+    storage.add_auto_path("evimage2/H/deep1/");
+    storage.add_auto_path("evimage2/H/deep2/");
+
+    assert_eq!(storage.find("missing.txt").unwrap(), None);
+    let counts = storage.probe_counts();
+    // `absent/` returned NotFound from stat so it never called `fs::list`.
+    // Only `app_dir` was listed (live disk walk + top-level check for `evimage2`).
+    assert!(
+        counts.list <= 3,
+        "missing auto-path directories must not be listed: {counts:?}"
+    );
+}
+
+/// The inverted auto-path index preserves exact precedence: later auto-path
+/// wins over earlier, a directory in a later auto-path does not shadow a file
+/// in an earlier auto-path, and an exact lower-cased directory in the same
+/// folder still shadows a differently cased file in that folder.
+#[test]
+fn auto_path_index_preserves_later_wins_and_directory_shadowing() {
+    let fs = memory_with(&[
+        ("game/early/shared.txt", b"early"),
+        ("game/early/foo", b"early-file"),
+        ("game/late/shared.txt", b"late"),
+        ("game/late/foo/child.txt", b"dir-marker"),
+        ("game/late/Foo", b"late-mixed-case"),
+    ]);
+    let mut storage =
+        Storage::mount_archives(fs, "/game", std::iter::empty::<&str>()).expect("mount");
+    storage.add_auto_path("early/");
+    storage.add_auto_path("late/");
+
+    // Later auto-path wins for `shared.txt`.
+    assert_eq!(storage.read("shared.txt").unwrap(), b"late");
+    // In `late/`, exact directory `foo/` shadows `Foo`, so lookup falls through
+    // to `early/foo` rather than returning `late/Foo` or failing.
+    assert_eq!(storage.read("foo").unwrap(), b"early-file");
 }

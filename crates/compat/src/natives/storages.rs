@@ -13,7 +13,7 @@
 //! | `addAutoPath(path)` / `removeAutoPath(path)` | maintain the L2 auto-path list; the path must end with `/`, `\` or `>` |
 //! | `getFullPath(path)` | normalized storage name (lowercase, `/` separators, in-archive part additionally collapsed) |
 //! | `getPlacedPath(path)` | normalized placed name when `Storage::find` resolves it, `""` otherwise; positive results are cached in per-family dispatch state |
-//! | `isExistentStorage(name)` | whether the name resolves to a file or directory in the mounted storage/auto paths |
+//! | `isExistentStorage(name)` | whether the name resolves to a file in the mounted storage/auto paths |
 //! | `extractStorageExt/Name/Path`, `chopStorageExt` | pure string helpers over `/`, `\` and the `>` archive delimiter |
 //! | `clearArchiveCache()` | clears the L3 placed-path cache (the L2 mounts are parsed eagerly) |
 //! | `getLocalName(name)` | absolute disk path for a disk file; raises for archive-only names; name unchanged otherwise |

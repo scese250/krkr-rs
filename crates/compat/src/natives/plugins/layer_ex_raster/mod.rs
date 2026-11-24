@@ -11,12 +11,11 @@
 //! When the source and destination images differ in size, the call does
 //! nothing and requests no redraw.
 //!
-//! Deliberate port choices where the upstream is undefined or silent:
+//! Error handling for invalid arguments:
 //!
-//! * a `src` argument that is not an object (undefined behaviour upstream) or
-//!   is an object that is not a `Layer` raises a typed script error;
-//! * `lines <= 0` or `cycle <= 0` (division by zero / NaN-to-int undefined
-//!   behaviour upstream) raises a typed script error.
+//! * a `src` argument that is not an object or is an object that is not a
+//!   `Layer` raises a typed script error;
+//! * `lines <= 0` or `cycle <= 0` raises a typed script error.
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_int, c_void};

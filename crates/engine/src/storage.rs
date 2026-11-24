@@ -598,62 +598,81 @@ enum AutoPathTable {
     },
 }
 
-/// One auto-path table hit.
-enum AutoPathHit {
-    /// The base resolved to a file location.
-    File(Location),
-    /// The base resolved to a directory, so a file lookup finds nothing here.
-    Directory,
-}
-
 impl AutoPathTable {
-    /// Looks up `base` (already lower-cased) in this table.
-    fn lookup(&self, base: &str) -> Option<AutoPathHit> {
+    /// Inserts this table's file entries into the inverted auto-path index.
+    ///
+    /// Entries already present in `index` are left untouched so callers
+    /// populating in reverse `auto_paths` order preserve "later added wins"
+    /// precedence. Within a single folder table, an exact lower-cased
+    /// directory shadows a differently cased file of the same name, while a
+    /// directory in a later auto path does not shadow a file in an earlier one.
+    fn populate_index(&self, index: &mut crate::hasher::Map<String, Location>) {
         match self {
             AutoPathTable::Folder {
                 root,
                 exact,
                 first_file,
             } => {
-                // The lower-cased spelling wins, matching the normalized
-                // lookup; a directory at that spelling shadows a differently
-                // cased file in the same auto-path directory.
-                if let Some(is_dir) = exact.get(base) {
-                    return Some(if *is_dir {
-                        AutoPathHit::Directory
-                    } else {
-                        AutoPathHit::File(Location::Disk(root.join(base)))
-                    });
+                for (key, is_dir) in exact {
+                    if !*is_dir {
+                        index
+                            .entry(key.clone())
+                            .or_insert_with(|| Location::Disk(root.join(key)));
+                    }
                 }
-                first_file
-                    .get(base)
-                    .map(|real| AutoPathHit::File(Location::Disk(root.join(real.as_str()))))
+                for (key, real) in first_file {
+                    if exact.contains_key(key) {
+                        continue;
+                    }
+                    index
+                        .entry(key.clone())
+                        .or_insert_with(|| Location::Disk(root.join(real.as_str())));
+                }
             }
-            AutoPathTable::Archive { archive, entries } => entries
-                .get(base)
-                .map(|full| AutoPathHit::File(Location::Archive(archive.clone(), full.clone()))),
+            AutoPathTable::Archive { archive, entries } => {
+                for (key, full) in entries {
+                    index
+                        .entry(key.clone())
+                        .or_insert_with(|| Location::Archive(archive.clone(), full.clone()));
+                }
+            }
         }
     }
 }
 
-/// The listing of one directory: its entries and the moment it was read.
+/// The file-system state of a directory probed for listing cache validation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectoryState {
+    /// The directory does not exist (or the path is not a directory).
+    Missing,
+    /// The directory exists with a readable modification timestamp.
+    Present(u64),
+    /// The directory exists, but the file system reports no modification
+    /// timestamp (such as the in-memory backend).
+    PresentNoMtime,
+}
+
+/// The listing of one directory: its entries and the state when it was read.
 struct DirectoryListing {
     /// The directory's entries: the name and whether the entry is a
     /// directory.
     entries: Vec<(String, bool)>,
-    /// The directory's modification time when the listing was read.
+    /// The directory's cached state.
     ///
-    /// A directory's modification time moves when an entry is added or
-    /// removed, so it says whether the listing still describes the
-    /// directory. `None` when the directory has no readable modification
-    /// time: such a listing is read again on every probe.
-    modified_ms: Option<u64>,
+    /// A `Missing` listing is reused until [`Storage::invalidate_disk_listings`]
+    /// or [`Storage::clear_resolution_cache`] clears the cache. A `Present(ms)`
+    /// listing stays valid while the directory's modification time matches
+    /// `ms`. A `PresentNoMtime` listing is read again on every probe.
+    state: DirectoryState,
 }
 
 /// The per-storage resolver cache.
 struct ResolutionCache {
     /// Candidate tables keyed by the auto-path entry string.
     auto_paths: crate::hasher::Map<String, Rc<AutoPathTable>>,
+    /// Lazily-built inverted auto-path index mapping lower-cased base name to
+    /// its winning file location (later auto-path wins).
+    auto_path_index: Option<crate::hasher::Map<String, Location>>,
     /// Resolved hits keyed by the requested storage name: a hit is cached, a
     /// miss is not.
     placed: crate::hasher::Map<String, Location>,
@@ -663,7 +682,8 @@ struct ResolutionCache {
     /// The listing is the storage's own view of the directory, and one
     /// listing serves every probe that needs the directory's contents: a
     /// name looked up under twenty-two extensions reads the directory once,
-    /// not twenty-two times.
+    /// not twenty-two times. Missing directories are cached as empty
+    /// [`DirectoryState::Missing`] entries until invalidated.
     listings: crate::hasher::Map<PathBuf, Rc<DirectoryListing>>,
     /// Bottom file-system probes issued while resolving.
     probes: ProbeCounts,
@@ -675,6 +695,7 @@ impl Default for ResolutionCache {
     fn default() -> Self {
         Self {
             auto_paths: crate::hasher::map(),
+            auto_path_index: None,
             placed: crate::hasher::map(),
             listings: crate::hasher::map(),
             probes: ProbeCounts::default(),
@@ -686,6 +707,14 @@ impl Default for ResolutionCache {
 /// The number of leading characters kept in the bounded `debug` storage-miss
 /// line; the rest is elided behind a marker naming the dropped count.
 const MISS_LOG_HEAD_CHARS: usize = 200;
+
+/// Maximum trailing auto-path entries recorded per shape when only `debug`
+/// logging is enabled (not `trace`).
+///
+/// The `debug` miss line is truncated to [`MISS_LOG_HEAD_CHARS`] characters,
+/// so recording hundreds of entries beyond this cap would only allocate
+/// strings that [`SearchTrace::render_short`] immediately discards.
+const DEBUG_AUTO_PATH_TRACE_CAP: usize = 32;
 
 /// The locations a failed storage lookup searched.
 ///
@@ -788,14 +817,31 @@ impl AutoPathTrace {
         }
     }
 
-    /// Records one folder auto-path entry and its candidate.
-    fn record_folder(&mut self, entry: &str, candidate: String) {
-        self.folders.record(entry, candidate);
+    /// Records one folder auto-path entry, computing its candidate only for the
+    /// first folder entry.
+    fn record_folder(&mut self, entry: &str, candidate: impl FnOnce() -> String, detailed: bool) {
+        self.folders.record(entry, candidate, detailed);
     }
 
-    /// Records one archive auto-path entry and its candidate.
-    fn record_archive(&mut self, entry: &str, candidate: String) {
-        self.archives.record(entry, candidate);
+    /// Records one archive auto-path entry, computing its candidate only for
+    /// the first archive entry.
+    fn record_archive(&mut self, entry: &str, candidate: impl FnOnce() -> String, detailed: bool) {
+        self.archives.record(entry, candidate, detailed);
+    }
+
+    /// Records all auto-path entries in reverse (later-added-first) order.
+    fn record_auto_paths(&mut self, entries: &[String], base: &str, detailed: bool) {
+        for entry in entries.iter().rev() {
+            if let Some((arc, dir)) = entry.split_once('>') {
+                self.record_archive(entry, || format!("{arc}>{dir}{base}"), detailed);
+            } else {
+                let dir = entry.trim_end_matches('/');
+                if dir.is_empty() {
+                    continue;
+                }
+                self.record_folder(entry, || format!("{dir}/{base}"), detailed);
+            }
+        }
     }
 
     /// Whether any auto-path entry was recorded.
@@ -825,15 +871,20 @@ struct ShapeEntries {
     example: Option<String>,
     /// The entries after the first, in search order.
     rest: Vec<String>,
+    /// Count of trailing entries omitted when only `debug` logging is active.
+    omitted: usize,
 }
 
 impl ShapeEntries {
-    /// Records one entry of the shape; the first also keeps its candidate.
-    fn record(&mut self, entry: &str, candidate: String) {
+    /// Records one entry of the shape; the first computes and keeps its
+    /// candidate.
+    fn record(&mut self, entry: &str, candidate: impl FnOnce() -> String, detailed: bool) {
         if self.example.is_none() {
-            self.example = Some(candidate);
-        } else {
+            self.example = Some(candidate());
+        } else if detailed || self.rest.len() < DEBUG_AUTO_PATH_TRACE_CAP {
             self.rest.push(entry.to_string());
+        } else {
+            self.omitted += 1;
         }
     }
 
@@ -845,10 +896,16 @@ impl ShapeEntries {
     /// Renders the shape, or `None` when it has no entries.
     fn render(&self) -> Option<String> {
         let example = self.example.as_ref()?;
-        if self.rest.is_empty() {
+        if self.rest.is_empty() && self.omitted == 0 {
             Some(example.clone())
-        } else {
+        } else if self.omitted == 0 {
             Some(format!("{example} (also {})", self.rest.join(", ")))
+        } else {
+            Some(format!(
+                "{example} (also {}, +{} more)",
+                self.rest.join(", "),
+                self.omitted
+            ))
         }
     }
 }
@@ -2318,19 +2375,32 @@ impl Storage {
     /// archive-backed).
     pub fn add_auto_path(&mut self, path: impl Into<String>) {
         let path = self.current_storage_path(path.into());
-        if !self.auto_paths.contains(&path) {
-            self.auto_paths.push(path);
+        if self.auto_paths.contains(&path) {
+            return;
         }
-        // The auto-path cache is cleared whenever the list changes, which
-        // also covers the added path itself.
-        self.clear_resolution_cache();
+        self.auto_paths.push(path);
+        self.invalidate_auto_path_index();
     }
 
     /// Removes an auto search path.
     pub fn remove_auto_path(&mut self, path: &str) {
         let path = self.current_storage_path(path.to_string());
+        let before = self.auto_paths.len();
         self.auto_paths.retain(|p| p != &path);
-        self.clear_resolution_cache();
+        if self.auto_paths.len() != before {
+            self.invalidate_auto_path_index();
+        }
+    }
+
+    /// Invalidates cached placed hits and the inverted auto-path index without
+    /// discarding per-entry auto-path tables or directory listings.
+    fn invalidate_auto_path_index(&mut self) {
+        let cache = self.resolution_cache.get_mut();
+        cache.auto_path_index = None;
+        cache.placed.clear();
+        // The resolution changed, so a read that was scheduled against the
+        // old one must not be served to a caller that resolves now.
+        self.generation = self.generation.saturating_add(1);
     }
 
     /// Resolves an auto path against the current storage path.
@@ -2365,13 +2435,15 @@ impl Storage {
         self.resolution_cache.borrow().read_bytes
     }
 
-    /// Drops the cached auto-path tables and the directory listings.
+    /// Drops the cached auto-path tables, inverted index, and directory
+    /// listings.
     ///
-    /// Call when the auto-path list or the mounted archives change; the probe
+    /// Call when the mounted archives or root configuration change; the probe
     /// counters are kept so the diagnostic survives an invalidation.
     pub fn clear_resolution_cache(&mut self) {
         let cache = self.resolution_cache.get_mut();
         cache.auto_paths.clear();
+        cache.auto_path_index = None;
         cache.placed.clear();
         cache.listings.clear();
         // The resolution changed, so a read that was scheduled against the
@@ -2894,38 +2966,17 @@ impl Storage {
         }
 
         // Auto paths, last added first ("later added wins").
-        // Each auto path's candidate table is built once and cached, so the
-        // lookup is an in-memory hit rather than a directory probe. Archive
-        // prefixes are opened on demand when the table is built. The trace
-        // groups the entries by resolution shape, so a 41-entry list names each
-        // entry once instead of repeating the candidate boilerplate per line.
-        let mut auto_trace = if trace.enabled {
-            Some(AutoPathTrace::new(base))
-        } else {
-            None
-        };
-        for entry in self.auto_paths.iter().rev() {
-            if let Some((arc, dir)) = entry.split_once('>') {
-                if let Some(auto_trace) = auto_trace.as_mut() {
-                    auto_trace.record_archive(entry, format!("{arc}>{dir}{base}"));
-                }
-            } else {
-                let dir = entry.trim_end_matches('/');
-                if dir.is_empty() {
-                    continue;
-                }
-                if let Some(auto_trace) = auto_trace.as_mut() {
-                    auto_trace.record_folder(entry, format!("{dir}/{base}"));
-                }
-            }
-            match self.auto_path_table(entry)?.lookup(base) {
-                Some(AutoPathHit::File(location)) => return Ok(Some(location)),
-                Some(AutoPathHit::Directory) => continue,
-                None => {}
-            }
+        // The inverted index is built lazily from each entry's cached
+        // candidate table, so every lookup or miss is a single hash-map probe.
+        if let Some(location) = self.lookup_auto_paths(base)? {
+            return Ok(Some(location));
         }
-        if let Some(auto_trace) = auto_trace.filter(|trace| !trace.is_empty()) {
-            trace.attempt(|| auto_trace.render());
+        if trace.enabled && !self.auto_paths.is_empty() {
+            let mut auto_trace = AutoPathTrace::new(base);
+            auto_trace.record_auto_paths(&self.auto_paths, base, trace.detailed);
+            if !auto_trace.is_empty() {
+                trace.attempt(|| auto_trace.render());
+            }
         }
 
         // The remaining mounted archives, later mounts first (later-mounted
@@ -3015,28 +3066,40 @@ impl Storage {
     /// name looked up under twenty-two extensions reads the directory once,
     /// not twenty-two times.
     ///
-    /// The listing is kept until the directory changes. The directory's
-    /// modification time moves when an entry is added or removed, so a
-    /// listing whose time differs from the directory's is stale and the
-    /// directory is read again; a directory with no readable modification
-    /// time is read again on every probe. A host that writes into the
-    /// namespace drops the listings itself
-    /// ([`Self::invalidate_disk_listings`]), so a file the game wrote is
-    /// found by the next probe.
+    /// Missing directories are cached as empty [`DirectoryState::Missing`]
+    /// listings without issuing a second `fs::list` call, and stay cached
+    /// until [`Self::invalidate_disk_listings`] or
+    /// [`Self::clear_resolution_cache`] clears the cache. Existing directories
+    /// with a readable modification time stay cached until their mtime moves;
+    /// directories with no readable modification time are read again on every
+    /// probe.
     fn directory_listing(&self, dir: &Path) -> Result<Rc<DirectoryListing>, StorageReadError> {
-        let modified = self.directory_modified_ms(dir)?;
         let cached = self.resolution_cache.borrow().listings.get(dir).cloned();
+        if let Some(listing) = &cached
+            && listing.state == DirectoryState::Missing
+        {
+            return Ok(Rc::clone(listing));
+        }
+        let state = self.directory_state(dir)?;
+        if state == DirectoryState::Missing {
+            let listing = Rc::new(DirectoryListing {
+                entries: Vec::new(),
+                state: DirectoryState::Missing,
+            });
+            self.resolution_cache
+                .borrow_mut()
+                .listings
+                .insert(dir.to_path_buf(), Rc::clone(&listing));
+            return Ok(listing);
+        }
         if let Some(listing) = cached
-            && let Some(modified) = modified
-            && listing.modified_ms == Some(modified)
+            && let DirectoryState::Present(modified) = state
+            && listing.state == DirectoryState::Present(modified)
         {
             return Ok(listing);
         }
         let entries = self.read_directory_listing(dir)?;
-        let listing = Rc::new(DirectoryListing {
-            entries,
-            modified_ms: modified,
-        });
+        let listing = Rc::new(DirectoryListing { entries, state });
         self.resolution_cache
             .borrow_mut()
             .listings
@@ -3044,17 +3107,23 @@ impl Storage {
         Ok(listing)
     }
 
-    /// The directory's modification time, or `None` when it has none.
+    /// Probes the directory's existence and modification timestamp.
     ///
-    /// A directory's modification time moves when an entry is added or
-    /// removed, so it says whether a listing still describes the directory.
-    /// A directory that does not exist has no time, and neither has one
-    /// whose modification time the file system does not report.
-    fn directory_modified_ms(&self, dir: &Path) -> Result<Option<u64>, StorageReadError> {
+    /// Distinguishes a missing/non-directory path ([`DirectoryState::Missing`])
+    /// from an existing directory whose file system reports no modification
+    /// timestamp ([`DirectoryState::PresentNoMtime`]), so missing directories
+    /// can be cached without issuing a redundant `fs::list`.
+    fn directory_state(&self, dir: &Path) -> Result<DirectoryState, StorageReadError> {
         self.resolution_cache.borrow_mut().probes.stat += 1;
         match fs::stat(&self.fs, &FsPath::host(dir)) {
-            Ok(meta) => Ok(meta.modified_ms),
-            Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => Ok(None),
+            Ok(meta) if !meta.is_dir => Ok(DirectoryState::Missing),
+            Ok(meta) => Ok(match meta.modified_ms {
+                Some(ms) => DirectoryState::Present(ms),
+                None => DirectoryState::PresentNoMtime,
+            }),
+            Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => {
+                Ok(DirectoryState::Missing)
+            }
             Err(error) => Err(StorageReadError::Fs(error)),
         }
     }
@@ -3082,6 +3151,36 @@ impl Storage {
             Err(FsError::NotFound { .. }) | Err(FsError::NotADirectory { .. }) => Ok(None),
             Err(error) => Err(StorageReadError::Fs(error)),
         }
+    }
+
+    /// Looks up `base` (already lower-cased) in the lazily-built inverted
+    /// auto-path index.
+    ///
+    /// Populated in reverse `self.auto_paths` order (later added wins) from
+    /// each entry's cached [`AutoPathTable`], so every lookup or miss after
+    /// index construction is a single hash-map probe.
+    fn lookup_auto_paths(&self, base: &str) -> Result<Option<Location>, StorageReadError> {
+        if self.auto_paths.is_empty() {
+            return Ok(None);
+        }
+        if self.resolution_cache.borrow().auto_path_index.is_none() {
+            let mut index = crate::hasher::map();
+            for entry in self.auto_paths.iter().rev() {
+                if !entry.contains('>') && entry.trim_end_matches('/').is_empty() {
+                    continue;
+                }
+                let table = self.auto_path_table(entry)?;
+                table.populate_index(&mut index);
+            }
+            self.resolution_cache.borrow_mut().auto_path_index = Some(index);
+        }
+        Ok(self
+            .resolution_cache
+            .borrow()
+            .auto_path_index
+            .as_ref()
+            .and_then(|index| index.get(base))
+            .cloned())
     }
 
     /// The cached candidate table for one auto-path entry, built on first use.
@@ -3113,12 +3212,38 @@ impl Storage {
     }
 
     /// Builds the plain-directory candidate table from one live listing.
+    ///
+    /// For multi-component relative folders (e.g. `evimage2/H/foo`), checks
+    /// whether the first path component exists as a directory under `app_dir`
+    /// before probing deep subfolders, avoiding hundreds of doomed `stat`
+    /// probes when the top-level folder lives only inside an archive.
     fn build_folder_auto_path(&self, dir: &str) -> Result<AutoPathTable, StorageReadError> {
-        let root = if Path::new(dir).is_absolute() {
+        let is_abs = Path::new(dir).is_absolute();
+        let root = if is_abs {
             PathBuf::from(dir)
         } else {
             self.app_dir.join(dir)
         };
+        if !is_abs
+            && let Some((first, rest)) = dir.split_once(['/', '\\'])
+            && !first.is_empty()
+            && !rest.is_empty()
+            && first != "."
+            && first != ".."
+        {
+            let app_listing = self.directory_listing(&self.app_dir)?;
+            let top_exists = app_listing
+                .entries
+                .iter()
+                .any(|(name, is_dir)| *is_dir && name.eq_ignore_ascii_case(first));
+            if !top_exists {
+                return Ok(AutoPathTable::Folder {
+                    root,
+                    exact: crate::hasher::map(),
+                    first_file: crate::hasher::map(),
+                });
+            }
+        }
         let listing = self.directory_listing(&root)?;
         let mut exact = crate::hasher::map();
         let mut first_file = crate::hasher::map();
@@ -3396,14 +3521,6 @@ impl Storage {
             )
         });
         self.find_disk_case_insensitive(root, &normalized)
-    }
-
-    /// Resolves a disk-relative name that must name a directory.
-    fn find_disk_dir(&self, relative: &str) -> Result<Option<PathBuf>, StorageReadError> {
-        let mut trace = SearchTrace::default();
-        Ok(self
-            .resolve_disk(&self.app_dir, relative, &mut trace)?
-            .and_then(|(path, is_dir)| is_dir.then_some(path)))
     }
 
     /// Bounded component-wise case-insensitive disk walk.
@@ -3739,10 +3856,10 @@ impl Storage {
         }
     }
 
-    /// True if a storage name resolves to a file or a directory.
+    /// True if a storage name resolves to an existing file.
     ///
-    /// Directories count as existing; [`Self::find`] itself is file-only. A
-    /// file-system failure while probing propagates.
+    /// Matches [`Self::find`]: directories do not count as existing storage
+    /// files. A file-system failure while probing propagates.
     ///
     /// # Errors
     ///
@@ -3753,13 +3870,7 @@ impl Storage {
         if let Some((provider, path)) = self.media_provider(name)? {
             return provider.exists(path);
         }
-        if self.find(name)?.is_some() {
-            return Ok(true);
-        }
-        let Some(relative) = self.relative_disk_name_checked(name)? else {
-            return Ok(false);
-        };
-        Ok(self.find_disk_dir(&relative)?.is_some())
+        Ok(self.find(name)?.is_some())
     }
 
     /// Resolve the startup script sequence against this storage.
@@ -4516,9 +4627,13 @@ mod tests {
     #[test]
     fn auto_path_trace_groups_by_shape() {
         let mut trace = AutoPathTrace::new("config.tjs");
-        trace.record_folder("parts/", "parts/config.tjs".to_string());
-        trace.record_folder("other/", "other/config.tjs".to_string());
-        trace.record_archive("data.xp3>system/", "data.xp3>system/config.tjs".to_string());
+        trace.record_folder("parts/", || "parts/config.tjs".to_string(), true);
+        trace.record_folder("other/", || "other/config.tjs".to_string(), true);
+        trace.record_archive(
+            "data.xp3>system/",
+            || "data.xp3>system/config.tjs".to_string(),
+            true,
+        );
 
         let rendered = trace.render();
         assert!(rendered.contains("parts/config.tjs"), "{rendered}");
@@ -4535,7 +4650,7 @@ mod tests {
         // A folder entry without a trailing slash still shows the inserted
         // separator in its example candidate.
         let mut no_slash = AutoPathTrace::new("config.tjs");
-        no_slash.record_folder("nested", "nested/config.tjs".to_string());
+        no_slash.record_folder("nested", || "nested/config.tjs".to_string(), true);
         assert_eq!(
             no_slash.render(),
             "auto paths (later added first; candidates append \"config.tjs\"): nested/config.tjs"
