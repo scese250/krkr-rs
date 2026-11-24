@@ -138,6 +138,7 @@ The namespace also holds the aliased class objects: `Motion.Player`,
 | `setSize(width, height)` | method | the canvas size; arity 2 (`reference/cpp/plugins/motionplayer/Player.h:319`) |
 | `copyRect(args)` | method | copies a rectangle; arity 1 (`reference/cpp/plugins/motionplayer/Player.h:320`) |
 | `adjustGamma(args)` | method | the gamma adjustment; arity 1 (`reference/cpp/plugins/motionplayer/Player.h:321`) |
+| `clear(target, neutralColor)` | method | clears the target layer's pose surface with `neutralColor` (`0xAARRGGBB`, default `0`) and queues the clear for the next `draw(target)` |
 | `draw(target)` | method | paints the pose into the target; arity 1 (`reference/cpp/plugins/motionplayer/Player.h:322-323`, `main.cpp:234`) |
 | `frameProgress(frames)` | method | advances the playback by a frame count; arity 1 (`reference/cpp/plugins/motionplayer/Player.h:324`) |
 | `setFlip(flag)` | method | the flip flag; arity 1 (`reference/cpp/plugins/motionplayer/Player.h:327`) |

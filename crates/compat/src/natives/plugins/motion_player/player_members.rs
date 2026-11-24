@@ -1126,6 +1126,18 @@ mp_method_void!(
 );
 
 mp_method_void!(
+    player_clear,
+    PlayerInst,
+    |p: &mut PlayerInst, args: &[Value], ctx: &CompatCtx| {
+        super::helpers::require_args(args, 1, "clear")?;
+        let target = StoredValue::from_value(&args[0], ctx);
+        let color = args.get(1).map(value_as_i64).unwrap_or(0) as u32;
+        p.clear(ctx, &target, color)?;
+        Ok(())
+    }
+);
+
+mp_method_void!(
     player_draw,
     PlayerInst,
     |p: &mut PlayerInst, args: &[Value], ctx: &CompatCtx| {

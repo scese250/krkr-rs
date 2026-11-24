@@ -175,6 +175,9 @@ pub(crate) struct PlayerInst {
     /// Whether a draw target that names no layer was already reported, so
     /// the divergence is named once instead of on every frame.
     pub(crate) warned_draw_target: bool,
+    /// Pending clear colour queued by `Motion.Player.clear(target, neutralColor)`
+    /// so the next `draw(target)` clears the layer pose surface before drawing.
+    pub(crate) pending_clear: Option<(u32, [u8; 4])>,
 
     // Emote transform state.
     pub(crate) coord: CoordState,
@@ -279,6 +282,7 @@ impl Default for PlayerInst {
             tinted: Map::default(),
             missing_textures: BTreeSet::new(),
             warned_draw_target: false,
+            pending_clear: None,
             coord: CoordState::default(),
             scale: Animator::at(1.0),
             rotate: Animator::at(0.0),
@@ -1574,6 +1578,63 @@ impl PlayerInst {
         Ok(RetainedValue::Object(array))
     }
 
+    /// Clear the target surface with `color` (`0xAARRGGBB`) and record the
+    /// clear for the next `draw` on the same layer.
+    pub(crate) fn clear(
+        &mut self,
+        ctx: &CompatCtx,
+        target: &StoredValue,
+        color: u32,
+    ) -> Result<(), String> {
+        let Some(target_id) = target.object_id() else {
+            return Ok(());
+        };
+        // SAFETY: `ctx` is only created for a bound, live engine, so its VM pointer is valid for `clear`.
+        let engine = unsafe { ctx.engine() };
+        let Some(surface) = resolve_draw_target(engine, target_id)? else {
+            return Ok(());
+        };
+        // SAFETY: the host keeps the attached scene alive for the binding.
+        let Some(scene) = unsafe { ctx.services() }.scene() else {
+            return Err("Motion.Player.clear: no scene is attached to the compat host".to_string());
+        };
+        // SAFETY: the host keeps the attached scene alive for the binding.
+        let scene = unsafe { &mut *scene };
+        let rgba = [
+            (color >> 16) as u8,
+            (color >> 8) as u8,
+            color as u8,
+            (color >> 24) as u8,
+        ];
+        match surface {
+            DrawSurface::Layer(layer_id) => {
+                self.pending_clear = Some((layer_id, rgba));
+                scene.set_layer_pose_clear(layer_id, Some(rgba));
+                scene.set_layer_draws(layer_id, Vec::new());
+                if !scene.host_draws_lists {
+                    scene.draw_layer_draws(layer_id);
+                }
+            }
+            DrawSurface::D3DAdaptor(payload) => {
+                // SAFETY: the payload is the adaptor's live native instance;
+                // the script's target argument keeps it alive for the call.
+                let Some(adaptor) = (unsafe { inst_mut::<D3DInst>(payload) }) else {
+                    return Err("Motion.Player.clear: the D3D adaptor has no instance".to_string());
+                };
+                if !adaptor.captures_canvas() {
+                    return Ok(());
+                }
+                let layer = super::adaptors::d3d_render_target(adaptor, scene)?;
+                scene.set_layer_pose_clear(layer, Some(rgba));
+                scene.set_layer_draws(layer, Vec::new());
+                if !scene.host_draws_lists {
+                    scene.draw_layer_draws(layer);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Draw the current pose onto the target layer through the L2 scene.
     pub(crate) fn draw(&mut self, ctx: &CompatCtx, target: &StoredValue) -> Result<(), String> {
         // The progress path evaluates the tree; a draw evaluates it only when
@@ -1615,11 +1676,14 @@ impl PlayerInst {
         let pool = pool.map(|pool| unsafe { &mut *pool });
         match surface {
             DrawSurface::Layer(layer_id) => {
-                // The ordinary route paints over the target: the pose is
-                // composited onto the pixels the target already holds, so the
-                // target's alpha accumulates from frame to frame. Nothing
-                // clears the target.
-                self.draw_into_scene(scene, layer_id, storage, pool, None);
+                // When `clear(target, neutralColor)` preceded this draw, pass
+                // its colour so the target is cleared before the new pose is
+                // composited; otherwise preserve the existing pixels.
+                let clear = self
+                    .pending_clear
+                    .take()
+                    .and_then(|(cleared_id, rgba)| (cleared_id == layer_id).then_some(rgba));
+                self.draw_into_scene(scene, layer_id, storage, pool, clear);
             }
             DrawSurface::D3DAdaptor(payload) => {
                 // The D3D route paints into the adaptor's own render target,
@@ -4026,6 +4090,7 @@ pub(crate) fn register_named(
     method!("setSize", player_set_size);
     method!("copyRect", player_copy_rect);
     method!("adjustGamma", player_adjust_gamma);
+    method!("clear", player_clear);
     method!("draw", player_draw);
     method!("frameProgress", player_frame_progress);
     method!("setFlip", player_set_flip);

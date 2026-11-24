@@ -3538,27 +3538,30 @@ fn word_pixel(word: u32) -> [u8; 4] {
 /// zero index.
 struct BlendTables {
     /// The effective source weight per (source alpha, destination alpha).
-    opacity_on_opacity: [u8; 65536],
+    opacity_on_opacity: Box<[u8]>,
     /// The destination alpha a blend leaves per (source alpha, destination
     /// alpha).
-    negative_mul: [u8; 65536],
+    negative_mul: Box<[u8]>,
     /// The colour dodge's reciprocal per channel.
-    reciprocal: [u32; 256],
+    reciprocal: Box<[u32]>,
 }
 
 /// The lookup tables, built once on first use.
+///
+/// The backing slices are allocated directly on the heap (`vec![0; ...]`):
+/// holding the 128 KB+ arrays by value inside `OnceLock` places multiple
+/// copies on the stack during unoptimized (debug) initialization, which
+/// overflows Android's 1 MB `android_main` pthread stack on the first blend.
 fn blend_tables() -> &'static BlendTables {
     static TABLES: std::sync::OnceLock<BlendTables> = std::sync::OnceLock::new();
     TABLES.get_or_init(|| {
-        let mut tables = BlendTables {
-            opacity_on_opacity: [0; 65536],
-            negative_mul: [0; 65536],
-            reciprocal: [0; 256],
-        };
+        let mut opacity_on_opacity = vec![0u8; 65536].into_boxed_slice();
+        let mut negative_mul = vec![0u8; 65536].into_boxed_slice();
+        let mut reciprocal = vec![0u32; 256].into_boxed_slice();
         // The zero index has no reciprocal; the value is 65536 there.
-        tables.reciprocal[0] = 65536;
+        reciprocal[0] = 65536;
         for index in 1..256u16 {
-            tables.reciprocal[usize::from(index)] = 65536 / u32::from(index);
+            reciprocal[usize::from(index)] = 65536 / u32::from(index);
         }
         for destination_alpha in 0..256u32 {
             for source_alpha in 0..256u32 {
@@ -3573,12 +3576,16 @@ fn blend_tables() -> &'static BlendTables {
                     if value >= 256 { 255 } else { value as u8 }
                 };
                 let index = (source_alpha as usize) * 256 + destination_alpha as usize;
-                tables.opacity_on_opacity[index] = weight;
-                tables.negative_mul[index] =
+                opacity_on_opacity[index] = weight;
+                negative_mul[index] =
                     (255 - (255 - destination_alpha) * (255 - source_alpha) / 255) as u8;
             }
         }
-        tables
+        BlendTables {
+            opacity_on_opacity,
+            negative_mul,
+            reciprocal,
+        }
     })
 }
 
