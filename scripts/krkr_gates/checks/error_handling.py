@@ -71,7 +71,7 @@ FALLIBLE_OK = re.compile(
 # Fallible calls whose discarded result is worth flagging under `let _ =`.
 FALLIBLE_LET = re.compile(
     r"(set_member|set_call_missing|set_default_member|resolve_face"
-    r"|update_layer|\.poll\(|\.stop\(|delete_member|send_eof|call_member"
+    r"|update_layer|set_layer_offset|\.poll\(|\.stop\(|delete_member|send_eof|call_member"
     r"|" + FALLIBLE_STORAGE + r")"
 )
 

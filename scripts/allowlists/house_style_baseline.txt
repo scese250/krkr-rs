@@ -94,7 +94,6 @@
 {"path": "crates/compat/src/event.rs", "rule": "reference-citation", "anchor": "/// reference window `onKeyDown`/`onKeyUp` take `(key, shift)` and", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/frame.rs", "rule": "reference-citation", "anchor": "// (`reference/cpp/core/environ/impl/SystemControl.cpp:174-179`). It runs", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/frame.rs", "rule": "reference-citation", "anchor": "// Idle compaction: the reference `tTVPSystemControl::SystemWatchTimerTimer`", "reason": "legacy comment, cleanup tracked in TODO §15"}
-{"path": "crates/compat/src/frame.rs", "rule": "history-comment", "anchor": "//! L2 advances its timer registry and frame clock before this body runs, so the", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/host.rs", "rule": "reference-citation", "anchor": "/// A handful of the reference `System` members describe genuine host facts —", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/lib.rs", "rule": "reference-citation", "anchor": "// (the analogue of the reference `TVPAddContinuousEventHook`).", "reason": "legacy comment, cleanup tracked in TODO §15"}
 {"path": "crates/compat/src/lib.rs", "rule": "reference-citation", "anchor": "//! The C++ ABI hands native callbacks only the raw `tjs2_engine*` and", "reason": "legacy comment, cleanup tracked in TODO §15"}

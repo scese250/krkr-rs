@@ -234,8 +234,13 @@ CPP_PAREN_RE = re.compile(
     r"\([^()\n]*[\w./\\-]+\.(?:cpp|hpp|h|cc|cxx|inl)\b[^()\n]*\)", re.IGNORECASE
 )
 # Comments that narrate history instead of describing the code.
+# The historical phrasings: a comment that narrates what the code used to do.
+# "before this runs" is an ordering of two calls and not a history, so the
+# phrase needs the noun that makes it one.
 HISTORY_RE = re.compile(
-    r"\bused to\b|\bpreviously\b|\bbefore this\b|\breplaced by\b", re.IGNORECASE
+    r"\bused to\b|\bpreviously\b|\bbefore this (?:change|commit|patch|rework|version|release)\b"
+    r"|\breplaced by\b",
+    re.IGNORECASE,
 )
 # `#[allow(clippy::…)]`, `#![allow(clippy::…)]` or `#[expect(clippy::…)]`.
 CLIPPY_ALLOW_RE = re.compile(r"#!?\[\s*(?:allow|expect)\s*\([^)]*clippy\s*::")
