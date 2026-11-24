@@ -12,7 +12,7 @@
 //! any more. The assets themselves stay where the script put them.
 
 use api::error::RenderError;
-use engine::engine::FrameTarget;
+use engine::engine::{FrameTarget, RETIRED_TEXTURE_LIMIT};
 use engine::{Engine, EngineParts, GameFrame, Rect};
 use render::{
     PipelineConfig, RenderPipeline, RenderTargetDesc, begin_offscreen_render_state,
@@ -89,6 +89,19 @@ fn layer_of(engine: &mut Engine) -> u32 {
         state.image_width = SIZE.0;
         state.image_height = SIZE.1;
     }
+    layer
+}
+
+/// Adds a layer of `window` that shows `bitmap` over the whole frame.
+fn layer_showing(engine: &mut Engine, window: u32, bitmap: u32) -> u32 {
+    let scene = engine.scene_mut();
+    let layer = scene.add_layer(window, None);
+    let state = scene.layer_mut(layer).expect("the layer");
+    state.visible = true;
+    state.rect = Rect::new(0, 0, SIZE.0, SIZE.1);
+    state.image_width = SIZE.0;
+    state.image_height = SIZE.1;
+    state.bitmap = Some(bitmap);
     layer
 }
 
@@ -260,5 +273,103 @@ fn the_pool_survives_a_run_that_shows_and_drops_many_assets() {
         engine.textures().len() <= 1,
         "the device holds {} copies after {ASSETS} assets",
         engine.textures().len()
+    );
+}
+
+/// A copy the picture stops needing is retired, and freed at the next frame's
+/// safe point.
+///
+/// The frame that stops drawing the copy may already be on the device, so
+/// freeing it there stops the frame to wait for the device. The copy leaves
+/// the picture's table at once and its device resource goes one frame later,
+/// after the draws that could have sampled it have completed.
+#[test]
+fn a_retired_copy_waits_for_the_next_frames_safe_point() {
+    let mut engine = null_engine();
+    let layer = layer_of(&mut engine);
+    let mut hooks = NoFrame;
+
+    let bitmap = engine.scene_mut().add_bitmap(SIZE.0, SIZE.1, pixels());
+    show(&mut engine, layer, bitmap);
+    engine.frame(0, &mut hooks).expect("the frame runs");
+    assert_eq!(engine.textures().len(), 1, "the layer shows the asset");
+    assert!(
+        engine.retired_textures().is_empty(),
+        "a frame that gives no copy up retires none"
+    );
+
+    // The layer stops showing the asset. The copy leaves the picture's table
+    // in this frame: no layer holds the asset any more, so no projection
+    // makes a node for it and no draw of this frame samples it.
+    show_nothing(&mut engine, layer);
+    engine.frame(16, &mut hooks).expect("the frame runs");
+    assert!(
+        engine.textures().is_empty(),
+        "the copy left the table in the frame that stopped showing the asset"
+    );
+    assert_eq!(
+        engine.retired_textures().len(),
+        1,
+        "the copy waits for the safe point instead of stalling the frame that gave it up"
+    );
+
+    // The next frame's sync start is the safe point: the draws that could
+    // have sampled the copy have returned, so the batch goes.
+    engine.frame(32, &mut hooks).expect("the frame runs");
+    assert!(
+        engine.retired_textures().is_empty(),
+        "the safe point freed the retired copy"
+    );
+}
+
+/// A burst of copies the picture stops needing stays within the batch's
+/// bound.
+///
+/// A retired copy still holds its descriptor set, and the pool the device
+/// takes the sets from holds a fixed number of them. A frame that gives up
+/// more copies than the batch may hold frees the batch at the mark instead of
+/// letting the list take the sets the live copies need.
+#[test]
+fn a_burst_of_retired_copies_is_freed_at_the_bound() {
+    let mut engine = null_engine();
+    let mut hooks = NoFrame;
+    let window = engine.scene_mut().add_window("test", SIZE);
+
+    // One layer per asset, so the frame holds every copy at once and the
+    // frame that drops them gives up more copies than the batch may hold.
+    let burst = RETIRED_TEXTURE_LIMIT * 2 + 5;
+    let mut bitmaps = Vec::with_capacity(burst);
+    for _ in 0..burst {
+        let bitmap = engine.scene_mut().add_bitmap(SIZE.0, SIZE.1, pixels());
+        layer_showing(&mut engine, window, bitmap);
+        bitmaps.push(bitmap);
+    }
+    engine.frame(0, &mut hooks).expect("the frame runs");
+    assert_eq!(
+        engine.textures().len(),
+        burst,
+        "the frame holds one copy per asset"
+    );
+
+    // The page change: every asset goes at once.
+    for bitmap in &bitmaps {
+        engine.scene_mut().remove_bitmap(*bitmap);
+    }
+    engine.frame(16, &mut hooks).expect("the frame runs");
+    assert!(
+        engine.textures().is_empty(),
+        "every copy left the table in the frame that dropped the assets"
+    );
+    assert!(
+        engine.retired_textures().len() < RETIRED_TEXTURE_LIMIT,
+        "a burst of {burst} copies is freed at the mark of {RETIRED_TEXTURE_LIMIT}, \
+         so the batch holds {}",
+        engine.retired_textures().len()
+    );
+
+    engine.frame(32, &mut hooks).expect("the frame runs");
+    assert!(
+        engine.retired_textures().is_empty(),
+        "the safe point freed the rest of the burst"
     );
 }

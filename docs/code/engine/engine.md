@@ -229,15 +229,16 @@ into it and `frame` put it at the injected value.
 7. `refresh_overlay(now_ms)`;
 8. draw the layers' draw lists — a layer's pose is drawn on the backend, into
    the layer's own pose surface;
-9. upload the dirty bitmap regions, prune the textures whose bitmap is gone;
-   both walk the scene's dirty and removal sets, not the bitmap and texture
-   tables;
+9. upload the dirty bitmap regions, prune the textures whose bitmap is gone
+   (the prune retires what it removes and frees the batch at the next
+   frame's start, so no destroy waits for the device mid-frame); both walk
+   the scene's dirty and removal sets, not the bitmap and texture tables;
 10. project the scene when `Scene::structure_revision` changed (or the
     presentation/texture table invalidated the projection);
 11. `hooks.after_project(&drawn_layers)`;
 12. `sync_presentation()` again;
 13. upload the dirty bitmap regions again (a CPU-blended transition writes a
-    bitmap the hook rewrote without changing the tree) and prune again;
+    bitmap the hook rewrote without changing the tree);
 14. project again if the hook changed the scene's structure;
 15. one `render` call — into the surface, or into the offscreen target;
 16. recover a lost surface, then record the frame in the presentation stall —

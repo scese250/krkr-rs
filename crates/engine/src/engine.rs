@@ -278,6 +278,18 @@ fn present_outcome(presentation: Presentation) -> PresentOutcome {
     }
 }
 
+/// How many copies the frame retires before it frees the batch.
+///
+/// A retired copy still holds its descriptor set and its image memory, and
+/// the pool the backend takes those sets from holds a fixed number of them
+/// (1024 on the Vulkan backend, one set per copy). The frame retires the
+/// copies it stopped drawing and frees them at the next frame's safe point,
+/// so the list normally holds one frame's worth; a frame that retires more
+/// than this frees the batch as soon as it reaches the mark. At 64 the list
+/// never holds more than a sixteenth of the pool, so the live copies keep the
+/// rest of it even while a page change drops a whole screen of assets.
+pub const RETIRED_TEXTURE_LIMIT: usize = 64;
+
 /// How long a presentation stall may last before its age is reported.
 const STALL_REPORT_MS: u64 = 1_000;
 
@@ -482,7 +494,8 @@ pub struct FrameReport {
     pub sync_ms: f64,
     /// Milliseconds of `sync_ms` spent uploading dirty bitmaps.
     pub upload_ms: f64,
-    /// Milliseconds of `sync_ms` spent dropping textures whose bitmap is gone.
+    /// Milliseconds of `sync_ms` spent retiring the copies of the bitmaps the
+    /// picture no longer needs and freeing the copies an earlier frame retired.
     pub prune_ms: f64,
     /// Milliseconds spent projecting the scene tree.
     pub project_ms: f64,
@@ -564,6 +577,16 @@ pub struct Engine {
     /// a host that draws text itself) reaches the same faces through the same
     /// registry.
     text: crate::text::TextEngine,
+    /// The copies the picture stopped needing, waiting for the safe point.
+    ///
+    /// A retired copy is out of [`Device::textures`], so no projection makes
+    /// a node for it, and the device resource behind it is still alive: the
+    /// frames the device may still be executing sampled it, and freeing it
+    /// inside the frame that stopped drawing it would stop that frame to idle
+    /// the device. [`Engine::prune_stale_textures`] moves the copies into
+    /// this list, and the next frame frees the batch before it creates a copy
+    /// of its own.
+    retired: Vec<Texture>,
     /// Current surface size in pixels.
     surface_size: (u32, u32),
     /// The frame clock of the previous frame, or `None` before the first one.
@@ -803,6 +826,7 @@ impl Engine {
             drawn_layers: Vec::new(),
             target,
             timer: TimerState::new(),
+            retired: Vec::new(),
             decode_pool: None,
             storage_pool: None,
             input: crate::input::InputState::default(),
@@ -1113,9 +1137,9 @@ impl Engine {
     /// The order is the frame contract: fit the presentation, fire due
     /// timers, run the upward hook, fit the presentation again (the hook may
     /// have resized a window's primary layer), then refresh the overlay,
-    /// upload, project, apply the presentation root transform and draw. A size
-    /// pair that cannot be fitted skips everything that draws and reports no
-    /// frame statistics.
+    /// upload, project, prune the copies the frame stopped drawing, apply the
+    /// presentation root transform and draw. A size pair that cannot be fitted
+    /// skips everything that draws and reports no frame statistics.
     fn run_frame(
         &mut self,
         now_ms: u64,
@@ -1170,12 +1194,36 @@ impl Engine {
         self.draw_layer_draw_lists();
 
         let sync_started = Instant::now();
+        // The copies the prune retired are freed here, at the start of the
+        // frame's sync, before any copy of this frame is created: a retired
+        // copy still holds its descriptor set and its image memory, and the
+        // uploads below ask the pool for both.
+        //
+        // The device point that makes the batch safe to free: a copy enters it
+        // only after it has left the picture's table, so the newest draw that
+        // can still name one belongs to an earlier frame than this one. A frame
+        // drawn offscreen returns only after its own submission has completed,
+        // so the device is idle here and the batch costs nothing; a presented
+        // frame may still be in flight, and the backend waits for the device
+        // before it frees an image, so that path pays one idle for the whole
+        // batch, where a copy freed inside the frame that gave it up paid one
+        // idle per copy.
+        let free_started = Instant::now();
+        self.free_retired();
+        let mut prune_ms = free_started.elapsed().as_secs_f64() * 1000.0;
+        // The bitmaps the layers hold: the upload copies them and the prune
+        // gives the copies of the others back, so one snapshot of the set
+        // serves both. The hook may change the tree before the second upload,
+        // and the revision says whether it did: an unchanged revision means
+        // the layers hold exactly what they held, so the snapshot stands.
+        let mut held = self.scene.held_bitmaps();
+        let held_revision = self.scene.structure_revision();
         let upload_started = Instant::now();
-        let mut upload_timings = self.sync_dirty_bitmaps();
+        let mut upload_timings = self.sync_dirty_bitmaps(&held);
         let mut upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
         let prune_started = Instant::now();
-        self.prune_stale_textures();
-        let mut prune_ms = prune_started.elapsed().as_secs_f64() * 1000.0;
+        self.prune_stale_textures(&held);
+        prune_ms += prune_started.elapsed().as_secs_f64() * 1000.0;
         let mut sync_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
 
         // The device work the compatibility layer asked for: the composite of
@@ -1206,12 +1254,12 @@ impl Engine {
         // The hook may have rewritten a transition frame bitmap without
         // changing the scene graph; upload those dirty bitmaps either way.
         let sync2_started = Instant::now();
+        if self.scene.structure_revision() != held_revision {
+            held = self.scene.held_bitmaps();
+        }
         let upload2_started = Instant::now();
-        upload_timings = add_upload_timings(upload_timings, self.sync_dirty_bitmaps());
+        upload_timings = add_upload_timings(upload_timings, self.sync_dirty_bitmaps(&held));
         upload_ms += upload2_started.elapsed().as_secs_f64() * 1000.0;
-        let prune2_started = Instant::now();
-        self.prune_stale_textures();
-        prune_ms += prune2_started.elapsed().as_secs_f64() * 1000.0;
         sync_ms += sync2_started.elapsed().as_secs_f64() * 1000.0;
         if self.translation.is_some()
             && self.render_scene_revision != Some(self.scene.structure_revision())
@@ -1601,6 +1649,17 @@ impl Engine {
         &self.device.textures
     }
 
+    /// Returns the copies the frame retired and has not freed yet.
+    ///
+    /// A copy leaves [`Engine::textures`] in the frame that stops drawing it
+    /// and is freed at the next frame's safe point, so this is what the device
+    /// still holds for a picture that no longer shows it. The batch is a
+    /// diagnostic: its length says how many descriptor sets a frame's retires
+    /// keep out of the pool.
+    pub fn retired_textures(&self) -> &[Texture] {
+        &self.retired
+    }
+
     /// Returns the script-visible input state.
     pub fn input(&self) -> &crate::input::InputState {
         &self.input
@@ -1921,6 +1980,7 @@ impl Engine {
         self.scene.draw_layer_draws(layer_id);
     }
 
+    /// Uploads the pixels of the dirty bitmaps the layers hold.
     ///
     /// A bitmap that changed in a rectangle uploads that rectangle alone;
     /// one that changed wholly uploads every pixel.
@@ -1931,12 +1991,15 @@ impl Engine {
     /// are the ones the picture needs, and the descriptor set each of them
     /// takes is the pool's scarcest resource.
     ///
+    /// `held` is the frame's snapshot of the bitmaps the layers hold: the
+    /// upload copies those and leaves the others on the host, and the prune
+    /// that follows it uses the same snapshot to give the copies of the
+    /// others back.
+    ///
     /// The costs of the upload are returned when the backend measured them,
     /// so the frame's report can name where the upload's time went.
-    fn sync_dirty_bitmaps(&mut self) -> Option<UploadTimings> {
+    fn sync_dirty_bitmaps(&mut self, held: &Set<u32>) -> Option<UploadTimings> {
         let dirty: Vec<u32> = self.scene.dirty_bitmaps_for_upload();
-        // The bitmaps the layers hold: the copies the picture needs.
-        let held = self.scene.held_bitmaps();
         // The bitmaps a layer holds whose copy is gone: the copy is made
         // again, and the whole bitmap is uploaded into it.
         let missing: Vec<u32> = held
@@ -2003,9 +2066,12 @@ impl Engine {
                 .get(&id)
                 .is_none_or(|texture| texture.width() != width || texture.height() != height);
             if recreate {
+                // The old copy is retired, not freed: the frames the device
+                // may still be executing sampled it, so the batch goes at the
+                // next frame's safe point.
                 let old = self.device.textures.remove(&id);
                 if let Some(old) = old {
-                    drop_texture(&self.device.pipeline, &mut self.device.state, old);
+                    self.retire_texture(old);
                 }
                 match create_texture(&self.device.pipeline, TextureDesc::new(width, height)) {
                     Ok(texture) => {
@@ -2100,18 +2166,27 @@ impl Engine {
         timings
     }
 
-    /// Drops textures whose bitmap no longer exists in the scene.
+    /// Retires the copies whose bitmap the picture no longer needs.
     ///
-    /// The scene records the bitmaps it removed, so the prune drops the
-    /// textures of those bitmaps instead of walking the texture table.
+    /// The scene records the bitmaps it removed, so the prune takes those
+    /// instead of walking the bitmap table; the copies of the bitmaps that are
+    /// still in the scene but that no layer holds are found through the
+    /// frame's held-bitmap snapshot.
     ///
-    /// The device surfaces go with the layers they belong to: a layer that
-    /// no longer exists has no composite to draw, so its surface is released.
-    fn prune_stale_textures(&mut self) {
+    /// A copy leaves [`Device::textures`] here, so no projection resolves it,
+    /// and its image, memory and descriptor set are freed with the frame's
+    /// batch, before the frame creates its next copies. Retiring instead of
+    /// freeing keeps the resource alive until that point, so a node that was
+    /// projected before the retire still samples its own source, and the frees
+    /// of a frame all happen at one point instead of inside it.
+    ///
+    /// The device surfaces go with the layers they belong to: a layer that no
+    /// longer exists has no composite to draw, so its surface is released.
+    fn prune_stale_textures(&mut self, held: &Set<u32>) {
         let removed = self.scene.take_removed_bitmaps();
         for id in removed {
             if let Some(texture) = self.device.textures.remove(&id) {
-                drop_texture(&self.device.pipeline, &mut self.device.state, texture);
+                self.retire_texture(texture);
             }
         }
         // The copies of the bitmaps no layer holds any more: a bitmap nobody
@@ -2119,7 +2194,6 @@ impl Engine {
         // copy holds is the pool's scarcest resource. The copy of a bitmap
         // that is shown again is made again, and the whole bitmap is
         // uploaded into it.
-        let held = self.scene.held_bitmaps();
         let stale: Vec<u32> = self
             .device
             .textures
@@ -2129,13 +2203,13 @@ impl Engine {
             .collect();
         for id in stale {
             if let Some(texture) = self.device.textures.remove(&id) {
-                drop_texture(&self.device.pipeline, &mut self.device.state, texture);
+                self.retire_texture(texture);
             }
         }
         // The copies of the draw sources that were released: a source is
         // per-frame content, and its copy goes with it.
         for texture in self.scene.take_released_draw_textures() {
-            drop_texture(&self.device.pipeline, &mut self.device.state, texture);
+            self.retire_texture(texture);
         }
         // The device surfaces go with the layers they belong to: a layer that
         // no longer exists has no composite to draw, so its surface is
@@ -2149,6 +2223,30 @@ impl Engine {
             .collect();
         for layer in stale {
             release_device_surface(&mut self.device, layer);
+        }
+    }
+
+    /// Adds a copy the frame stopped drawing to the batch the device still
+    /// holds.
+    ///
+    /// The batch keeps the copy's descriptor set and image memory until it is
+    /// freed, so a burst that reaches [`RETIRED_TEXTURE_LIMIT`] frees the
+    /// batch at once: the pool the backend takes the sets from holds a fixed
+    /// number of them, and a list that grew without a bound would take the
+    /// sets the live copies need.
+    fn retire_texture(&mut self, texture: Texture) {
+        self.retired.push(texture);
+        if self.retired.len() >= RETIRED_TEXTURE_LIMIT {
+            self.free_retired();
+        }
+    }
+
+    /// Frees every copy in the retire batch: the backend gives the image, its
+    /// memory and its descriptor set back.
+    fn free_retired(&mut self) {
+        let batch = std::mem::take(&mut self.retired);
+        for texture in batch {
+            drop_texture(&self.device.pipeline, &mut self.device.state, texture);
         }
     }
 }

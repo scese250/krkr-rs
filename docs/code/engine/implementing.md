@@ -489,7 +489,7 @@ the clock is already set when it starts.
 | 14 | put the Fit presentation on the render-scene root | `PixelTranslation::root_transform` |
 | 15 | **run the upward hook again**, with the projected layer ids | `GameFrame::after_project(&self.drawn_layers)` |
 | 16 | fit the presentation again | `Engine::sync_presentation` |
-| 17 | upload and prune again — the hook may have rewritten a bitmap without changing the tree | `Engine::sync_dirty_bitmaps`, `Engine::prune_stale_textures` |
+| 17 | upload again — the hook may have rewritten a bitmap without changing the tree | `Engine::sync_dirty_bitmaps` |
 | 18 | project again if the hook changed the scene's structure | `Engine::reproject_render_scene` |
 | 19 | draw the scene in one call — into the surface, or into the offscreen target | `render::render`, `render::render_to_target` |
 | 20 | recover a lost surface; record whether the display accepted the frame | `render::recover_surface`, the presentation-stall bookkeeping |

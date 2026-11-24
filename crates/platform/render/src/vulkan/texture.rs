@@ -39,14 +39,29 @@ pub(crate) struct VulkanTexture {
 
 impl VulkanTexture {
     /// Destroys the view, image, memory and descriptor set.
+    ///
+    /// The caller makes sure the device holds no work that samples the image
+    /// before this runs: a texture outlives the draw that last read it until
+    /// the caller retires it, and the caller waits for the device at the point
+    /// where that draw has completed. With no command buffer referencing them,
+    /// the handles are unbound and the memory goes back to the allocator. A
+    /// descriptor set the device refuses to take back leaves the pool one set
+    /// short, so the failure is reported: a set that silently disappears is a
+    /// pool that runs dry with nothing in the log.
     pub(crate) fn destroy(&self, device: &ash::Device, descriptor_pool: vk::DescriptorPool) {
         // SAFETY: all handles were created by `device`; the caller guarantees
-        // the GPU is idle.
+        // no submitted work still references them.
         unsafe {
             device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
             device.free_memory(self.memory, None);
-            let _ = device.free_descriptor_sets(descriptor_pool, &[self.descriptor_set]);
+            if let Err(error) = device.free_descriptor_sets(descriptor_pool, &[self.descriptor_set])
+            {
+                log::warn!(
+                    "platform.render: a freed texture kept its descriptor set, so the pool \
+                     is one set short: {error}"
+                );
+            }
         }
     }
 }
