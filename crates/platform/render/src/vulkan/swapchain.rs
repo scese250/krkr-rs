@@ -162,6 +162,20 @@ pub(crate) fn create(
         vk::CompositeAlphaFlagsKHR::INHERIT
     };
 
+    // Request IDENTITY when supported so Android's SurfaceFlinger rotates the
+    // swapchain to match the activity's orientation (e.g. sensorLandscape on a
+    // natively portrait panel). Passing `current_transform` without pre-rotating
+    // the render output tells the compositor we already rotated it, which
+    // displays the game sideways.
+    let pre_transform = if capabilities
+        .supported_transforms
+        .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
+    {
+        vk::SurfaceTransformFlagsKHR::IDENTITY
+    } else {
+        capabilities.current_transform
+    };
+
     let create_info = vk::SwapchainCreateInfoKHR::default()
         .surface(surface)
         .min_image_count(image_count)
@@ -171,7 +185,7 @@ pub(crate) fn create(
         .image_array_layers(1)
         .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .pre_transform(capabilities.current_transform)
+        .pre_transform(pre_transform)
         .composite_alpha(composite_alpha)
         .present_mode(present_mode)
         .clipped(true)

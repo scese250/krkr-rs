@@ -95,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --ndk=*) NDK="${1#--ndk=}"; shift ;;
         --check) MODE="check"; shift ;;
         --debug) PROFILE="debug"; shift ;;
+        --fast) PROFILE="android-fast"; shift ;;
         -h|--help) sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "build-android.sh: unknown argument '$1' (try --help)" >&2; exit 2 ;;
     esac
@@ -102,9 +103,9 @@ done
 
 # cargo's profile flag and the output directory it implies. A custom profile
 # keeps its own name in the output directory, so the library is found under
-# `target/<triple>/android-release/`.
+# `target/<triple>/<profile>/`.
 CARGO_PROFILE_ARGS=()
-if [[ "$PROFILE" == "android-release" ]]; then
+if [[ "$PROFILE" != "debug" ]]; then
     CARGO_PROFILE_ARGS+=(--profile "$PROFILE")
 fi
 

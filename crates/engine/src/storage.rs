@@ -122,6 +122,40 @@ struct MountedArchive {
     backing: ArchiveBacking,
     /// Parsed index.
     archive: Arc<Xp3Archive>,
+    /// Lazily-built map from normalized parent directory prefix (`""` or
+    /// `"dir/sub/"`) to its direct children `{ base_name -> entry_name }`.
+    /// Built once per mounted archive so resolving hundreds of auto-path
+    /// subfolders does not rescan every entry of the archive.
+    children_by_dir:
+        std::sync::OnceLock<crate::hasher::Map<String, crate::hasher::Map<String, String>>>,
+}
+
+impl MountedArchive {
+    /// Returns the direct children of `prefix` (`""` or ending with `'/'`).
+    fn children_for_dir(&self, prefix: &str) -> crate::hasher::Map<String, String> {
+        let index = self.children_by_dir.get_or_init(|| {
+            let mut by_dir: crate::hasher::Map<String, crate::hasher::Map<String, String>> =
+                crate::hasher::map();
+            for entry in self.archive.entries() {
+                let (dir, rest) = match entry.name.rfind('/') {
+                    Some(slash) => (&entry.name[..=slash], &entry.name[slash + 1..]),
+                    None => ("", &entry.name[..]),
+                };
+                if rest.is_empty() {
+                    continue;
+                }
+                by_dir
+                    .entry(dir.to_string())
+                    .or_insert_with(crate::hasher::map)
+                    .insert(rest.to_string(), entry.name.to_string());
+            }
+            by_dir
+        });
+        index
+            .get(prefix)
+            .cloned()
+            .unwrap_or_else(crate::hasher::map)
+    }
 }
 
 /// Where a mounted archive's bytes are read from.
@@ -2225,6 +2259,7 @@ impl Storage {
             file_name,
             backing,
             archive,
+            children_by_dir: std::sync::OnceLock::new(),
         });
         self.clear_resolution_cache();
         Ok(())
@@ -3138,8 +3173,13 @@ impl Storage {
             .unwrap_or_default();
         for mounted in self.archives.iter().rev() {
             if mounted.file_name.eq_ignore_ascii_case(&arc_name) {
-                let mut entries = crate::hasher::map();
-                collect_archive_children(mounted.archive.entries(), prefix, &mut entries);
+                let entries = if prefix.is_empty() || prefix.ends_with('/') {
+                    mounted.children_for_dir(prefix)
+                } else {
+                    let mut entries = crate::hasher::map();
+                    collect_archive_children(mounted.archive.entries(), prefix, &mut entries);
+                    entries
+                };
                 return Ok(Some((mounted.path.clone(), entries)));
             }
         }

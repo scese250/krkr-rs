@@ -94,3 +94,12 @@ codegen-units = 1
 [profile.android-release]
 inherits = "release"
 lto = "fat"
+
+# Fast-building optimized profile for Android debug APKs: full native speed on
+# low-end phones without the slow single-unit fat-LTO link step in CI.
+[profile.android-fast]
+inherits = "release"
+opt-level = 2
+lto = "off"
+codegen-units = 16
+strip = "symbols"
