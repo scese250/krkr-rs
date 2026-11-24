@@ -1615,6 +1615,32 @@ impl PlayerInst {
                     scene.draw_layer_draws(layer_id);
                 }
             }
+            DrawSurface::SeparateAdaptor(payload, target_layer_id) => {
+                // SAFETY: the payload is the adaptor's live native instance;
+                // the script's target argument keeps it alive for the call.
+                let Some(adaptor) = (unsafe { inst_mut::<SeparateInst>(payload) }) else {
+                    return Err(
+                        "Motion.Player.clear: the separate-layer adaptor has no instance"
+                            .to_string(),
+                    );
+                };
+                let fallback = snapshot_canvas_size(self.snapshot.as_deref());
+                let Some(layer_id) = super::adaptors::separate_render_target(
+                    adaptor,
+                    scene,
+                    target_layer_id,
+                    fallback,
+                )?
+                else {
+                    return Ok(());
+                };
+                self.pending_clear = Some((layer_id, rgba));
+                scene.set_layer_pose_clear(layer_id, Some(rgba));
+                scene.set_layer_draws(layer_id, Vec::new());
+                if !scene.host_draws_lists {
+                    scene.draw_layer_draws(layer_id);
+                }
+            }
             DrawSurface::D3DAdaptor(payload) => {
                 // SAFETY: the payload is the adaptor's live native instance;
                 // the script's target argument keeps it alive for the call.
@@ -1679,6 +1705,31 @@ impl PlayerInst {
                 // When `clear(target, neutralColor)` preceded this draw, pass
                 // its colour so the target is cleared before the new pose is
                 // composited; otherwise preserve the existing pixels.
+                let clear = self
+                    .pending_clear
+                    .take()
+                    .and_then(|(cleared_id, rgba)| (cleared_id == layer_id).then_some(rgba));
+                self.draw_into_scene(scene, layer_id, storage, pool, clear);
+            }
+            DrawSurface::SeparateAdaptor(payload, target_layer_id) => {
+                // SAFETY: the payload is the adaptor's live native instance;
+                // the script's target argument keeps it alive for the call.
+                let Some(adaptor) = (unsafe { inst_mut::<SeparateInst>(payload) }) else {
+                    return Err(
+                        "Motion.Player.draw: the separate-layer adaptor has no instance"
+                            .to_string(),
+                    );
+                };
+                let fallback = snapshot_canvas_size(self.snapshot.as_deref());
+                let Some(layer_id) = super::adaptors::separate_render_target(
+                    adaptor,
+                    scene,
+                    target_layer_id,
+                    fallback,
+                )?
+                else {
+                    return Ok(());
+                };
                 let clear = self
                     .pending_clear
                     .take()
@@ -1871,6 +1922,11 @@ fn canvas_size(
     if width > 0 && height > 0 {
         return Some((width, height));
     }
+    snapshot_canvas_size(snapshot)
+}
+
+/// The motion's own extent as a canvas size, when it is a usable one.
+fn snapshot_canvas_size(snapshot: Option<&MotionSnapshot>) -> Option<(u32, u32)> {
     let snapshot = snapshot?;
     Some((
         motion_extent(snapshot.width)?,
@@ -3584,6 +3640,14 @@ fn refresh_shape_bounds(nodes: &mut [MotionNode], index: usize, z_factor: f64) {
 enum DrawSurface {
     /// A layer in the L2 scene: the pose is composited into its image.
     Layer(u32),
+    /// A `Motion.SeparateLayerAdaptor`: draws directly into `targetLayer` when
+    /// it carries a bitmap, or into a managed child layer when `targetLayer`
+    /// is a container layer (such as `ltBinder`).
+    ///
+    /// The payload is the adaptor's native instance and the `u32` is the
+    /// resolved `targetLayer` scene id. The script's target argument keeps the
+    /// adaptor alive for the whole call, so the payload stays alive.
+    SeparateAdaptor(*mut std::ffi::c_void, u32),
     /// A `Motion.D3DAdaptor`: the pose is composited into the adaptor's own
     /// render target, which the capture copies into a layer.
     ///
@@ -3596,9 +3660,10 @@ enum DrawSurface {
 /// The surface a `Player.draw` target paints into.
 ///
 /// A `D3DAdaptor` draws into its own render target, a `SeparateLayerAdaptor`
-/// draws into the layer its live `targetLayer` names, and any other object is
-/// resolved as a `Layer` directly. `None` means the target names no layer,
-/// which `draw` treats as a no-op.
+/// draws into the layer its live `targetLayer` names (or a managed child when
+/// that target is a bitmap-less container), and any other object is resolved
+/// as a `Layer` directly. `None` means the target names no layer, which `draw`
+/// treats as a no-op.
 ///
 /// The dispatch checks the D3D adaptor first, then the separate-layer
 /// adaptor, then the ordinary layer path.
@@ -3633,7 +3698,7 @@ fn resolve_draw_target(
         tjs::Tjs2ValueId::from_raw(target as *mut std::ffi::c_void),
         &["Layer"],
     )
-    .map(|id| id.map(DrawSurface::Layer))
+    .map(|id| id.map(|layer_id| DrawSurface::SeparateAdaptor(payload.as_ptr(), layer_id)))
 }
 
 /// Install an object member by retaining it.

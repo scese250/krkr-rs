@@ -10,6 +10,7 @@
 
 use std::ffi::c_void;
 
+use api::blend::BlendMode;
 use tjs::{
     DetachedValue, NativeInstanceBuilder, NativeInstanceMethodDef, NativeInstancePropertyDef,
     TjsValue, VAL_OBJECT, Value,
@@ -448,6 +449,10 @@ pub(crate) struct SeparateInst {
     /// The reference `_owner`, computed once from the construction-time
     /// `targetLayer.window` (`SeparateLayerAdaptor.cpp:26-34`, `:231`).
     owner: Option<DetachedValue>,
+    /// Managed child layer `(parent_layer_id, child_layer_id)` lazily created
+    /// when `targetLayer` is a container layer without a bitmap (such as
+    /// `ltBinder`).
+    managed_child: Option<(u32, u32)>,
 }
 
 impl Default for SeparateInst {
@@ -456,6 +461,7 @@ impl Default for SeparateInst {
             absolute: 0,
             target: StoredValue::Void,
             owner: None,
+            managed_child: None,
         }
     }
 }
@@ -467,16 +473,163 @@ impl SeparateInst {
     }
 }
 
+/// Remove the adaptor's managed child layer from `scene`, if one exists.
+fn release_managed_child_in_scene(adaptor: &mut SeparateInst, scene: &mut Scene) {
+    if let Some((_, child_id)) = adaptor.managed_child.take() {
+        scene.remove_layer(child_id);
+    }
+}
+
+/// Remove the adaptor's managed child layer from the compat host's attached
+/// scene, if a scene is attached.
+fn release_managed_child(adaptor: &mut SeparateInst, ctx: &CompatCtx) {
+    let Some((_, child_id)) = adaptor.managed_child.take() else {
+        return;
+    };
+    // SAFETY: the host keeps the attached scene alive for the binding.
+    let Some(scene) = (unsafe { ctx.services() }).scene() else {
+        return;
+    };
+    // SAFETY: the host keeps the attached scene alive for the binding.
+    let scene = unsafe { &mut *scene };
+    scene.remove_layer(child_id);
+}
+
+/// Resolve the L2 scene layer a `Motion.SeparateLayerAdaptor` draws into.
+///
+/// When `target_layer_id` already carries its own bitmap (ordinary `ltAlpha`
+/// or other drawable layer types), the pose draws directly into
+/// `target_layer_id`. When `target_layer_id` has no bitmap (a container layer
+/// such as `ltBinder`), a managed child layer parented to `target_layer_id` is
+/// lazily created, kept sized to the target's rectangle (or `fallback_size`
+/// when the target rectangle is empty), and returned as the draw surface.
+pub(crate) fn separate_render_target(
+    adaptor: &mut SeparateInst,
+    scene: &mut Scene,
+    target_layer_id: u32,
+    fallback_size: Option<(u32, u32)>,
+) -> Result<Option<u32>, String> {
+    let Some(target_layer) = scene.layer(target_layer_id) else {
+        release_managed_child_in_scene(adaptor, scene);
+        return Ok(None);
+    };
+    if target_layer.bitmap.is_some() {
+        release_managed_child_in_scene(adaptor, scene);
+        return Ok(Some(target_layer_id));
+    }
+
+    let window_id = target_layer.window;
+    let target_size = (target_layer.rect.w, target_layer.rect.h);
+    let desired_absolute = adaptor.absolute as i32;
+
+    let existing_child = adaptor.managed_child.and_then(|(parent_id, child_id)| {
+        if parent_id == target_layer_id
+            && scene
+                .layer(child_id)
+                .is_some_and(|layer| !layer.shutdown && layer.parent == Some(target_layer_id))
+        {
+            Some(child_id)
+        } else {
+            None
+        }
+    });
+
+    let desired_size = if target_size.0 > 0 && target_size.1 > 0 {
+        Some(target_size)
+    } else if let Some((w, h)) = fallback_size
+        && w > 0
+        && h > 0
+    {
+        Some((w, h))
+    } else {
+        existing_child
+            .and_then(|child_id| scene.layer(child_id))
+            .filter(|layer| layer.rect.w > 0 && layer.rect.h > 0)
+            .map(|layer| (layer.rect.w, layer.rect.h))
+    };
+
+    let Some((width, height)) = desired_size else {
+        return Ok(None);
+    };
+
+    if let Some(child_id) = existing_child {
+        let mut size_changed = false;
+        scene.update_layer(child_id, |layer| {
+            let mut changed = false;
+            if !layer.visible {
+                layer.visible = true;
+                changed = true;
+            }
+            if layer.blend != BlendMode::SourceOver {
+                layer.blend = BlendMode::SourceOver;
+                changed = true;
+            }
+            if layer.rect.w != width || layer.rect.h != height {
+                layer.rect.w = width;
+                layer.rect.h = height;
+                size_changed = true;
+                changed = true;
+            }
+            changed
+        });
+        if size_changed {
+            scene.layer_size_changed(child_id);
+        }
+        let bitmap_matches = scene
+            .layer(child_id)
+            .and_then(|layer| layer.bitmap)
+            .and_then(|bitmap_id| scene.bitmap(bitmap_id))
+            .is_some_and(|bitmap| bitmap.width == width && bitmap.height == height);
+        if !bitmap_matches && !scene.set_layer_image_size(child_id, width, height) {
+            return Err(
+                "Motion.SeparateLayerAdaptor: could not resize managed child layer image"
+                    .to_string(),
+            );
+        }
+        if scene
+            .layer(child_id)
+            .is_some_and(|layer| layer.z_order != desired_absolute)
+        {
+            let _ = scene.set_absolute_order_index(child_id, desired_absolute);
+        }
+        return Ok(Some(child_id));
+    }
+
+    release_managed_child_in_scene(adaptor, scene);
+    let child_id = scene.add_layer(window_id, Some(target_layer_id));
+    if let Some(layer) = scene.layer_mut(child_id) {
+        layer.visible = true;
+        layer.blend = BlendMode::SourceOver;
+        layer.rect.x = 0;
+        layer.rect.y = 0;
+        layer.rect.w = width;
+        layer.rect.h = height;
+    }
+    if !scene.allocate_layer_image(child_id) {
+        scene.remove_layer(child_id);
+        return Err(
+            "Motion.SeparateLayerAdaptor: could not allocate managed child layer image".to_string(),
+        );
+    }
+    let _ = scene.set_absolute_order_index(child_id, desired_absolute);
+    adaptor.managed_child = Some((target_layer_id, child_id));
+    Ok(Some(child_id))
+}
+
 extern "C" fn separate_create(_engine: *mut c_void) -> *mut c_void {
     Box::into_raw(Box::new(SeparateInst::default())) as *mut c_void
 }
 
-extern "C" fn separate_destroy(_engine: *mut c_void, instance: *mut c_void) {
+extern "C" fn separate_destroy(engine: *mut c_void, instance: *mut c_void) {
     if instance.is_null() {
         return;
     }
     // SAFETY: `instance` came from `separate_create` and is released once.
-    drop(unsafe { Box::from_raw(instance as *mut SeparateInst) });
+    let mut adaptor = unsafe { Box::from_raw(instance as *mut SeparateInst) };
+    if let Some(res) = resolve(engine) {
+        let ctx = res.ctx();
+        release_managed_child(&mut adaptor, &ctx);
+    }
 }
 
 extern "C" fn separate_ctor(
@@ -535,20 +688,41 @@ mp_get_variant!(
     SeparateInst,
     |p: &SeparateInst, ctx: &CompatCtx| p.target.to_retained(ctx)
 );
-mp_set_variant!(
-    separate_set_target,
-    SeparateInst,
-    |p: &mut SeparateInst, value: StoredValue| {
-        p.target = value;
-    }
-);
+
+extern "C" fn separate_set_target(
+    engine: *mut c_void,
+    instance: *mut c_void,
+    value: *const Value,
+    out_error: *mut *mut std::ffi::c_char,
+    _objthis: *mut c_void,
+) -> std::os::raw::c_int {
+    let Some(res) = resolve(engine) else {
+        return report_error(out_error, super::helpers::NO_BINDING);
+    };
+    // SAFETY: the VM guarantees the live payload.
+    let Some(inst) = (unsafe { inst_mut::<SeparateInst>(instance) }) else {
+        return report_error(out_error, "SeparateLayerAdaptor: null instance");
+    };
+    let ctx = res.ctx();
+    let stored = if value.is_null() {
+        StoredValue::Void
+    } else {
+        // SAFETY: the VM passes a valid value for the duration of the call.
+        StoredValue::from_value(unsafe { &*value }, &ctx)
+    };
+    release_managed_child(inst, &ctx);
+    inst.target = stored;
+    0
+}
+
 mp_method_void!(
     separate_clear,
     SeparateInst,
-    |_p: &mut SeparateInst, _args: &[Value], _ctx: &CompatCtx| {
+    |p: &mut SeparateInst, _args: &[Value], ctx: &CompatCtx| {
         // `clear()` only releases the adaptor's private render state;
         // `targetLayer` and `absolute` are untouched
         // (`reference/cpp/plugins/motionplayer/SeparateLayerAdaptor.cpp:262-279`).
+        release_managed_child(p, ctx);
         Ok(())
     }
 );

@@ -1889,3 +1889,182 @@ fn reference_checkout_a_real_motion_keeps_can_sync_closed_until_the_first_full_f
     );
     assert_eq!(env.eval_int("p.frameTickCount > 0 ? 1 : 0"), 1);
 }
+
+#[test]
+fn separate_layer_adaptor_manages_child_layer_for_lt_binder_parent() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    // `SeparateLayerAdaptor` hosts its drawn output on a managed child layer
+    // when `targetLayer` is a bitmap-less `ltBinder` container
+    // (`reference/cpp/plugins/motionplayer/SeparateLayerAdaptor.cpp:262-279`,
+    // `PlayerRenderTargets.cpp:1228-1252`).
+    env.run(
+        "var w = new Window(); \
+         var screen = new Layer(w, null); \
+         var target = new Layer(w, screen); \
+         target.setSize(320, 240); \
+         target.type = ltBinder; \
+         var p = new Motion.Player(null); \
+         var adaptor = new Motion.SeparateLayerAdaptor(target); \
+         adaptor.absolute = 7;",
+    );
+    let target_id = env
+        ._scene
+        .layers
+        .iter()
+        .find(|layer| layer.rect.w == 320 && layer.rect.h == 240 && layer.bitmap.is_none())
+        .map(|layer| layer.id)
+        .expect("the ltBinder target layer");
+    assert!(
+        env._scene
+            .layer(target_id)
+            .expect("target")
+            .children
+            .is_empty(),
+        "no managed child exists before the first draw or clear"
+    );
+
+    // Clearing into the binder adaptor lazily creates a visible child layer
+    // sized to `target` with `absolute` applied and fills its bitmap.
+    env.run("p.clear(adaptor, 0xFF112233);");
+    let child_id = {
+        let target = env._scene.layer(target_id).expect("target");
+        assert!(target.bitmap.is_none());
+        assert_eq!(target.children.len(), 1);
+        target.children[0]
+    };
+    {
+        let child = env._scene.layer(child_id).expect("managed child");
+        assert!(child.visible);
+        assert_eq!(child.blend, api::blend::BlendMode::SourceOver);
+        assert_eq!((child.rect.w, child.rect.h), (320, 240));
+        assert_eq!(child.z_order, 7);
+        let bitmap_id = child.bitmap.expect("managed child bitmap");
+        let bitmap = env._scene.bitmap(bitmap_id).expect("bitmap");
+        assert_eq!((bitmap.width, bitmap.height), (320, 240));
+        assert_eq!(&bitmap.rgba[0..4], &[0x11, 0x22, 0x33, 0xFF]);
+    }
+
+    // Resizing `target` keeps the managed child's rect and bitmap synced.
+    env.run("target.setSize(400, 300); p.clear(adaptor, 0xFF445566);");
+    {
+        let target = env._scene.layer(target_id).expect("target");
+        assert_eq!(target.children, vec![child_id]);
+        let child = env._scene.layer(child_id).expect("managed child");
+        assert_eq!((child.rect.w, child.rect.h), (400, 300));
+        let bitmap_id = child.bitmap.expect("managed child bitmap");
+        let bitmap = env._scene.bitmap(bitmap_id).expect("bitmap");
+        assert_eq!((bitmap.width, bitmap.height), (400, 300));
+        assert_eq!(&bitmap.rgba[0..4], &[0x44, 0x55, 0x66, 0xFF]);
+    }
+
+    // `p.clear(adaptor, 0)` clears the managed child's pixels to zero.
+    env.run("p.clear(adaptor, 0);");
+    {
+        let child = env._scene.layer(child_id).expect("managed child");
+        let bitmap_id = child.bitmap.expect("managed child bitmap");
+        let bitmap = env._scene.bitmap(bitmap_id).expect("bitmap");
+        assert!(
+            bitmap.rgba.iter().all(|&byte| byte == 0),
+            "p.clear(adaptor, 0) must clear all pixels"
+        );
+    }
+
+    // `adaptor.clear()` removes the managed child layer from the scene.
+    env.run("adaptor.clear();");
+    assert!(env._scene.layer(child_id).is_none());
+    assert!(
+        env._scene
+            .layer(target_id)
+            .expect("target")
+            .children
+            .is_empty()
+    );
+
+    // Reassigning `targetLayer` also cleans up the managed child layer.
+    env.run("p.clear(adaptor, 0xFF112233);");
+    let recreated_child_id = env._scene.layer(target_id).expect("target").children[0];
+    env.run("adaptor.targetLayer = void;");
+    assert!(env._scene.layer(recreated_child_id).is_none());
+    assert!(
+        env._scene
+            .layer(target_id)
+            .expect("target")
+            .children
+            .is_empty()
+    );
+}
+
+#[test]
+fn reference_checkout_separate_layer_adaptor_draws_and_clears_lt_binder_parent() {
+    let _lock = vm_lock();
+    let env = Env::with_reference_storage();
+    let path = "e-mote3.0バニラパジャマa.psb";
+    env.run("Motion.ResourceManager.setEmotePSBDecryptSeed(742877301);");
+    // When a game (e.g. `MotionAffineSourceLayer.tjs`) sets `target.type = ltBinder`
+    // and draws through `new Motion.SeparateLayerAdaptor(target)`, the adaptor
+    // creates a visible child layer with non-zero pixels and `p.clear(adaptor, 0)`
+    // clears it (`reference/cpp/plugins/motionplayer/SeparateLayerAdaptor.cpp:262-279`,
+    // `PlayerRenderTargets.cpp:1228-1252`).
+    env.run(&format!(
+        "var rm = new Motion.ResourceManager(null, 1024); \
+         var w = new Window(); \
+         var screen = new Layer(w, null); \
+         var target = new Layer(w, screen); \
+         target.setSize(800, 1080); \
+         target.type = ltBinder; \
+         var p = new Motion.Player(rm); \
+         p.motionKey = \"{path}\"; \
+         var adaptor = new Motion.SeparateLayerAdaptor(target); \
+         p.draw(adaptor);"
+    ));
+    let target_id = env
+        ._scene
+        .layers
+        .iter()
+        .find(|layer| layer.rect.w == 800 && layer.rect.h == 1080 && layer.bitmap.is_none())
+        .map(|layer| layer.id)
+        .expect("the ltBinder target layer");
+    let child_id = {
+        let target = env._scene.layer(target_id).expect("target");
+        assert_eq!(
+            target.children.len(),
+            1,
+            "drawing into an ltBinder SeparateLayerAdaptor must create a managed child layer"
+        );
+        target.children[0]
+    };
+    {
+        let child = env._scene.layer(child_id).expect("managed child");
+        assert!(child.visible);
+        assert_eq!((child.rect.w, child.rect.h), (800, 1080));
+        let bitmap_id = child.bitmap.expect("managed child bitmap");
+        let bitmap = env._scene.bitmap(bitmap_id).expect("bitmap");
+        assert_eq!((bitmap.width, bitmap.height), (800, 1080));
+        assert!(
+            bitmap
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] != 0),
+            "managed child layer must contain non-zero drawn pixels"
+        );
+    }
+
+    // `p.clear(adaptor, 0)` clears the managed child layer's bitmap.
+    env.run("p.clear(adaptor, 0);");
+    {
+        let child = env._scene.layer(child_id).expect("managed child");
+        let bitmap_id = child.bitmap.expect("managed child bitmap");
+        let bitmap = env._scene.bitmap(bitmap_id).expect("bitmap");
+        assert!(
+            bitmap.rgba.iter().all(|&byte| byte == 0),
+            "p.clear(adaptor, 0) must clear the managed child layer"
+        );
+    }
+
+    // `adaptor.clear()` removes the managed child layer.
+    env.run("adaptor.clear();");
+    assert!(env._scene.layer(child_id).is_none());
+}
