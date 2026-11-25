@@ -1502,11 +1502,10 @@ extern "C" fn layer_update(
 /// Returns the failure of one `onPaint` handler as a message; the other
 /// layers still receive their event.
 pub fn paint_poll(ctx: &CompatCtx) -> Result<(), String> {
-    let scene = scene_ref(ctx)?;
-    let ids: Vec<u32> = scene
+    let ids: Vec<u32> = scene_ref(ctx)?
         .layers
         .iter()
-        .filter(|layer| layer.pending_paint && scene.layer_visible_or_cached(layer.id))
+        .filter(|layer| layer.pending_paint)
         .map(|layer| layer.id)
         .collect();
     if ids.is_empty() {
