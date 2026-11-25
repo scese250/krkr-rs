@@ -818,6 +818,8 @@ pub struct GameHost {
     fps_presented: u32,
     /// Accumulated per-frame active work time (ms) in the current window.
     fps_work_ms: f64,
+    /// Per-second `/proc/stat` CPU and per-core utilization sampler.
+    cpu_sampler: CpuSampler,
 }
 
 /// The engine's frame hook for a running game: the VM tick, the audio drain it
@@ -1191,6 +1193,7 @@ impl GameHost {
             fps_frames: 0,
             fps_presented: 0,
             fps_work_ms: 0.0,
+            cpu_sampler: CpuSampler::new(),
         })
     }
 
@@ -1346,6 +1349,8 @@ impl GameHost {
         if !self.first_frame_logged {
             self.first_frame_logged = true;
             self.fps_window_start = Instant::now();
+            self.cpu_sampler.reset();
+            log_device_hardware_info();
             log::info!(
                 "app.startup: first frame after open frame_ms={:.1}",
                 self.open_start.elapsed().as_secs_f64() * 1000.0
@@ -1365,8 +1370,11 @@ impl GameHost {
                 } else {
                     0.0
                 };
+                let (cpu_pct, cores_str) = self.cpu_sampler.sample_percent();
+                let rss_mb = read_process_rss_mb();
+                let avail_mb = read_mem_avail_mb();
                 log::info!(
-                    "app.frame: fps={fps:.1} presented_fps={presented_fps:.1} avg_ms={avg_ms:.1} frames={}",
+                    "app.frame: fps={fps:.1} presented_fps={presented_fps:.1} avg_ms={avg_ms:.1} frames={} cpu={cpu_pct:.0}% cores=[{cores_str}] rss_mb={rss_mb} mem_avail_mb={avail_mb}",
                     self.fps_frames
                 );
                 self.fps_window_start = Instant::now();
@@ -1405,6 +1413,152 @@ impl GameHost {
         );
         self.reporting.charge(started.elapsed());
     }
+}
+
+/// Samples total and per-core CPU utilization from `/proc/stat`.
+#[derive(Default)]
+struct CpuSampler {
+    prev_total: Option<(u64, u64)>,
+    prev_cores: Vec<(u64, u64)>,
+}
+
+impl CpuSampler {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        let (total, cores) = read_proc_stat();
+        self.prev_total = total;
+        self.prev_cores = cores;
+    }
+
+    fn sample_percent(&mut self) -> (f64, String) {
+        let (total, cores) = read_proc_stat();
+        let total_pct = match (self.prev_total, total) {
+            (Some((pt, pi)), Some((ct, ci))) => cpu_delta_percent(pt, pi, ct, ci),
+            _ => 0.0,
+        };
+        let mut core_parts = Vec::with_capacity(cores.len());
+        for (idx, &(ct, ci)) in cores.iter().enumerate() {
+            let pct = match self.prev_cores.get(idx) {
+                Some(&(pt, pi)) => cpu_delta_percent(pt, pi, ct, ci),
+                None => 0.0,
+            };
+            core_parts.push(format!("{pct:.0}%"));
+        }
+        self.prev_total = total;
+        self.prev_cores = cores;
+        (total_pct, core_parts.join(","))
+    }
+}
+
+fn cpu_delta_percent(prev_total: u64, prev_idle: u64, cur_total: u64, cur_idle: u64) -> f64 {
+    let dt = cur_total.saturating_sub(prev_total);
+    let di = cur_idle.saturating_sub(prev_idle);
+    if dt == 0 {
+        return 0.0;
+    }
+    ((dt.saturating_sub(di)) as f64 / dt as f64) * 100.0
+}
+
+fn parse_proc_cpu_line(line: &str) -> Option<(u64, u64)> {
+    let mut parts = line.split_whitespace();
+    let _label = parts.next()?;
+    let mut total = 0u64;
+    let mut idle = 0u64;
+    for (idx, part) in parts.enumerate() {
+        let Ok(val) = part.parse::<u64>() else {
+            break;
+        };
+        total = total.saturating_add(val);
+        if idx == 3 || idx == 4 {
+            idle = idle.saturating_add(val);
+        }
+    }
+    Some((total, idle))
+}
+
+fn read_proc_stat() -> (Option<(u64, u64)>, Vec<(u64, u64)>) {
+    let Ok(text) = std::fs::read_to_string("/proc/stat") else {
+        return (None, Vec::new());
+    };
+    let mut total = None;
+    let mut cores = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("cpu ") {
+            total = parse_proc_cpu_line(line);
+        } else if line.starts_with("cpu") {
+            if let Some(sample) = parse_proc_cpu_line(line) {
+                cores.push(sample);
+            }
+        } else {
+            break;
+        }
+    }
+    (total, cores)
+}
+
+fn parse_proc_kb(text: &str, prefix: &str) -> Option<u64> {
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+fn read_process_rss_mb() -> u64 {
+    let Ok(text) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    parse_proc_kb(&text, "VmRSS:").unwrap_or(0)
+}
+
+fn read_mem_avail_mb() -> u64 {
+    let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
+        return 0;
+    };
+    parse_proc_kb(&text, "MemAvailable:").unwrap_or(0)
+}
+
+/// Logs static device hardware details (CPU cores, SoC/model, RAM) once at startup.
+fn log_device_hardware_info() {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let mut cpu_model = String::new();
+    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+        for key in ["Hardware", "model name", "Processor"] {
+            if let Some(line) = cpuinfo.lines().find(|l| l.starts_with(key))
+                && let Some((_, val)) = line.split_once(':')
+            {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    cpu_model = trimmed.to_owned();
+                    break;
+                }
+            }
+        }
+    }
+    if cpu_model.is_empty()
+        && let Ok(model) = std::fs::read_to_string("/proc/device-tree/model")
+    {
+        cpu_model = model.trim_matches(['\0', '\n', ' ']).to_owned();
+    }
+    let (mem_total_mb, mem_avail_mb) = if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+        (
+            parse_proc_kb(&text, "MemTotal:").unwrap_or(0),
+            parse_proc_kb(&text, "MemAvailable:").unwrap_or(0),
+        )
+    } else {
+        (0, 0)
+    };
+    log::info!(
+        "app.startup: device arch={} cores={cores} cpu={cpu_model:?} mem_total_mb={mem_total_mb} mem_avail_mb={mem_avail_mb}",
+        std::env::consts::ARCH
+    );
 }
 
 /// Logs the start-up phase aggregates once, at `info`.
