@@ -107,20 +107,21 @@ fn the_additive_colour_fill_at_the_full_opacity_writes_the_colour() {
     }
 }
 
-/// The opacity removal multiplies the alpha by `255 - level` and keeps the
-/// low byte of the product.
+/// The opacity removal multiplies the alpha by `255 - level` and keeps bits
+/// `8..=15` (`>> 8`).
 ///
-/// Reference: the kernel the removal runs multiplies the destination's alpha
-/// by `255 - level` and keeps the low byte of the product
+/// Reference: the kernel the removal runs computes
+/// `((((d >> 24) * strength) << 16) & 0xff000000)`, keeping bits `8..=15`
+/// (`>> 8`) of `alpha * (255 - level)`
 /// (`reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:914-921`,
 /// `reference/krkr2/cpp/core/visual/tvpgl.cpp:6401-6438`).
 #[test]
-fn the_opacity_removal_keeps_the_low_byte_of_the_product() {
+fn the_opacity_removal_scales_the_alpha_by_strength() {
     for destination_alpha in 0..=u8::MAX {
         for level in 1..=i32::from(u8::MAX) {
             let mut dst = BitmapState::new(1, 1, vec![10, 20, 30, destination_alpha]);
             remove_const_opacity(&mut dst, (0, 0, 1, 1), level);
-            let expected = ((u32::from(destination_alpha) * (255 - level as u32)) & 0xff) as u8;
+            let expected = ((u32::from(destination_alpha) * (255 - level as u32)) >> 8) as u8;
             assert_eq!(
                 dst.rgba[3], expected,
                 "the removal of the level {level} over the destination alpha \

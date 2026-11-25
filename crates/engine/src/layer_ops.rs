@@ -13,7 +13,7 @@
 //! | [`fill_color_on_add_alpha`] | additive-alpha (premultiplied) fill |
 //! | [`fill_color_hold_alpha`] | set RGB to a constant color, holding the destination alpha |
 //! | [`fill_mask`] | replace the alpha channel with a constant |
-//! | [`remove_const_opacity`] | multiply the alpha by `255 - level`, keeping the low byte of the product |
+//! | [`remove_const_opacity`] | scale the alpha by `(255 - level) / 256` (`>> 8`) |
 //! | [`colorize`] | reblend hue and saturation, preserving lightness |
 //! | [`noise`] | add uniform per-channel noise, holding alpha |
 //! | [`blit_copy`] | copy a source region over the destination |
@@ -924,10 +924,9 @@ pub fn fill_mask(bitmap: &mut BitmapState, rect: RectI, value: u8) {
     bitmap.mark_dirty_rect(clipped_region(clipped));
 }
 
-/// `RemoveConstOpacity`: multiply the alpha by `255 - level` and keep the
-/// low byte of the product, so the alpha left is
-/// `(alpha * (255 - level)) & 0xff`. `level <= 0` does nothing, `level >= 255`
-/// clears the alpha.
+/// `RemoveConstOpacity`: multiply the alpha by `255 - level` and keep bits
+/// `8..=15` (`>> 8`), so the alpha left is `(alpha * (255 - level)) >> 8`.
+/// `level <= 0` does nothing, `level >= 255` clears the alpha.
 pub fn remove_const_opacity(bitmap: &mut BitmapState, rect: RectI, level: i32) {
     if level <= 0 {
         return;
@@ -941,7 +940,7 @@ pub fn remove_const_opacity(bitmap: &mut BitmapState, rect: RectI, level: i32) {
     let strength = 255 - level.min(255) as u32;
     walk_rows(bitmap, clipped, |row| {
         for pixel in row.as_chunks_mut::<4>().0 {
-            let alpha = (u32::from(pixel[3]) * strength) & 0xff;
+            let alpha = (u32::from(pixel[3]) * strength) >> 8;
             pixel[3] = alpha as u8;
         }
     });
@@ -6631,6 +6630,57 @@ pub fn render_layer_subtree(scene: &mut Scene, root: u32) -> Option<u32> {
     render_layer_subtree_at(scene, root, 0)
 }
 
+/// Finish any deferred image decodes for bitmaps that `root`'s subtree
+/// composite will read.
+///
+/// Deferred decodes leave `BitmapState.rgba` empty until
+/// [`Scene::resolve_bitmap`] installs the pixels; resolving them before
+/// `collect_subtree_draws` ensures both `dfMask` extraction and the blit
+/// loop see decoded pixels.
+fn resolve_subtree_bitmaps(scene: &mut Scene, order: &[u32], root: u32) {
+    if !scene.has_pending_images() {
+        return;
+    }
+    let mut pending_bitmaps = Vec::new();
+    let mut covered: Map<u32, u32> = crate::hasher::map();
+    for &id in order {
+        if id != root && !is_descendant(scene, id, root) {
+            continue;
+        }
+        let Some(layer) = scene.layer(id) else {
+            continue;
+        };
+        if let Some(owner) = layer
+            .parent
+            .and_then(|parent| covered.get(&parent).copied())
+        {
+            covered.insert(id, owner);
+            continue;
+        }
+        if id != root && !(layer.visible && layer.opacity != 0.0) {
+            continue;
+        }
+        let bitmap_id = if let Some(cache) = live_subtree_cache(layer, root) {
+            covered.insert(id, cache);
+            Some(cache)
+        } else if layer.face == FACE_PROVINCE {
+            None
+        } else {
+            subtree_drawn_image(layer)
+        };
+        if let Some(bitmap_id) = bitmap_id
+            && scene
+                .bitmap(bitmap_id)
+                .is_some_and(|bitmap| bitmap.pending.is_some())
+        {
+            pending_bitmaps.push(bitmap_id);
+        }
+    }
+    for bitmap_id in pending_bitmaps {
+        scene.resolve_bitmap(bitmap_id);
+    }
+}
+
 /// The composite of `root`'s subtree, with the depth of the walk.
 ///
 /// The depth bounds the completion of the descendants' caches: a malformed
@@ -6649,6 +6699,9 @@ fn render_layer_subtree_at(scene: &mut Scene, root: u32, depth: usize) -> Option
         // The trivial path returns the main image, so any content composited
         // for an earlier, non-trivial frame is stale.
         release_subtree_caches(scene, root);
+        if let Some(id) = bitmap {
+            scene.resolve_bitmap(id);
+        }
         return bitmap;
     }
     let (content, fresh) = ensure_layer_content(scene, root, w, h)?;
@@ -6677,6 +6730,7 @@ fn render_layer_subtree_at(scene: &mut Scene, root: u32, depth: usize) -> Option
     // asks the child for its cache, and the child rebuilds the stale part of
     // it and hands it over. A stale cache is never drawn live.
     complete_stale_caches(scene, &order, root, depth);
+    resolve_subtree_bitmaps(scene, &order, root);
     let draws = collect_subtree_draws(scene, &order, root, w, h);
     // The area the composite writes: the layer's region, widened over the
     // draws that are written whole. A scaled draw is written whole — the

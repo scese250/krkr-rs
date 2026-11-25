@@ -1142,10 +1142,10 @@ fn pixel_methods_enforce_reference_argument_counts() {
 /// the system-colour table first (`LayerIntf.cpp:4351`), so `0xff102030`
 /// names no plain colour: it keeps its low 24 bits with the red and blue
 /// bytes swapped. `TVPRemoveConstOpacity_c` multiplies alpha by
-/// `(255 - strength)` and keeps the low byte of the product
+/// `(255 - strength)` and keeps bits `8..=15` (`>> 8`)
 /// (`reference/krkr2/cpp/core/visual/tvpgl.cpp:6401-6413`,
 /// `reference/krkr2/cpp/core/visual/gl/blend_functor_c.h:914-921`), so
-/// `255 → 56` for `strength = 55`.
+/// `255 → 199` for `strength = 55`.
 #[test]
 fn color_rect_opacity_default_and_negative_removal() {
     let _lock = vm_lock();
@@ -1160,7 +1160,7 @@ fn color_rect_opacity_default_and_negative_removal() {
          var rgb_after = l.getMainPixel(0, 0);",
     );
     assert_eq!(env.eval_int("a_full"), 255);
-    assert_eq!(env.eval_int("a_removed"), 56);
+    assert_eq!(env.eval_int("a_removed"), 199);
     // Negative opacity does not repaint the colour.
     assert_eq!(env.eval_int("rgb_after"), 0x10_2030);
 }

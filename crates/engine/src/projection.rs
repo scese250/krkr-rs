@@ -359,6 +359,12 @@ fn append_window<F>(
     // Maps a layer id to the node its children should link to (its own node
     // when drawn, otherwise its nearest drawn ancestor).
     let mut nearest: Map<u32, RenderNodeId> = map();
+    // Opacity accumulated from the nearest drawn ancestor (or the window root)
+    // through undrawn intermediate layers. Both render backends multiply
+    // `parent_opacity * node.opacity` along the `RenderScene` tree, so each
+    // emitted node carries only this incremental factor and resets its
+    // descendants' unemitted factor to `1.0`.
+    let mut unemitted_opacity: Map<u32, f32> = map();
     // Descendants whose pixels are drawn through a cached ancestor, keyed by
     // the layer that owns the emitted cache bitmap.
     let mut cache_owner: Map<u32, u32> = map();
@@ -436,7 +442,8 @@ fn append_window<F>(
             Some(clip) => intersect_rect(clip, clip_rect),
             None => clip_rect,
         });
-        node_composed.opacity *= clamp_opacity(layer.opacity);
+        let layer_opacity = clamp_opacity(layer.opacity);
+        node_composed.opacity *= layer_opacity;
         node_composed.visible &= layer.visible;
         composed.insert(layer_id, node_composed);
 
@@ -445,6 +452,11 @@ fn append_window<F>(
             .parent
             .and_then(|parent| nearest.get(&parent).copied())
             .unwrap_or(out.root);
+        let inherited_unemitted = layer
+            .parent
+            .and_then(|parent| unemitted_opacity.get(&parent).copied())
+            .unwrap_or(win_opacity);
+        let node_opacity = inherited_unemitted * layer_opacity;
 
         // Build the node(s) the layer draws. Every `break` means "skipped":
         // the layer still passes `parent_node` on to its children through
@@ -463,8 +475,8 @@ fn append_window<F>(
                 clipped += 1;
                 break 'layer;
             }
-            let opacity = win_opacity * node_composed.opacity;
-            let blend = resolve_blend(layer.blend, opacity);
+            let composed_opacity = win_opacity * node_composed.opacity;
+            let blend = resolve_blend(layer.blend, composed_opacity);
 
             // A custom-shader draw: the passes are placed inside the draw's
             // own frame, and the frame where the layer's own image would be.
@@ -536,7 +548,7 @@ fn append_window<F>(
                         ))),
                         dst,
                         src: PixelRegion::ZERO,
-                        opacity,
+                        opacity: node_opacity,
                         visible: true,
                         z: state.next_z,
                         // The pipeline carries the blend; the node's own mode
@@ -633,7 +645,7 @@ fn append_window<F>(
                 content,
                 dst,
                 src,
-                opacity,
+                opacity: node_opacity,
                 visible: true,
                 z: state.next_z,
                 blend,
@@ -653,7 +665,7 @@ fn append_window<F>(
                     content: RenderContent::Texture(pose),
                     dst,
                     src,
-                    opacity,
+                    opacity: node_opacity,
                     visible: true,
                     z: state.next_z,
                     // The pose surface holds premultiplied pixels, so it
@@ -682,8 +694,10 @@ fn append_window<F>(
                 last = id;
             }
             nearest.insert(layer_id, last);
+            unemitted_opacity.insert(layer_id, 1.0);
         } else {
             nearest.insert(layer_id, parent_node);
+            unemitted_opacity.insert(layer_id, node_opacity);
         }
     }
 
