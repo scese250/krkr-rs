@@ -2543,6 +2543,22 @@ fn group_paint_box(
         if frame.settings.preview && node.child_owner.is_some() {
             continue;
         }
+        if node.node_type == 4 {
+            for particle in frame.particles {
+                if particle.emitter_node != index || particle.nodes.len() <= 1 {
+                    continue;
+                }
+                for p_idx in 1..particle.nodes.len() {
+                    if node_drawable(&particle.nodes[p_idx]) {
+                        paint_box = union_paint_box(
+                            paint_box,
+                            node_paint_box(&particle.nodes[p_idx], frame),
+                        );
+                    }
+                }
+            }
+            continue;
+        }
         if is_composite_group(node) {
             paint_box = union_paint_box(paint_box, group_paint_box(nodes, index, frame));
         } else if node_drawable(node) {
@@ -2634,6 +2650,46 @@ fn draw_group(
         }
         let node = &nodes[index];
         if frame.settings.preview && node.child_owner.is_some() {
+            continue;
+        }
+        if node.node_type == 4 {
+            let particles = frame.particles;
+            for particle in particles {
+                if particle.emitter_node != index || particle.nodes.len() <= 1 {
+                    continue;
+                }
+                let mut sub = DrawFrame {
+                    nodes: &particle.nodes,
+                    particles: &[],
+                    snapshot: frame.snapshot,
+                    storage: frame.storage,
+                    settings: frame.settings,
+                    tinted: frame.tinted,
+                    missing: Vec::new(),
+                    pool: frame.pool.as_deref_mut(),
+                };
+                for p_idx in 1..particle.nodes.len() {
+                    if node_drawable(&particle.nodes[p_idx]) {
+                        let p_opacity = particle.nodes[p_idx].accumulated.opacity;
+                        let ratio = if group_opacity > 0.0 {
+                            p_opacity / group_opacity
+                        } else {
+                            0.0
+                        };
+                        let blend = node_blend(particle.nodes[p_idx].accumulated.blend_mode);
+                        draw_clipped_item(
+                            &mut surface_ops,
+                            scene,
+                            origin,
+                            p_idx,
+                            &mut sub,
+                            ratio.clamp(0.0, 1.0),
+                            blend,
+                        );
+                    }
+                }
+                frame.missing.extend(sub.missing);
+            }
             continue;
         }
         if is_composite_group(node) {
@@ -5063,6 +5119,7 @@ mod tests {
             scene,
             DrawFrame {
                 nodes: &player.nodes,
+                particles: &player.particles,
                 snapshot: snapshot.as_deref(),
                 storage,
                 settings: DrawSettings {
@@ -7712,6 +7769,7 @@ mod tests {
             &mut scene,
             DrawFrame {
                 nodes: &player.nodes,
+                particles: &player.particles,
                 snapshot: held.as_deref(),
                 storage: Some(&storage),
                 settings: DrawSettings {
