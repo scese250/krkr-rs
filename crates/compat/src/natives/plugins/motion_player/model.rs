@@ -1557,7 +1557,7 @@ fn parse_particle_frame(value: Option<&PsbValue>) -> Option<ParticleFrame> {
         }
         None => (0.0, 0.0),
     };
-    let freq_min = number_of(prt.get("fmin")).unwrap_or(0.0);
+    let freq_min = number_of(prt.get("fmin")).unwrap_or(2.0);
     let freq_max = number_of(prt.get("fmax")).unwrap_or(freq_min);
     let vel_min = number_of(prt.get("vmin")).unwrap_or(0.0);
     let vel_max = number_of(prt.get("vmax")).unwrap_or(vel_min);

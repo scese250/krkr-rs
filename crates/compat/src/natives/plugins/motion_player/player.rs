@@ -106,8 +106,12 @@ pub(crate) struct ParticleState {
     pub(crate) emitter_node: usize,
     /// Elapsed particle age in 60 Hz frame units.
     pub(crate) age: f64,
-    /// Total lifetime of the particle's child clip in 60 Hz frame units.
+    /// Total lifetime of the particle in 60 Hz frame units.
     pub(crate) lifetime: f64,
+    /// Length of the particle's child clip in 60 Hz frame units.
+    pub(crate) clip_frames: f64,
+    /// Whether the particle's child clip loops during its lifetime.
+    pub(crate) loop_clip: bool,
     /// World-space position in player coordinates.
     pub(crate) x: f64,
     /// World-space position in player coordinates.
@@ -1194,10 +1198,17 @@ impl PlayerInst {
             // `fmin`/`fmax` is emitted particles per 60 frames (per second)
             // when >= 1.0, or per-frame probability when < 1.0.
             let per_frame = if freq >= 1.0 { freq / 60.0 } else { freq };
+            let first_activation = !self.particle_spawn_accum.contains_key(&index);
             let accum = self.particle_spawn_accum.entry(index).or_insert(0.0);
             *accum += per_frame * frames;
-            let to_spawn = (*accum).floor().min(8.0) as usize;
+            let mut to_spawn = (*accum).floor().min(8.0) as usize;
             *accum -= to_spawn as f64;
+            let prewarm_count = if first_activation {
+                16usize.min(cap)
+            } else {
+                0
+            };
+            to_spawn = to_spawn.saturating_add(prewarm_count);
 
             let emitter_x = self.nodes[index].accumulated.x;
             let emitter_y = self.nodes[index].accumulated.y;
@@ -1212,7 +1223,7 @@ impl PlayerInst {
                 1.0
             };
 
-            for _ in 0..to_spawn {
+            for spawn_i in 0..to_spawn {
                 if live_count >= cap {
                     break;
                 }
@@ -1223,15 +1234,23 @@ impl PlayerInst {
                 let Some(clip) = snapshot.clip(clip_name) else {
                     continue;
                 };
-                let lifetime = if clip.total_frames > 0.0 {
+                let clip_frames = if clip.total_frames > 0.0 {
                     clip.total_frames
                 } else {
                     180.0
                 };
-                let rx = (next_particle_rand(&mut self.particle_rng) * 2.0 - 1.0) * pf.range_x;
-                let ry = (next_particle_rand(&mut self.particle_rng) * 2.0 - 1.0) * pf.range_y;
-                let x = emitter_x + emitter_matrix[0] * rx + emitter_matrix[1] * ry;
-                let y = emitter_y + emitter_matrix[2] * rx + emitter_matrix[3] * ry;
+                let loop_clip = clip.loop_time >= 0.0;
+                let lifetime = if loop_clip {
+                    720.0_f64.max(clip_frames)
+                } else {
+                    clip_frames.max(60.0)
+                };
+                // `particle/quad` spans [-16, 16] in local emitter space;
+                // `emitter_matrix` already carries `zx`, `zy`, and `angle`.
+                let lx = (next_particle_rand(&mut self.particle_rng) * 2.0 - 1.0) * 16.0;
+                let ly = (next_particle_rand(&mut self.particle_rng) * 2.0 - 1.0) * 16.0;
+                let mut x = emitter_x + emitter_matrix[0] * lx + emitter_matrix[1] * ly;
+                let mut y = emitter_y + emitter_matrix[2] * lx + emitter_matrix[3] * ly;
 
                 let speed_lo = pf.vel_min.min(pf.vel_max);
                 let speed_hi = pf.vel_min.max(pf.vel_max);
@@ -1240,22 +1259,33 @@ impl PlayerInst {
                 if config.apply_zoom_to_velocity {
                     speed *= emitter_scale;
                 }
-                let ang_lo = pf.angle_min.min(pf.angle_max);
-                let ang_hi = pf.angle_min.max(pf.angle_max);
-                let emit_angle_deg =
-                    ang_lo + (ang_hi - ang_lo) * next_particle_rand(&mut self.particle_rng);
-                let move_rad = (emit_angle_deg + config.fly_direction).to_radians();
+                let spread =
+                    (next_particle_rand(&mut self.particle_rng) * 2.0 - 1.0) * (pf.range_x * 0.5);
+                let move_rad = (emitter_angle + config.fly_direction + spread).to_radians();
                 let vx = speed * move_rad.cos();
                 let vy = speed * move_rad.sin();
-                let ax = vx * config.accel_ratio * 0.01;
-                let ay = vy * config.accel_ratio * 0.01;
 
                 let z_lo = pf.zoom_min.min(pf.zoom_max);
                 let z_hi = pf.zoom_min.max(pf.zoom_max);
                 let scale =
                     (z_lo + (z_hi - z_lo) * next_particle_rand(&mut self.particle_rng)).max(0.01);
+                let ang_lo = pf.angle_min.min(pf.angle_max);
+                let ang_hi = pf.angle_min.max(pf.angle_max);
+                let init_rot =
+                    ang_lo + (ang_hi - ang_lo) * next_particle_rand(&mut self.particle_rng);
                 let angle = if config.inherit_angle {
-                    emitter_angle + emit_angle_deg
+                    emitter_angle + init_rot
+                } else {
+                    init_rot
+                };
+
+                let age = if spawn_i < prewarm_count {
+                    let frac = (spawn_i as f64 + next_particle_rand(&mut self.particle_rng))
+                        / prewarm_count as f64;
+                    let pre_age = frac * lifetime * 0.85;
+                    x += vx * pre_age;
+                    y += vy * pre_age;
+                    pre_age
                 } else {
                     0.0
                 };
@@ -1263,14 +1293,16 @@ impl PlayerInst {
                 let nodes = build_node_tree_at(&snapshot, Some(clip), 0.0);
                 self.particles.push(ParticleState {
                     emitter_node: index,
-                    age: 0.0,
+                    age,
                     lifetime,
+                    clip_frames,
+                    loop_clip,
                     x,
                     y,
                     vx,
                     vy,
-                    ax,
-                    ay,
+                    ax: 0.0,
+                    ay: 0.0,
                     angle,
                     scale,
                     nodes,
@@ -3461,7 +3493,11 @@ fn evaluate_particle_nodes(
     if particle.nodes.is_empty() {
         return;
     }
-    let time = particle.age;
+    let time = if particle.loop_clip && particle.clip_frames > 0.0 {
+        particle.age % particle.clip_frames
+    } else {
+        particle.age
+    };
     for node in &mut particle.nodes {
         let local_time = (time - node.time_offset).max(0.0);
         node.local = evaluate_frames(&node.frames, local_time, node.coordinate_mode);
