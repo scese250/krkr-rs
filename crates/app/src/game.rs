@@ -818,7 +818,15 @@ pub struct GameHost {
     fps_presented: u32,
     /// Accumulated per-frame active work time (ms) in the current window.
     fps_work_ms: f64,
-    /// Per-second `/proc/stat` CPU and per-core utilization sampler.
+    /// Accumulated per-phase timings (ms) in the current 1-second window.
+    fps_vm_ms: f64,
+    fps_sync_ms: f64,
+    fps_render_ms: f64,
+    fps_residual_ms: f64,
+    fps_gpu_sub_ms: f64,
+    fps_gpu_wait_ms: f64,
+    fps_gpu_pres_ms: f64,
+    /// Per-second `/proc/stat` and `/proc/self/stat` CPU utilization sampler.
     cpu_sampler: CpuSampler,
 }
 
@@ -1193,6 +1201,13 @@ impl GameHost {
             fps_frames: 0,
             fps_presented: 0,
             fps_work_ms: 0.0,
+            fps_vm_ms: 0.0,
+            fps_sync_ms: 0.0,
+            fps_render_ms: 0.0,
+            fps_residual_ms: 0.0,
+            fps_gpu_sub_ms: 0.0,
+            fps_gpu_wait_ms: 0.0,
+            fps_gpu_pres_ms: 0.0,
             cpu_sampler: CpuSampler::new(),
         })
     }
@@ -1361,26 +1376,48 @@ impl GameHost {
                 self.fps_presented = self.fps_presented.saturating_add(1);
             }
             self.fps_work_ms += total_ms;
+            self.fps_vm_ms += hook_ms;
+            self.fps_sync_ms += report.sync_ms;
+            self.fps_render_ms += report.render_ms;
+            let residual_ms =
+                (host_ms - report.sync_ms - report.project_ms - report.render_ms).max(0.0);
+            self.fps_residual_ms += residual_ms;
+            if let Some(gpu) = self.host.last_frame_timings() {
+                self.fps_gpu_sub_ms += gpu.submit_ms;
+                self.fps_gpu_wait_ms += gpu.fence_wait_ms;
+                self.fps_gpu_pres_ms += gpu.present_ms;
+            }
             let elapsed = self.fps_window_start.elapsed().as_secs_f64();
             if elapsed >= 1.0 {
+                let n = f64::from(self.fps_frames.max(1));
                 let fps = f64::from(self.fps_frames) / elapsed;
                 let presented_fps = f64::from(self.fps_presented) / elapsed;
-                let avg_ms = if self.fps_frames > 0 {
-                    self.fps_work_ms / f64::from(self.fps_frames)
-                } else {
-                    0.0
-                };
-                let (cpu_pct, cores_str) = self.cpu_sampler.sample_percent();
+                let avg_ms = self.fps_work_ms / n;
+                let vm_ms = self.fps_vm_ms / n;
+                let sync_ms = self.fps_sync_ms / n;
+                let ren_ms = self.fps_render_ms / n;
+                let res_ms = self.fps_residual_ms / n;
+                let gsub_ms = self.fps_gpu_sub_ms / n;
+                let gwait_ms = self.fps_gpu_wait_ms / n;
+                let gpres_ms = self.fps_gpu_pres_ms / n;
+                let (cpu_pct, proc_pct, cores_str) = self.cpu_sampler.sample_percent(elapsed);
                 let rss_mb = read_process_rss_mb();
                 let avail_mb = read_mem_avail_mb();
                 log::info!(
-                    "app.frame: fps={fps:.1} presented_fps={presented_fps:.1} avg_ms={avg_ms:.1} frames={} cpu={cpu_pct:.0}% cores=[{cores_str}] rss_mb={rss_mb} mem_avail_mb={avail_mb}",
+                    "app.frame: fps={fps:.1} presented_fps={presented_fps:.1} avg_ms={avg_ms:.1} (vm={vm_ms:.1} sync={sync_ms:.1} ren={ren_ms:.1} res={res_ms:.1} gpu_sub={gsub_ms:.1} gpu_wait={gwait_ms:.1} pres={gpres_ms:.1}) frames={} cpu={cpu_pct:.0}% proc_cpu={proc_pct:.0}% cores=[{cores_str}] rss_mb={rss_mb} mem_avail_mb={avail_mb}",
                     self.fps_frames
                 );
                 self.fps_window_start = Instant::now();
                 self.fps_frames = 0;
                 self.fps_presented = 0;
                 self.fps_work_ms = 0.0;
+                self.fps_vm_ms = 0.0;
+                self.fps_sync_ms = 0.0;
+                self.fps_render_ms = 0.0;
+                self.fps_residual_ms = 0.0;
+                self.fps_gpu_sub_ms = 0.0;
+                self.fps_gpu_wait_ms = 0.0;
+                self.fps_gpu_pres_ms = 0.0;
             }
         }
         Ok(report)
@@ -1415,11 +1452,14 @@ impl GameHost {
     }
 }
 
-/// Samples total and per-core CPU utilization from `/proc/stat`.
+/// Samples total/per-core CPU utilization from `/proc/stat` and process CPU
+/// utilization from `/proc/self/stat` (which remains readable under Android
+/// SELinux when `/proc/stat` is restricted).
 #[derive(Default)]
 struct CpuSampler {
     prev_total: Option<(u64, u64)>,
     prev_cores: Vec<(u64, u64)>,
+    prev_proc_ticks: Option<u64>,
 }
 
 impl CpuSampler {
@@ -1431,9 +1471,10 @@ impl CpuSampler {
         let (total, cores) = read_proc_stat();
         self.prev_total = total;
         self.prev_cores = cores;
+        self.prev_proc_ticks = read_proc_self_ticks();
     }
 
-    fn sample_percent(&mut self) -> (f64, String) {
+    fn sample_percent(&mut self, elapsed_secs: f64) -> (f64, f64, String) {
         let (total, cores) = read_proc_stat();
         let total_pct = match (self.prev_total, total) {
             (Some((pt, pi)), Some((ct, ci))) => cpu_delta_percent(pt, pi, ct, ci),
@@ -1447,10 +1488,32 @@ impl CpuSampler {
             };
             core_parts.push(format!("{pct:.0}%"));
         }
+        let cur_proc = read_proc_self_ticks();
+        let proc_pct = match (self.prev_proc_ticks, cur_proc) {
+            (Some(prev), Some(cur)) if elapsed_secs > 0.0 => {
+                // Linux/Android `USER_HZ` is 100 ticks/sec, so `delta / elapsed`
+                // equals process CPU percent (100% = one full core).
+                cur.saturating_sub(prev) as f64 / elapsed_secs
+            }
+            _ => 0.0,
+        };
         self.prev_total = total;
         self.prev_cores = cores;
-        (total_pct, core_parts.join(","))
+        self.prev_proc_ticks = cur_proc;
+        (total_pct, proc_pct, core_parts.join(","))
     }
+}
+
+fn read_proc_self_ticks() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // Skip past the closing `)` of the process name, which may contain spaces.
+    let after_comm = text.rsplit_once(')')?.1;
+    let mut fields = after_comm.split_whitespace();
+    // Fields after `) ` start at field 3 (`state`); `utime` is field 14 (index 11)
+    // and `stime` is field 15 (index 12).
+    let utime = fields.nth(11)?.parse::<u64>().ok()?;
+    let stime = fields.next()?.parse::<u64>().ok()?;
+    Some(utime.saturating_add(stime))
 }
 
 fn cpu_delta_percent(prev_total: u64, prev_idle: u64, cur_total: u64, cur_idle: u64) -> f64 {
@@ -1523,7 +1586,21 @@ fn read_mem_avail_mb() -> u64 {
     parse_proc_kb(&text, "MemAvailable:").unwrap_or(0)
 }
 
-/// Logs static device hardware details (CPU cores, SoC/model, RAM) once at startup.
+fn read_build_prop_value(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(key)
+            && let Some(val) = rest.strip_prefix('=')
+        {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Logs static device hardware details (model, OS, CPU cores, SoC, RAM) once at startup.
 fn log_device_hardware_info() {
     let cores = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -1547,6 +1624,17 @@ fn log_device_hardware_info() {
     {
         cpu_model = model.trim_matches(['\0', '\n', ' ']).to_owned();
     }
+    let mut device_model = String::new();
+    let mut os_release = String::new();
+    if let Ok(prop) = std::fs::read_to_string("/system/build.prop") {
+        let mfg = read_build_prop_value(&prop, "ro.product.manufacturer").unwrap_or_default();
+        let model = read_build_prop_value(&prop, "ro.product.model").unwrap_or_default();
+        device_model = format!("{mfg} {model}").trim().to_owned();
+        if let Some(ver) = read_build_prop_value(&prop, "ro.build.version.release") {
+            let sdk = read_build_prop_value(&prop, "ro.build.version.sdk").unwrap_or_default();
+            os_release = format!("Android {ver} (API {sdk})");
+        }
+    }
     let (mem_total_mb, mem_avail_mb) = if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
         (
             parse_proc_kb(&text, "MemTotal:").unwrap_or(0),
@@ -1556,7 +1644,7 @@ fn log_device_hardware_info() {
         (0, 0)
     };
     log::info!(
-        "app.startup: device arch={} cores={cores} cpu={cpu_model:?} mem_total_mb={mem_total_mb} mem_avail_mb={mem_avail_mb}",
+        "app.startup: device model={device_model:?} os={os_release:?} arch={} cores={cores} cpu={cpu_model:?} mem_total_mb={mem_total_mb} mem_avail_mb={mem_avail_mb}",
         std::env::consts::ARCH
     );
 }

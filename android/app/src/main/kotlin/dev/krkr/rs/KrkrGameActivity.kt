@@ -1,6 +1,8 @@
 package dev.krkr.rs
 
+import android.app.ActivityManager
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 
 import androidx.core.view.WindowCompat
@@ -143,6 +145,13 @@ class KrkrGameActivity : GameActivity() {
         pendingGameName = intent.getStringExtra(EXTRA_GAME_NAME)
         pendingStateDir = filesDir.absolutePath
         publishRuntimeSettings()
+        val memInfo = ActivityManager.MemoryInfo()
+        (getSystemService(ACTIVITY_SERVICE) as? ActivityManager)?.getMemoryInfo(memInfo)
+        val totalMb = memInfo.totalMem / (1024L * 1024L)
+        val availMb = memInfo.availMem / (1024L * 1024L)
+        LauncherLog.i(
+            "KrkrGameActivity.device: manufacturer=${Build.MANUFACTURER} model=${Build.MODEL} device=${Build.DEVICE} hardware=${Build.HARDWARE} board=${Build.BOARD} android=${Build.VERSION.RELEASE} sdk=${Build.VERSION.SDK_INT} abis=${Build.SUPPORTED_ABIS.joinToString(",")} cores=${Runtime.getRuntime().availableProcessors()} ram_total_mb=$totalMb ram_avail_mb=$availMb low_mem=${memInfo.lowMemory}",
+        )
         LauncherLog.i(
             "KrkrGameActivity.onCreate: game=${pendingGameName ?: "?"} dir=${pendingGameDir ?: "?"} stateDir=${pendingStateDir ?: "?"} fps=${pendingFrameRate ?: "?"} preload=${pendingPreloadArchives ?: "?"} overlay=${pendingDebugOverlay ?: "?"} native=${pendingNativeResolution ?: "?"} log=${pendingLogLevel ?: "?"}",
         )
