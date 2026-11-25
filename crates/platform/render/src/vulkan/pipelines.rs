@@ -523,14 +523,15 @@ pub(crate) fn blend_slot(mode: BlendMode) -> Option<usize> {
         BlendMode::Multiply => Some(5),
         BlendMode::Screen => Some(6),
         // `PsNormal` is `src * a + dst * (1 - a)` with the destination's alpha
-        // preserved — identical to fixed-function slot 7, avoiding full-frame
-        // destination snapshot copies on mobile tile GPUs.
+        // preserved — identical to fixed-function slot 7. `PsAdditive` (Linear
+        // Dodge) uses fixed-function additive slot 2 (`SRC_ALPHA, ONE`),
+        // avoiding full-frame destination snapshot copies on mobile tile GPUs.
         BlendMode::PsNormal => Some(7),
+        BlendMode::PsAdditive => Some(2),
         // The remaining modes of the Photoshop family read the destination,
         // and the destination-dependent program computes their per-channel
         // function.
-        BlendMode::PsAdditive
-        | BlendMode::PsSubtractive
+        BlendMode::PsSubtractive
         | BlendMode::PsMultiplicative
         | BlendMode::PsScreen
         | BlendMode::DestinationDependent(_) => None,
@@ -547,7 +548,7 @@ pub(crate) fn blend_slot(mode: BlendMode) -> Option<usize> {
 /// `None` means the mode has a fixed-function slot and never reaches the
 /// destination-dependent program.
 pub(crate) fn dst_blend_mode(mode: BlendMode) -> Option<u32> {
-    if matches!(mode, BlendMode::PsNormal) {
+    if matches!(mode, BlendMode::PsNormal | BlendMode::PsAdditive) {
         return None;
     }
     if let Some(blend) = crate::blend::photoshop_blend(mode) {
@@ -1319,8 +1320,7 @@ mod tests {
             BlendMode::DestinationDependent(DstBlend::HardLight),
             BlendMode::DestinationDependent(DstBlend::SoftLight),
             // The destination-reading modes of the Photoshop family run in the
-            // destination-dependent program (`PsNormal` uses fixed-function slot 7).
-            BlendMode::PsAdditive,
+            // destination-dependent program (`PsNormal` uses slot 7, `PsAdditive` uses slot 2).
             BlendMode::PsSubtractive,
             BlendMode::PsMultiplicative,
             BlendMode::PsScreen,
@@ -1337,14 +1337,15 @@ mod tests {
     }
 
     /// The destination-reading modes of the Photoshop family have no
-    /// fixed-function slot, while `PsNormal` uses fixed-function slot 7 and
-    /// `Subtractive` keeps slot 3.
+    /// fixed-function slot, while `PsNormal` uses slot 7, `PsAdditive` uses
+    /// slot 2, and `Subtractive` keeps slot 3.
     #[test]
     fn the_photoshop_family_has_no_fixed_function_slot() {
         assert_eq!(blend_slot(BlendMode::PsNormal), Some(7));
         assert_eq!(dst_blend_mode(BlendMode::PsNormal), None);
+        assert_eq!(blend_slot(BlendMode::PsAdditive), Some(2));
+        assert_eq!(dst_blend_mode(BlendMode::PsAdditive), None);
         for mode in [
-            BlendMode::PsAdditive,
             BlendMode::PsSubtractive,
             BlendMode::PsMultiplicative,
             BlendMode::PsScreen,

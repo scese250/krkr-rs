@@ -351,6 +351,15 @@ fn append_window<F>(
         return;
     }
     let win_opacity = clamp_opacity(window_state.opacity);
+    let (win_w, win_h) = window_state
+        .primary_layer
+        .and_then(|id| scene.layer(id))
+        .map(|layer| (layer.rect.w as f32, layer.rect.h as f32))
+        .filter(|&(w, h)| w > 0.0 && h > 0.0)
+        .unwrap_or((
+            window_state.inner_size.0 as f32,
+            window_state.inner_size.1 as f32,
+        ));
 
     // Per-window composition state, keyed by layer id. Both maps only ever
     // hold this window's layers, so a cross-window `parent` link simply misses
@@ -370,6 +379,9 @@ fn append_window<F>(
     let mut cache_owner: Map<u32, u32> = map();
     // Cached layers whose node was actually emitted this pass.
     let mut emitted_cached: Set<u32> = set();
+    // Emitted nodes in painter's order, paired with whether the node is a
+    // full-window opaque occluder covering every pixel behind it.
+    let mut emitted_nodes: Vec<(RenderNodeId, bool)> = Vec::new();
 
     // Why layers produced no node — a scene that renders almost nothing is
     // invisible from the outside (`RUST_LOG=debug` reports it).
@@ -685,12 +697,23 @@ fn append_window<F>(
             if cached_bitmap.is_some() || effect_covers_subtree {
                 emitted_cached.insert(layer_id);
             }
+            let composed_opacity = win_opacity * node_composed.opacity;
+            let source_bitmap = cached_bitmap.or(layer.bitmap);
             let mut last = parent_node;
             for node in state.nodes.drain(..) {
+                let is_occluder = is_full_window_occluder(
+                    &node,
+                    composed_opacity,
+                    win_w,
+                    win_h,
+                    scene,
+                    source_bitmap,
+                );
                 let id = out.push(node);
                 if let Some(parent_node) = out.node_mut(parent_node) {
                     parent_node.children.push(id);
                 }
+                emitted_nodes.push((id, is_occluder));
                 last = id;
             }
             nearest.insert(layer_id, last);
@@ -701,11 +724,79 @@ fn append_window<F>(
         }
     }
 
+    // Any node strictly behind a full-window opaque occluder is completely
+    // overwritten; clear its draw content and reset its blend mode so the
+    // backend skips both its draw call and any destination-snapshot pass.
+    if let Some(cut) = emitted_nodes.iter().rposition(|&(_, occluder)| occluder)
+        && cut > 0
+    {
+        for &(node_id, _) in &emitted_nodes[..cut] {
+            if let Some(node) = out.node_mut(node_id) {
+                node.content = RenderContent::None;
+                node.blend = BlendMode::SourceOver;
+            }
+        }
+    }
+
     log::trace!(
         "engine.projection: window id={window} drew {drawn} layer(s); skipped \
          hidden={hidden} empty={empty} clipped={clipped} of {}",
         scene.window_layer_order(window).len()
     );
+}
+
+/// Whether `node` completely covers `(0, 0, win_w, win_h)` with opaque pixels.
+fn is_full_window_occluder(
+    node: &RenderNode,
+    composed_opacity: f32,
+    win_w: f32,
+    win_h: f32,
+    scene: &Scene,
+    bitmap_id: Option<u32>,
+) -> bool {
+    if win_w <= 0.0 || win_h <= 0.0 || composed_opacity < 1.0 {
+        return false;
+    }
+    if node.dst.x > 0.0
+        || node.dst.y > 0.0
+        || node.dst.x + node.dst.width < win_w
+        || node.dst.y + node.dst.height < win_h
+    {
+        return false;
+    }
+    if let Some(Clip::Rect(clip)) = node.clip
+        && (clip.x > 0.0
+            || clip.y > 0.0
+            || clip.x + clip.width < win_w
+            || clip.y + clip.height < win_h)
+    {
+        return false;
+    }
+    if matches!(node.clip, Some(Clip::Mask(_))) {
+        return false;
+    }
+    match node.content {
+        RenderContent::Solid([_, _, _, a]) => {
+            node.blend == BlendMode::Replace
+                || (a >= 1.0 && matches!(node.blend, BlendMode::SourceOver | BlendMode::PsNormal))
+        }
+        RenderContent::Texture(_) => {
+            if node.blend == BlendMode::Replace {
+                return true;
+            }
+            if !matches!(node.blend, BlendMode::SourceOver | BlendMode::PsNormal) {
+                return false;
+            }
+            let Some(id) = bitmap_id else {
+                return false;
+            };
+            let Some(bitmap) = scene.bitmap(id) else {
+                return false;
+            };
+            !bitmap.rgba.is_empty() && bitmap.rgba.chunks_exact(4).all(|px| px[3] == 255)
+        }
+        _ => false,
+    }
 }
 
 /// Project a single window's layer subtree into a fresh [`RenderScene`].
