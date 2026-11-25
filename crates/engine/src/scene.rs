@@ -27,9 +27,9 @@ use api::media::DecodedImage;
 use render::scene::{RenderContent, RenderNode};
 use render::{
     RenderPipeline, RenderState, RenderTarget, RenderTargetDesc, Texture, TextureDesc,
-    copy_render_target_to_render_target, copy_render_target_to_texture, create_render_target,
-    create_texture, destroy_render_target, drop_texture, read_render_target, render_to_target,
-    upload_texture,
+    TextureUpload, copy_render_target_to_render_target, copy_render_target_to_texture,
+    create_render_target, create_texture, destroy_render_target, drop_texture, read_render_target,
+    render_to_target, upload_textures,
 };
 
 use crate::hasher::{Map, Set, map, set};
@@ -812,6 +812,9 @@ struct DecodedImageCache {
     total_bytes: u64,
     /// Cache bound.
     limit: CacheLimit,
+    /// Cached province-image resolution results (`None` means confirmed absent)
+    /// keyed by the requested main image name.
+    province_names: crate::hasher::Map<String, Option<String>>,
 }
 
 impl Default for DecodedImageCache {
@@ -821,6 +824,7 @@ impl Default for DecodedImageCache {
             order: Vec::new(),
             total_bytes: 0,
             limit: CacheLimit::Disabled,
+            province_names: crate::hasher::map(),
         }
     }
 }
@@ -3329,6 +3333,24 @@ impl Scene {
         self.image_cache.take_copy(key)
     }
 
+    /// Returns the cached province-image resolution for `name` when present
+    /// (`Some(None)` means no province image exists).
+    pub fn lookup_province_name(&self, name: &str) -> Option<Option<&str>> {
+        self.image_cache
+            .province_names
+            .get(name)
+            .map(|resolved| resolved.as_deref())
+    }
+
+    /// Caches the resolved province-image storage name (or absence) for `name`.
+    pub fn insert_province_name(&mut self, name: String, resolved: Option<String>) {
+        const MAX_PROVINCE_CACHE_ENTRIES: usize = 4096;
+        if self.image_cache.province_names.len() >= MAX_PROVINCE_CACHE_ENTRIES {
+            self.image_cache.province_names.clear();
+        }
+        self.image_cache.province_names.insert(name, resolved);
+    }
+
     /// Marks the cached decoded image for `key` most recently used and
     /// reports whether the cache holds it.
     ///
@@ -4049,16 +4071,38 @@ impl Scene {
             .any(|layer| layer.held_bitmaps().any(|held| held == id))
     }
 
-    /// The bitmaps the live layers hold.
+    /// Whether `layer_id` is visible along its ancestor chain (all ancestors
+    /// visible with non-zero opacity) or participates in a cached/transition
+    /// subtree (`cache_enabled_count > 0` on itself or an ancestor).
+    pub fn layer_visible_or_cached(&self, mut layer_id: u32) -> bool {
+        let mut visible = true;
+        while let Some(layer) = self.layer(layer_id) {
+            if layer.cache_enabled_count > 0 {
+                return true;
+            }
+            if !layer.visible || layer.opacity == 0.0 {
+                visible = false;
+            }
+            let Some(parent) = layer.parent else {
+                return visible;
+            };
+            layer_id = parent;
+        }
+        false
+    }
+
+    /// The bitmaps the visible or cached layers hold.
     ///
-    /// The engine keeps a copy of these bitmaps on the device and gives the
-    /// copies of the others back, so the copies follow the layers and not
-    /// the assets the game has shown. The set is the scene's own answer to
-    /// "which bitmaps does the picture need".
+    /// Hidden scratch layers (such as back-page layers or `AffineLayer._image`
+    /// buffers) stay on the host until they become visible or enter a
+    /// transition/cached subtree, avoiding unnecessary GPU texture uploads and
+    /// VRAM use.
     pub(crate) fn held_bitmaps(&self) -> Set<u32> {
         let mut held = set();
         for layer in &self.layers {
-            held.extend(layer.held_bitmaps());
+            if self.layer_visible_or_cached(layer.id) {
+                held.extend(layer.held_bitmaps());
+            }
         }
         held
     }
@@ -4219,6 +4263,7 @@ impl Scene {
         self.image_cache.entries.clear();
         self.image_cache.order.clear();
         self.image_cache.total_bytes = 0;
+        self.image_cache.province_names.clear();
     }
 
     /// Return the cached decoded image for `key`, or run `decode`, cache the
@@ -4846,6 +4891,7 @@ impl Scene {
         ops: &[crate::layer_ops::DrawOp],
     ) -> Result<Map<u32, Texture>, RenderError> {
         let mut textures: Map<u32, Texture> = map();
+        let mut stale_ids: Vec<(u32, Texture, Option<DrawSourceRevision>)> = Vec::new();
         for op in ops {
             let Some(id) = op.source() else {
                 continue;
@@ -4853,24 +4899,23 @@ impl Scene {
             if textures.contains_key(&id) {
                 continue;
             }
-            // The source is cloned out of the table, because the table is
-            // written below and the borrow would outlive it.
-            let Some(source) = self.draw_sources.get(&id).cloned() else {
+            let Some((width, height)) = self
+                .draw_sources
+                .get(&id)
+                .map(|source| (source.width, source.height))
+            else {
                 continue;
             };
-            if source.width == 0 || source.height == 0 {
+            if width == 0 || height == 0 {
                 continue;
             }
             let existing = self.draw_textures.get(&id).cloned();
             let (texture, created) = match existing {
-                Some(texture)
-                    if texture.width() == source.width && texture.height() == source.height =>
-                {
+                Some(texture) if texture.width() == width && texture.height() == height => {
                     (texture, false)
                 }
                 _ => {
-                    let texture =
-                        create_texture(pipeline, TextureDesc::new(source.width, source.height))?;
+                    let texture = create_texture(pipeline, TextureDesc::new(width, height))?;
                     self.draw_textures.insert(id, texture.clone());
                     (texture, true)
                 }
@@ -4890,19 +4935,29 @@ impl Scene {
                 None => true,
             };
             if stale {
-                upload_texture(
-                    pipeline,
-                    state,
-                    &texture,
-                    PixelRegion::new(0, 0, source.width, source.height),
-                    source.rgba.as_slice(),
-                )?;
+                stale_ids.push((id, texture.clone(), revision));
+            }
+            textures.insert(id, texture);
+        }
+        if !stale_ids.is_empty() {
+            let uploads: Vec<TextureUpload<'_>> = stale_ids
+                .iter()
+                .filter_map(|(id, texture, _)| {
+                    let source = self.draw_sources.get(id)?;
+                    Some(TextureUpload {
+                        texture,
+                        region: PixelRegion::new(0, 0, source.width, source.height),
+                        pixels: source.rgba.as_slice(),
+                    })
+                })
+                .collect();
+            upload_textures(pipeline, state, &uploads)?;
+            for (id, _, revision) in stale_ids {
                 if let Some(mut revision) = revision {
                     revision.filled = Some(revision.content);
                     self.draw_source_revisions.insert(id, revision);
                 }
             }
-            textures.insert(id, texture);
         }
         Ok(textures)
     }

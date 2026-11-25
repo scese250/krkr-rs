@@ -652,11 +652,20 @@ enum DirectoryState {
     PresentNoMtime,
 }
 
+/// How long a `Present(mtime)` disk directory listing is trusted without
+/// re-statting the directory. Any write through [`Storage`] calls
+/// [`Storage::invalidate_disk_listings`] immediately, so engine writes are
+/// always visible without waiting for this window.
+const DISK_LISTING_TTL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The listing of one directory: its entries and the state when it was read.
 struct DirectoryListing {
     /// The directory's entries: the name and whether the entry is a
     /// directory.
     entries: Vec<(String, bool)>,
+    /// Indices into [`Self::entries`] grouped by ASCII-lowercased entry name
+    /// for O(1) case-insensitive lookup.
+    by_lower: crate::hasher::Map<String, Vec<usize>>,
     /// The directory's cached state.
     ///
     /// A `Missing` listing is reused until [`Storage::invalidate_disk_listings`]
@@ -664,6 +673,44 @@ struct DirectoryListing {
     /// listing stays valid while the directory's modification time matches
     /// `ms`. A `PresentNoMtime` listing is read again on every probe.
     state: DirectoryState,
+    /// When `Present(ms)` was last confirmed via `fs::stat`.
+    checked_at: Option<std::time::Instant>,
+}
+
+impl DirectoryListing {
+    fn new(entries: Vec<(String, bool)>, state: DirectoryState) -> Self {
+        let mut by_lower: crate::hasher::Map<String, Vec<usize>> = crate::hasher::map();
+        for (idx, (name, _)) in entries.iter().enumerate() {
+            by_lower
+                .entry(name.to_ascii_lowercase())
+                .or_default()
+                .push(idx);
+        }
+        let checked_at = match state {
+            DirectoryState::Present(_) => Some(std::time::Instant::now()),
+            DirectoryState::Missing | DirectoryState::PresentNoMtime => None,
+        };
+        Self {
+            entries,
+            by_lower,
+            state,
+            checked_at,
+        }
+    }
+
+    fn missing() -> Self {
+        Self::new(Vec::new(), DirectoryState::Missing)
+    }
+
+    fn is_fresh_disk(&self) -> bool {
+        match self.state {
+            DirectoryState::Missing => true,
+            DirectoryState::Present(_) => self
+                .checked_at
+                .is_some_and(|at| at.elapsed() < DISK_LISTING_TTL),
+            DirectoryState::PresentNoMtime => false,
+        }
+    }
 }
 
 /// The per-storage resolver cache.
@@ -3076,16 +3123,13 @@ impl Storage {
     fn directory_listing(&self, dir: &Path) -> Result<Rc<DirectoryListing>, StorageReadError> {
         let cached = self.resolution_cache.borrow().listings.get(dir).cloned();
         if let Some(listing) = &cached
-            && listing.state == DirectoryState::Missing
+            && listing.is_fresh_disk()
         {
             return Ok(Rc::clone(listing));
         }
         let state = self.directory_state(dir)?;
         if state == DirectoryState::Missing {
-            let listing = Rc::new(DirectoryListing {
-                entries: Vec::new(),
-                state: DirectoryState::Missing,
-            });
+            let listing = Rc::new(DirectoryListing::missing());
             self.resolution_cache
                 .borrow_mut()
                 .listings
@@ -3096,10 +3140,20 @@ impl Storage {
             && let DirectoryState::Present(modified) = state
             && listing.state == DirectoryState::Present(modified)
         {
-            return Ok(listing);
+            let refreshed = Rc::new(DirectoryListing {
+                entries: listing.entries.clone(),
+                by_lower: listing.by_lower.clone(),
+                state,
+                checked_at: Some(std::time::Instant::now()),
+            });
+            self.resolution_cache
+                .borrow_mut()
+                .listings
+                .insert(dir.to_path_buf(), Rc::clone(&refreshed));
+            return Ok(refreshed);
         }
         let entries = self.read_directory_listing(dir)?;
-        let listing = Rc::new(DirectoryListing { entries, state });
+        let listing = Rc::new(DirectoryListing::new(entries, state));
         self.resolution_cache
             .borrow_mut()
             .listings
@@ -3500,6 +3554,34 @@ impl Storage {
         // lowercase spelling wins when both a lowercase
         // and a mixed-case file exist.
         let normalized = normalize_in_archive_name(relative);
+        // When `root` already has a fresh disk listing in cache, resolve
+        // through the in-memory listing first so missing files avoid FUSE
+        // `stat` syscalls completely.
+        let root_fresh = self
+            .resolution_cache
+            .borrow()
+            .listings
+            .get(root)
+            .map(|listing| {
+                (
+                    listing.state == DirectoryState::Missing,
+                    listing.is_fresh_disk(),
+                )
+            });
+        if let Some((is_missing, is_fresh)) = root_fresh {
+            if is_missing {
+                return Ok(None);
+            }
+            if is_fresh {
+                trace.attempt(|| {
+                    format!(
+                        "disk (cached listing) {normalized} under {}",
+                        root.display()
+                    )
+                });
+                return self.find_disk_case_insensitive(root, &normalized);
+            }
+        }
         let candidate = root.join(&normalized);
         trace.attempt(|| format!("disk {}", candidate.display()));
         if let Some(is_dir) = self.stat_probe(&candidate)? {
@@ -3542,29 +3624,41 @@ impl Storage {
         ) -> Result<Option<(PathBuf, bool)>, StorageReadError> {
             let want = parts[0];
             let listing = storage.directory_listing(dir)?;
+            let Some(indices) = listing.by_lower.get(want) else {
+                return Ok(None);
+            };
             // Directories matching this component are collected and only
             // entered after every file at this level has been checked, so a
-            // file directly at this level wins.
+            // file directly at this level wins. An exact lowercase match wins
+            // over mixed-case siblings when both exist.
             let mut subdirs = Vec::new();
             let mut dir_match = None;
-            for (name, is_dir) in listing.entries.iter() {
-                if !name.eq_ignore_ascii_case(want) {
-                    continue;
-                }
+            let mut mixed_file = None;
+            for &idx in indices {
+                let (name, is_dir) = &listing.entries[idx];
                 let path = dir.join(name.as_str());
                 if parts.len() == 1 {
-                    if !is_dir {
-                        // Validate against the live file system: a file removed
-                        // between the listing and this probe must not resolve.
-                        if storage.stat_probe(&path)?.is_some() {
-                            return Ok(Some((path, false)));
+                    if !*is_dir {
+                        if name == want {
+                            // Validate against the live file system: a file removed
+                            // between the listing and this probe must not resolve.
+                            if storage.stat_probe(&path)?.is_some() {
+                                return Ok(Some((path, false)));
+                            }
+                        } else if mixed_file.is_none() {
+                            mixed_file = Some(path);
                         }
-                    } else if dir_match.is_none() {
+                    } else if dir_match.is_none() || name == want {
                         dir_match = Some(path);
                     }
                 } else if *is_dir {
                     subdirs.push(path);
                 }
+            }
+            if let Some(path) = mixed_file
+                && storage.stat_probe(&path)?.is_some()
+            {
+                return Ok(Some((path, false)));
             }
             if let Some(path) = dir_match
                 && storage.stat_probe(&path)?.is_some()

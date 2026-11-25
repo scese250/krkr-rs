@@ -322,6 +322,11 @@ pub(crate) fn resolve_province_image(
     }
 }
 
+/// Whether any asynchronous image save is currently in flight.
+pub(crate) fn has_pending_saves(ctx: &CompatCtx) -> bool {
+    !resource_state(ctx).pending_save_names().is_empty()
+}
+
 /// Decode image bytes through the installed host decoder.
 pub(crate) fn decode_image(
     services: &CompatServices,

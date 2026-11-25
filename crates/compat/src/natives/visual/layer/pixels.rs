@@ -2577,8 +2577,25 @@ fn load_auto_province(ctx: &CompatCtx, layer_id: u32, name: &str) -> Result<(), 
         // The main image could not have been loaded either.
         return Ok(());
     };
+    let no_pending_writes = !crate::natives::visual::bitmap::has_pending_saves(ctx);
+    if no_pending_writes
+        && let Ok(scene) = scene_ref(ctx)
+        && let Some(cached) = scene.lookup_province_name(name)
+    {
+        return match cached {
+            Some(province_name) => {
+                let province_name = province_name.to_owned();
+                load_layer_province(ctx, layer_id, &province_name)
+            }
+            None => Ok(()),
+        };
+    }
     // SAFETY: `attach_storage` guarantees the pointer stays valid.
-    let Some(province_name) = resolve_province_image(ctx, unsafe { &*storage }, name)? else {
+    let resolved = resolve_province_image(ctx, unsafe { &*storage }, name)?;
+    if let Ok(scene) = scene_mut(ctx) {
+        scene.insert_province_name(name.to_owned(), resolved.clone());
+    }
+    let Some(province_name) = resolved else {
         return Ok(());
     };
     load_layer_province(ctx, layer_id, &province_name)

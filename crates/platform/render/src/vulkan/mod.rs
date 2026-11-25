@@ -885,6 +885,17 @@ impl VulkanPipeline {
                 )?;
                 fence_wait_ms += fence_started.elapsed().as_secs_f64() * 1000.0;
                 presentation.fences.completed(frame_index);
+                let safe_frame = presentation
+                    .frames
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| presentation.fences.slot_running(*i))
+                    .map(|(_, frame)| frame.submitted_epoch.saturating_sub(1))
+                    .min()
+                    .unwrap_or(device_state.frame_submitted_epoch);
+                device_state.frame_completed_epoch =
+                    device_state.frame_completed_epoch.max(safe_frame);
+                device_state.reap_retired();
             }
 
             let acquire_started = Instant::now();
@@ -1157,6 +1168,10 @@ impl VulkanPipeline {
                 }
                 // The queue accepted the submission, so the fence will signal.
                 presentation.fences.submitted(frame_index);
+                device_state.frame_submitted_epoch =
+                    device_state.frame_submitted_epoch.saturating_add(1);
+                presentation.frames[frame_index].submitted_epoch =
+                    device_state.frame_submitted_epoch;
                 presentation.images_in_flight[image_index as usize] = in_flight;
                 Ok(())
             })();
@@ -1350,6 +1365,8 @@ pub(crate) struct VulkanFrame {
     pub(crate) in_flight: vk::Fence,
     /// Semaphore signalled when a swapchain image is acquired.
     pub(crate) image_available: vk::Semaphore,
+    /// Frame submission epoch guarded by [`Self::in_flight`].
+    pub(crate) submitted_epoch: u64,
 }
 
 /// The swapchain image the engine holds.
@@ -1462,6 +1479,20 @@ fn frame_slot_fences(frames: &[VulkanFrame]) -> [vk::Fence; MAX_FRAMES_IN_FLIGHT
 /// pairs it with nothing. Every resource here outlives a surface and none of
 /// them is tied to one, so the same device serves both kinds of caller.
 ///
+/// A GPU texture queued for destruction once in-flight uploads and frames finish.
+pub(crate) struct RetiredTexture {
+    texture: texture::VulkanTexture,
+    upload_epoch: u64,
+    frame_epoch: u64,
+}
+
+/// A GPU render target queued for destruction once in-flight uploads and frames finish.
+pub(crate) struct RetiredRenderTarget {
+    target: target::VulkanRenderTarget,
+    upload_epoch: u64,
+    frame_epoch: u64,
+}
+
 /// The device owns its own actions: a caller reaches the textures, the
 /// offscreen targets and the effect pipelines through the methods below, not
 /// through the fields.
@@ -1495,6 +1526,14 @@ pub(crate) struct VulkanDevice {
     pub(crate) textures: Map<u64, texture::VulkanTexture>,
     /// GPU offscreen targets keyed by [`RenderTarget`] identity.
     pub(crate) render_targets: Map<u64, target::VulkanRenderTarget>,
+    /// Textures removed from [`Self::textures`] awaiting GPU completion.
+    pub(crate) retired_textures: Vec<RetiredTexture>,
+    /// Render targets removed from [`Self::render_targets`] awaiting GPU completion.
+    pub(crate) retired_targets: Vec<RetiredRenderTarget>,
+    /// Monotonic epoch incremented on each accepted live frame submission.
+    pub(crate) frame_submitted_epoch: u64,
+    /// Highest live frame epoch guaranteed completed on the GPU.
+    pub(crate) frame_completed_epoch: u64,
     /// Per-format offscreen render passes and their pipelines.
     pub(crate) offscreen: Map<TextureFormat, target::OffscreenPass>,
     /// Custom effect pipelines, their samplers and the frame's uniform ring,
@@ -1587,6 +1626,10 @@ impl VulkanDevice {
             offscreen_fence,
             textures: Map::default(),
             render_targets: Map::default(),
+            retired_textures: Vec::new(),
+            retired_targets: Vec::new(),
+            frame_submitted_epoch: 0,
+            frame_completed_epoch: 0,
             offscreen: Map::default(),
             effect: None,
             readback: RefCell::new(texture::StagingBuffer::default()),
@@ -1594,45 +1637,135 @@ impl VulkanDevice {
         })
     }
 
+    /// Destroys retired GPU textures and render targets whose upload and frame
+    /// epochs have completed on the GPU, without blocking.
+    pub(crate) fn reap_retired(&mut self) {
+        if self.retired_textures.is_empty() && self.retired_targets.is_empty() {
+            return;
+        }
+        if self.offscreen_fence.in_flight() {
+            return;
+        }
+        let safe_upload = self.upload.safe_epoch(&self.device);
+        let safe_frame = self.frame_completed_epoch;
+        let device = &self.device;
+        let descriptor_pool = self.resources.descriptor_pool;
+
+        let mut i = 0;
+        while i < self.retired_textures.len() {
+            let entry = &self.retired_textures[i];
+            if entry.upload_epoch <= safe_upload && entry.frame_epoch <= safe_frame {
+                let retired = self.retired_textures.swap_remove(i);
+                retired.texture.destroy(device, descriptor_pool);
+            } else {
+                i += 1;
+            }
+        }
+
+        let mut j = 0;
+        while j < self.retired_targets.len() {
+            let entry = &self.retired_targets[j];
+            if entry.upload_epoch <= safe_upload && entry.frame_epoch <= safe_frame {
+                let retired = self.retired_targets.swap_remove(j);
+                retired.target.destroy(device);
+            } else {
+                j += 1;
+            }
+        }
+    }
+
+    /// Waits for all in-flight GPU work and immediately frees every retired
+    /// texture and render target.
+    pub(crate) fn flush_retired(&mut self) {
+        if self.retired_textures.is_empty() && self.retired_targets.is_empty() {
+            return;
+        }
+        // SAFETY: waiting for the device to go idle ensures no command buffer
+        // references any retired image, view, framebuffer, or descriptor set.
+        unsafe {
+            let _ = self.device.device_wait_idle();
+        }
+        self.frame_completed_epoch = self.frame_submitted_epoch;
+        let device = &self.device;
+        let descriptor_pool = self.resources.descriptor_pool;
+        for retired in self.retired_textures.drain(..) {
+            retired.texture.destroy(device, descriptor_pool);
+        }
+        for retired in self.retired_targets.drain(..) {
+            retired.target.destroy(device);
+        }
+    }
+
+    /// Creates a GPU texture, reaping completed retired resources first and
+    /// falling back to a full retired flush if allocation fails under pressure.
+    pub(crate) fn create_texture_or_reap(
+        &mut self,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        desc: TextureDesc,
+    ) -> Result<texture::VulkanTexture, RenderError> {
+        self.reap_retired();
+        match texture::create_texture(
+            &self.device,
+            memory_properties,
+            self.resources.descriptor_set_layout,
+            self.resources.descriptor_pool,
+            self.resources.sampler,
+            desc,
+        ) {
+            Ok(gpu) => Ok(gpu),
+            Err(error) if !self.retired_textures.is_empty() || !self.retired_targets.is_empty() => {
+                self.flush_retired();
+                texture::create_texture(
+                    &self.device,
+                    memory_properties,
+                    self.resources.descriptor_set_layout,
+                    self.resources.descriptor_pool,
+                    self.resources.sampler,
+                    desc,
+                )
+                .map_err(|_| error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Releases the GPU resources and the state slot for `tex`.
     pub(crate) fn drop_texture(&mut self, tex: Texture) {
         let Some(texture) = self.textures.remove(&tex.key()) else {
             return;
         };
-        let device = self.device.clone();
-        // SAFETY: wait for in-flight work before freeing the image; the device
-        // is idle afterwards.
-        unsafe {
-            let _ = device.device_wait_idle();
-        }
-        texture.destroy(&device, self.resources.descriptor_pool);
+        let upload_epoch = self.upload.submitted_epoch();
+        let frame_epoch = self.frame_submitted_epoch;
+        self.retired_textures.push(RetiredTexture {
+            texture,
+            upload_epoch,
+            frame_epoch,
+        });
+        self.reap_retired();
     }
 
     /// Releases the GPU resources and state slots for every texture in
-    /// `textures` with at most one device idle wait.
+    /// `textures`, deferring actual destruction until in-flight GPU work
+    /// referencing them finishes.
     pub(crate) fn drop_textures(&mut self, textures: &[Texture]) {
-        let mut removed = Vec::with_capacity(textures.len());
+        let upload_epoch = self.upload.submitted_epoch();
+        let frame_epoch = self.frame_submitted_epoch;
         for tex in textures {
             if let Some(texture) = self.textures.remove(&tex.key()) {
-                removed.push(texture);
+                self.retired_textures.push(RetiredTexture {
+                    texture,
+                    upload_epoch,
+                    frame_epoch,
+                });
             }
         }
-        if removed.is_empty() {
-            return;
-        }
-        let device = self.device.clone();
-        // SAFETY: wait for in-flight work once before freeing the batch; the
-        // device is idle afterwards.
-        unsafe {
-            let _ = device.device_wait_idle();
-        }
-        for texture in removed {
-            texture.destroy(&device, self.resources.descriptor_pool);
-        }
+        self.reap_retired();
     }
 
-    /// Releases idle host-visible staging and readback buffers to reclaim RAM.
+    /// Releases idle host-visible staging and readback buffers and flushes
+    /// retired GPU resources to reclaim memory.
     pub(crate) fn shrink_staging_buffers(&mut self) {
+        self.flush_retired();
         self.upload.shrink_staging_buffers(&self.device);
         if !self.offscreen_fence.in_flight() {
             self.readback.get_mut().release(&self.device);
@@ -1644,12 +1777,14 @@ impl VulkanDevice {
         let Some(gpu) = self.render_targets.remove(&target.key()) else {
             return;
         };
-        let device = self.device.clone();
-        // SAFETY: wait for in-flight work before freeing the image.
-        unsafe {
-            let _ = device.device_wait_idle();
-        }
-        gpu.destroy(&device);
+        let upload_epoch = self.upload.submitted_epoch();
+        let frame_epoch = self.frame_submitted_epoch;
+        self.retired_targets.push(RetiredRenderTarget {
+            target: gpu,
+            upload_epoch,
+            frame_epoch,
+        });
+        self.reap_retired();
     }
 
     /// Creates an effect pipeline whose resources live in this device.
@@ -1976,8 +2111,14 @@ impl Drop for VulkanDevice {
             for texture in self.textures.values() {
                 texture.destroy(&self.device, descriptor_pool);
             }
+            for retired in self.retired_textures.drain(..) {
+                retired.texture.destroy(&self.device, descriptor_pool);
+            }
             for target in self.render_targets.values() {
                 target.destroy(&self.device);
+            }
+            for retired in self.retired_targets.drain(..) {
+                retired.target.destroy(&self.device);
             }
             for pass in self.offscreen.values() {
                 pass.destroy(&self.device);
@@ -2382,6 +2523,7 @@ fn create_frame(device: &ash::Device, queue_family_index: u32) -> Result<VulkanF
             command_buffer,
             in_flight,
             image_available,
+            submitted_epoch: 0,
         }),
         (fence, image_available) => {
             if let Ok(fence) = fence {

@@ -69,14 +69,25 @@ impl VulkanTexture {
 /// Persistent host-visible staging buffer reused by one upload slot.
 ///
 /// The buffer grows geometrically and is only recreated when an upload needs
-/// more space. The owning [`UploadSlot`] waits its fence before the buffer is
-/// touched, so the old buffer is destroyed without a further wait.
+/// more space or after sustained small usage. Upload slots keep their buffer
+/// persistently mapped for its lifetime so each batch copies directly into
+/// host-visible memory without per-batch map/unmap calls. The owning
+/// [`UploadSlot`] waits its fence before the buffer is touched, so the old
+/// buffer is destroyed without a further wait.
 pub(crate) struct StagingBuffer {
     /// The host-visible buffer; null until the first reserve.
     pub(crate) buffer: vk::Buffer,
     /// Memory backing [`Self::buffer`]; null until the first reserve.
     pub(crate) memory: vk::DeviceMemory,
+    /// Persistently mapped base address of [`Self::memory`], when mapped.
+    ///
+    /// Stored as an address so the state stays free of raw pointers; `None`
+    /// when the buffer is empty or unmapped.
+    mapped: Option<usize>,
     capacity: vk::DeviceSize,
+    /// Consecutive reserves at or below [`STAGING_SHRINK_TARGET_MAX`] while
+    /// capacity exceeds [`STAGING_SHRINK_THRESHOLD`].
+    small_reserves: u32,
 }
 
 impl Default for StagingBuffer {
@@ -84,19 +95,25 @@ impl Default for StagingBuffer {
         Self {
             buffer: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
+            mapped: None,
             capacity: 0,
+            small_reserves: 0,
         }
     }
 }
 
-/// Host-visible staging capacity above which a buffer is shrunk when a smaller
-/// upload arrives, so a single loading burst does not permanently pin tens of
-/// megabytes of host-visible RAM.
+/// Host-visible staging capacity above which a buffer is eligible to shrink
+/// after sustained small uploads, so a single loading burst does not
+/// permanently pin tens of megabytes of host-visible RAM.
 const STAGING_SHRINK_THRESHOLD: vk::DeviceSize = 16 * 1024 * 1024;
 
-/// Maximum upload size that triggers shrinking an oversized staging buffer
-/// (hysteresis gap below [`STAGING_SHRINK_THRESHOLD`] to prevent thrashing).
+/// Maximum upload size that counts toward shrinking an oversized staging
+/// buffer (hysteresis gap below [`STAGING_SHRINK_THRESHOLD`]).
 const STAGING_SHRINK_TARGET_MAX: vk::DeviceSize = 8 * 1024 * 1024;
+
+/// Consecutive small reserves required before shrinking an oversized staging
+/// buffer, so a multi-frame loading burst does not reallocate on every frame.
+const STAGING_SHRINK_DELAY_RESERVES: u32 = 60;
 
 impl StagingBuffer {
     /// Destroys the staging buffer and its memory, if any.
@@ -107,6 +124,9 @@ impl StagingBuffer {
         // SAFETY: both handles were created by `device` and the caller
         // guarantees no in-flight work still references them.
         unsafe {
+            if self.mapped.is_some() {
+                device.unmap_memory(self.memory);
+            }
             device.destroy_buffer(self.buffer, None);
             device.free_memory(self.memory, None);
         }
@@ -118,17 +138,17 @@ impl StagingBuffer {
         self.destroy(device);
         self.buffer = vk::Buffer::null();
         self.memory = vk::DeviceMemory::null();
+        self.mapped = None;
         self.capacity = 0;
+        self.small_reserves = 0;
     }
 
-    /// Grows (or shrinks when oversized) the buffer to hold at least `size`
-    /// bytes.
+    /// Grows (or shrinks after sustained small usage) the buffer to hold at
+    /// least `size` bytes, leaving its memory unmapped.
     ///
-    /// `usage` is the buffer usage the caller will use it for. A staging
-    /// buffer is only ever a transfer source and a readback buffer only a
-    /// transfer destination, so the usage never changes after the first
-    /// reserve. The caller guarantees no GPU work still reads the old buffer;
-    /// it is therefore destroyed without a wait.
+    /// `usage` is the buffer usage the caller will use it for. The caller
+    /// guarantees no GPU work still accesses the old buffer; it is therefore
+    /// destroyed without a wait.
     pub(crate) fn reserve(
         &mut self,
         device: &ash::Device,
@@ -136,50 +156,116 @@ impl StagingBuffer {
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
     ) -> Result<(), RenderError> {
-        let should_shrink =
-            self.capacity > STAGING_SHRINK_THRESHOLD && size <= STAGING_SHRINK_TARGET_MAX;
-        if self.capacity >= size && !should_shrink {
+        self.reserve_with_mapping(device, memory_properties, size, usage, false)
+    }
+
+    /// Grows (or shrinks after sustained small usage) the buffer to hold at
+    /// least `size` bytes and keeps its memory persistently mapped.
+    fn reserve_mapped(
+        &mut self,
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<(), RenderError> {
+        self.reserve_with_mapping(device, memory_properties, size, usage, true)
+    }
+
+    /// Updates the shrink hysteresis counter and reports whether an oversized
+    /// buffer has seen enough consecutive small reserves to shrink.
+    fn should_shrink_after_reserve(&mut self, size: vk::DeviceSize) -> bool {
+        if self.capacity > STAGING_SHRINK_THRESHOLD && size <= STAGING_SHRINK_TARGET_MAX {
+            self.small_reserves = self.small_reserves.saturating_add(1);
+            self.small_reserves >= STAGING_SHRINK_DELAY_RESERVES
+        } else {
+            self.small_reserves = 0;
+            false
+        }
+    }
+
+    /// Allocates or reuses the staging buffer for `size` bytes, optionally
+    /// keeping the allocation persistently mapped.
+    fn reserve_with_mapping(
+        &mut self,
+        device: &ash::Device,
+        memory_properties: &vk::PhysicalDeviceMemoryProperties,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        persistent_map: bool,
+    ) -> Result<(), RenderError> {
+        let should_shrink = self.should_shrink_after_reserve(size);
+        let mapping_ready = !persistent_map || self.mapped.is_some();
+        if self.buffer != vk::Buffer::null()
+            && self.capacity >= size
+            && !should_shrink
+            && mapping_ready
+        {
             return Ok(());
         }
         let capacity = staging_capacity(size)?;
         let (buffer, memory) = create_staging_buffer(device, memory_properties, capacity, usage)?;
+        let mapped = if persistent_map {
+            // SAFETY: `memory` was allocated with `HOST_VISIBLE | HOST_COHERENT`
+            // and at least `capacity` bytes; the mapping stays valid until
+            // `destroy`.
+            let ptr = match unsafe {
+                device.map_memory(memory, 0, capacity, vk::MemoryMapFlags::empty())
+            } {
+                Ok(ptr) => ptr,
+                Err(error) => {
+                    // SAFETY: both handles are owned here and unused elsewhere.
+                    unsafe {
+                        device.destroy_buffer(buffer, None);
+                        device.free_memory(memory, None);
+                    }
+                    return Err(RenderError::Upload {
+                        message: format!("failed to map the staging buffer: {error}"),
+                    });
+                }
+            };
+            Some(ptr as usize)
+        } else {
+            None
+        };
         self.destroy(device);
         self.buffer = buffer;
         self.memory = memory;
+        self.mapped = mapped;
         self.capacity = capacity;
+        self.small_reserves = 0;
         Ok(())
     }
 
-    /// Maps the whole reserved range once and copies each upload's pixels at
-    /// its precomputed offset.
+    /// Copies each upload's pixels into the persistently mapped buffer at its
+    /// precomputed offset.
     ///
     /// `offsets` must be the layout returned by [`staging_layout`] for
     /// `uploads`.
     fn write(
         &self,
-        device: &ash::Device,
         total: usize,
         uploads: &[TextureUpload<'_>],
         offsets: &[usize],
     ) -> Result<(), RenderError> {
-        // SAFETY: `reserve` guarantees the host-visible buffer holds at least
-        // `total` bytes and no GPU work is reading it while it is mapped.
-        let mapped = unsafe {
-            device.map_memory(
-                self.memory,
-                0,
-                total as vk::DeviceSize,
-                vk::MemoryMapFlags::empty(),
-            )
+        let Some(mapped) = self.mapped else {
+            return Err(RenderError::Upload {
+                message: "the staging buffer is not mapped".to_owned(),
+            });
+        };
+        if (total as vk::DeviceSize) > self.capacity {
+            return Err(RenderError::Upload {
+                message: format!(
+                    "staged upload of {total} bytes exceeds the {}-byte staging buffer",
+                    self.capacity
+                ),
+            });
         }
-        .map_err(|error| RenderError::Upload {
-            message: format!("failed to map the staging buffer: {error}"),
-        })?;
-        let base = mapped.cast::<u8>();
+        let base = mapped as *mut u8;
         for (upload, &offset) in uploads.iter().zip(offsets) {
             // SAFETY: the offsets are the consecutive pixel lengths summed by
             // `staging_layout`, so `base + offset .. + pixels.len()` lies
-            // inside the `total` mapped bytes.
+            // inside `total <= self.capacity` mapped bytes, and the slot's
+            // fence was waited on before `write` so the GPU is not reading it.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     upload.pixels.as_ptr(),
@@ -188,8 +274,6 @@ impl StagingBuffer {
                 );
             }
         }
-        // SAFETY: the mapping was created above and is not used afterwards.
-        unsafe { device.unmap_memory(self.memory) };
         Ok(())
     }
 }
@@ -214,6 +298,8 @@ struct UploadSlot {
     fence: vk::Fence,
     /// Whether [`Self::fence`] still guards unfinished GPU work.
     in_flight: bool,
+    /// Submission epoch of the work guarded by [`Self::fence`].
+    epoch: u64,
     /// Number of batches submitted from this slot; a diagnostic counter.
     #[cfg(test)]
     submits: u64,
@@ -227,6 +313,8 @@ struct UploadSlot {
 pub(crate) struct UploadRing {
     slots: Vec<UploadSlot>,
     next: usize,
+    /// Monotonic counter incremented on every accepted upload submission.
+    submitted_epoch: u64,
     /// The costs of the most recent batch, measured on the thread that made
     /// it. `None` until the first batch.
     pub(crate) last: Option<UploadTimings>,
@@ -254,8 +342,38 @@ impl UploadRing {
         Ok(Self {
             slots,
             next: 0,
+            submitted_epoch: 0,
             last: None,
         })
+    }
+
+    /// Returns the epoch of the most recently submitted upload batch.
+    pub(crate) fn submitted_epoch(&self) -> u64 {
+        self.submitted_epoch
+    }
+
+    /// Polls in-flight upload fences without blocking and returns the highest
+    /// upload epoch guaranteed to have completed on the GPU.
+    pub(crate) fn safe_epoch(&mut self, device: &ash::Device) -> u64 {
+        for slot in &mut self.slots {
+            if !slot.in_flight {
+                continue;
+            }
+            // SAFETY: `slot.fence` was created by `device`.
+            match unsafe { device.get_fence_status(slot.fence) } {
+                Ok(true) => slot.in_flight = false,
+                Ok(false) => {}
+                Err(error) => {
+                    log::warn!("platform.render: failed to poll an upload fence: {error}");
+                }
+            }
+        }
+        self.slots
+            .iter()
+            .filter(|slot| slot.in_flight)
+            .map(|slot| slot.epoch.saturating_sub(1))
+            .min()
+            .unwrap_or(self.submitted_epoch)
     }
 
     /// Destroys every slot's staging buffer, command pool and fence.
@@ -425,6 +543,7 @@ fn create_upload_slot(
         command,
         fence,
         in_flight: false,
+        epoch: 0,
         #[cfg(test)]
         submits: 0,
     })
@@ -810,15 +929,16 @@ where
     // measurement behind, so a reader never sees the costs of an earlier
     // batch in its place.
     ring.last = None;
+    let next_epoch = ring.submitted_epoch.saturating_add(1);
     let (slot, wait_ms) = ring.acquire(device)?;
     let stage_started = Instant::now();
-    slot.staging.reserve(
+    slot.staging.reserve_mapped(
         device,
         memory_properties,
         total as vk::DeviceSize,
         vk::BufferUsageFlags::TRANSFER_SRC,
     )?;
-    slot.staging.write(device, total, uploads, offsets)?;
+    slot.staging.write(total, uploads, offsets)?;
     let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
     let staging_buffer = slot.staging.buffer;
 
@@ -864,11 +984,13 @@ where
     }
     let submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
 
+    slot.epoch = next_epoch;
     slot.in_flight = true;
     #[cfg(test)]
     {
         slot.submits = slot.submits.saturating_add(1);
     }
+    ring.submitted_epoch = next_epoch;
     // The batch's costs: the wait for the staging buffer, the write of the
     // pixels into it, and the device's copy command.
     ring.last = Some(UploadTimings {
@@ -1017,14 +1139,7 @@ impl VulkanDevice {
         let key = tex.key();
         let create_started = Instant::now();
         if !self.textures.contains_key(&key) {
-            let gpu = create_texture(
-                &self.device,
-                memory_properties,
-                self.resources.descriptor_set_layout,
-                self.resources.descriptor_pool,
-                self.resources.sampler,
-                *tex.desc(),
-            )?;
+            let gpu = self.create_texture_or_reap(memory_properties, *tex.desc())?;
             self.textures.insert(key, gpu);
         }
         let create_ms = create_started.elapsed().as_secs_f64() * 1000.0;
@@ -1072,14 +1187,7 @@ impl VulkanDevice {
         for upload in uploads {
             let key = upload.texture.key();
             if !self.textures.contains_key(&key) {
-                let gpu = create_texture(
-                    &self.device,
-                    memory_properties,
-                    self.resources.descriptor_set_layout,
-                    self.resources.descriptor_pool,
-                    self.resources.sampler,
-                    *upload.texture.desc(),
-                )?;
+                let gpu = self.create_texture_or_reap(memory_properties, *upload.texture.desc())?;
                 self.textures.insert(key, gpu);
             }
         }
