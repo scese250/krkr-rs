@@ -169,6 +169,69 @@ pub(crate) struct Frame {
     /// The child motion's clock offset (`motion.timeOffset`): the child clip
     /// runs that much ahead of the parent clock.
     pub(crate) motion_time_offset: f64,
+    /// Particle emitter parameters (`content.prt`), when present.
+    pub(crate) particle: Option<ParticleFrame>,
+}
+
+/// Keyframe parameters for a `LayerTypeParticle` emitter (`content.prt`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ParticleFrame {
+    /// Minimum emission frequency (`fmin`).
+    pub(crate) freq_min: f64,
+    /// Maximum emission frequency (`fmax`).
+    pub(crate) freq_max: f64,
+    /// Minimum initial velocity (`vmin`).
+    pub(crate) vel_min: f64,
+    /// Maximum initial velocity (`vmax`).
+    pub(crate) vel_max: f64,
+    /// Minimum emission angle in degrees (`amin`).
+    pub(crate) angle_min: f64,
+    /// Maximum emission angle in degrees (`amax`).
+    pub(crate) angle_max: f64,
+    /// Minimum initial zoom/scale (`zmin`).
+    pub(crate) zoom_min: f64,
+    /// Maximum initial zoom/scale (`zmax`).
+    pub(crate) zoom_max: f64,
+    /// Horizontal spawn half-range (`range` scalar or `range[0]`).
+    pub(crate) range_x: f64,
+    /// Vertical spawn half-range (`range` scalar or `range[1]`).
+    pub(crate) range_y: f64,
+}
+
+impl Default for ParticleFrame {
+    fn default() -> Self {
+        Self {
+            freq_min: 1.0,
+            freq_max: 1.0,
+            vel_min: 0.0,
+            vel_max: 0.0,
+            angle_min: 0.0,
+            angle_max: 0.0,
+            zoom_min: 1.0,
+            zoom_max: 1.0,
+            range_x: 0.0,
+            range_y: 0.0,
+        }
+    }
+}
+
+/// Layer-level configuration for a `LayerTypeParticle` (`type == 4`) emitter.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParticleEmitterConfig {
+    /// Maximum concurrent live particles (`particleMaxNum`).
+    pub(crate) max_num: usize,
+    /// Child motion clip names (`particleMotionList`).
+    pub(crate) motion_list: Vec<String>,
+    /// Velocity acceleration multiplier (`particleAccelRatio`).
+    pub(crate) accel_ratio: f64,
+    /// Fly direction angle (`particleFlyDirection`).
+    pub(crate) fly_direction: f64,
+    /// Whether spawned particles inherit the emitter's angle (`particleInheritAngle`).
+    pub(crate) inherit_angle: bool,
+    /// Whether spawned particles scale velocity by emitter zoom (`particleApplyZoomToVelocity`).
+    pub(crate) apply_zoom_to_velocity: bool,
+    /// Whether particles outside the screen are culled (`particleDeleteOutsideScreen`).
+    pub(crate) delete_outside_screen: bool,
 }
 
 impl Default for Frame {
@@ -203,6 +266,7 @@ impl Default for Frame {
             scc: BezierCurve::default(),
             cp: ControlPointCurve::default(),
             motion_time_offset: 0.0,
+            particle: None,
         }
     }
 }
@@ -260,6 +324,8 @@ pub(crate) struct FrameState {
     pub(crate) action: String,
     /// Sync marker.
     pub(crate) has_sync: bool,
+    /// Evaluated particle emitter parameters (`content.prt`), when present.
+    pub(crate) particle: Option<ParticleFrame>,
 }
 
 impl Default for FrameState {
@@ -284,6 +350,7 @@ impl Default for FrameState {
             src: String::new(),
             action: String::new(),
             has_sync: false,
+            particle: None,
         }
     }
 }
@@ -361,6 +428,8 @@ pub(crate) struct MotionNode {
     pub(crate) child_clip: Option<String>,
     /// The child clip a type-3 node's active keyframe selects.
     pub(crate) child_slot: Option<ChildSlot>,
+    /// Layer-level particle emitter settings when `node_type == 4`.
+    pub(crate) particle: Option<ParticleEmitterConfig>,
 }
 
 impl MotionNode {
@@ -398,6 +467,7 @@ impl MotionNode {
             child_owner: None,
             child_clip: None,
             child_slot: None,
+            particle: None,
         }
     }
 }
@@ -1288,6 +1358,41 @@ fn append_node(
     node.mesh_type = number_of(layer.get("meshTransform")).unwrap_or(0.0) as i32;
     node.mesh_flags = number_of(layer.get("meshSyncChildMask")).unwrap_or(0.0) as i32;
     node.mesh_division = number_of(layer.get("meshDivision")).unwrap_or(0.0) as i32;
+    if node.node_type == 4 {
+        let motion_list: Vec<String> = list_of(layer.get("particleMotionList"))
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| string_of(Some(item)))
+                    .filter_map(|raw| {
+                        let rest = match raw.strip_prefix("motion/") {
+                            Some(rest) => rest,
+                            None => raw.as_str(),
+                        };
+                        rest.rsplit('/')
+                            .find(|segment| !segment.is_empty())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let max_num = number_of(layer.get("particleMaxNum"))
+            .unwrap_or(64.0)
+            .clamp(0.0, 512.0) as usize;
+        node.particle = Some(ParticleEmitterConfig {
+            max_num,
+            motion_list,
+            accel_ratio: number_of(layer.get("particleAccelRatio")).unwrap_or(0.0),
+            fly_direction: number_of(layer.get("particleFlyDirection")).unwrap_or(0.0),
+            inherit_angle: number_of(layer.get("particleInheritAngle")).unwrap_or(0.0) != 0.0,
+            apply_zoom_to_velocity: number_of(layer.get("particleApplyZoomToVelocity"))
+                .unwrap_or(0.0)
+                != 0.0,
+            delete_outside_screen: number_of(layer.get("particleDeleteOutsideScreen"))
+                .unwrap_or(0.0)
+                != 0.0,
+        });
+    }
     if let Some(order) = layer.get("transformOrder").and_then(PsbValue::as_array) {
         for (slot, value) in node.transform_order.iter_mut().zip(order.iter()) {
             *slot = *value as i32;
@@ -1422,10 +1527,56 @@ fn parse_frames(value: Option<&PsbValue>) -> Vec<Frame> {
             frame.scc = parse_bezier_curve(content.get("scc"));
             frame.cp = parse_control_point_curve(content.get("cp"));
             frame.motion_time_offset = motion_time_offset(content, frame.content_mask);
+            frame.particle = parse_particle_frame(content.get("prt"));
         }
         frames.push(frame);
     }
     frames
+}
+
+/// Parses a `content.prt` dictionary into [`ParticleFrame`].
+fn parse_particle_frame(value: Option<&PsbValue>) -> Option<ParticleFrame> {
+    let prt = value?;
+    if matches!(prt, PsbValue::Null) {
+        return None;
+    }
+    let (range_x, range_y) = match prt.get("range") {
+        Some(range) => {
+            if let Some(list) = range.as_list() {
+                let rx = list.first().and_then(|v| number_of(Some(v))).unwrap_or(0.0);
+                let ry = list.get(1).and_then(|v| number_of(Some(v))).unwrap_or(rx);
+                (rx, ry)
+            } else if let Some(arr) = range.as_array() {
+                let rx = arr.first().copied().map(f64::from).unwrap_or(0.0);
+                let ry = arr.get(1).copied().map(f64::from).unwrap_or(rx);
+                (rx, ry)
+            } else {
+                let r = number_of(Some(range)).unwrap_or(0.0);
+                (r, r)
+            }
+        }
+        None => (0.0, 0.0),
+    };
+    let freq_min = number_of(prt.get("fmin")).unwrap_or(0.0);
+    let freq_max = number_of(prt.get("fmax")).unwrap_or(freq_min);
+    let vel_min = number_of(prt.get("vmin")).unwrap_or(0.0);
+    let vel_max = number_of(prt.get("vmax")).unwrap_or(vel_min);
+    let angle_min = number_of(prt.get("amin")).unwrap_or(0.0);
+    let angle_max = number_of(prt.get("amax")).unwrap_or(angle_min);
+    let zoom_min = number_of(prt.get("zmin")).unwrap_or(1.0);
+    let zoom_max = number_of(prt.get("zmax")).unwrap_or(zoom_min);
+    Some(ParticleFrame {
+        freq_min,
+        freq_max,
+        vel_min,
+        vel_max,
+        angle_min,
+        angle_max,
+        zoom_min,
+        zoom_max,
+        range_x,
+        range_y,
+    })
 }
 
 /// The keyframe active at `time`.
@@ -1839,6 +1990,7 @@ pub(crate) fn evaluate_frames(frames: &[Frame], time: f64, coordinate_mode: i32)
         src: active.src.clone(),
         action: active.action.clone(),
         has_sync: active.has_sync,
+        particle: active.particle,
     }
 }
 
@@ -1890,6 +2042,23 @@ fn interpolate(a: &Frame, b: &Frame, t: f64, coordinate_mode: i32) -> FrameState
     } else {
         a.angle
     };
+    let particle = match (a.particle, b.particle) {
+        (Some(pa), Some(pb)) => Some(ParticleFrame {
+            freq_min: lerp(pa.freq_min, pb.freq_min, t),
+            freq_max: lerp(pa.freq_max, pb.freq_max, t),
+            vel_min: lerp(pa.vel_min, pb.vel_min, t),
+            vel_max: lerp(pa.vel_max, pb.vel_max, t),
+            angle_min: lerp(pa.angle_min, pb.angle_min, t),
+            angle_max: lerp(pa.angle_max, pb.angle_max, t),
+            zoom_min: lerp(pa.zoom_min, pb.zoom_min, t),
+            zoom_max: lerp(pa.zoom_max, pb.zoom_max, t),
+            range_x: lerp(pa.range_x, pb.range_x, t),
+            range_y: lerp(pa.range_y, pb.range_y, t),
+        }),
+        (Some(pa), None) => Some(pa),
+        (None, Some(pb)) => Some(pb),
+        (None, None) => None,
+    };
     FrameState {
         active: true,
         ox: lerp(a.ox, b.ox, t),
@@ -1914,6 +2083,7 @@ fn interpolate(a: &Frame, b: &Frame, t: f64, coordinate_mode: i32) -> FrameState
         has_sync: a.has_sync,
         flip_x: a.flip_x,
         flip_y: a.flip_y,
+        particle,
     }
 }
 

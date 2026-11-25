@@ -99,6 +99,35 @@ pub(crate) struct TintKey {
 /// them alive.
 pub(crate) type TintedSources = Map<TintKey, u32>;
 
+/// One live particle emitted by a `LayerTypeParticle` (`type == 4`) node.
+#[derive(Clone)]
+pub(crate) struct ParticleState {
+    /// Index of the emitter node in `PlayerInst::nodes`.
+    pub(crate) emitter_node: usize,
+    /// Elapsed particle age in 60 Hz frame units.
+    pub(crate) age: f64,
+    /// Total lifetime of the particle's child clip in 60 Hz frame units.
+    pub(crate) lifetime: f64,
+    /// World-space position in player coordinates.
+    pub(crate) x: f64,
+    /// World-space position in player coordinates.
+    pub(crate) y: f64,
+    /// Velocity per 60 Hz frame.
+    pub(crate) vx: f64,
+    /// Velocity per 60 Hz frame.
+    pub(crate) vy: f64,
+    /// Acceleration per 60 Hz frame squared.
+    pub(crate) ax: f64,
+    /// Acceleration per 60 Hz frame squared.
+    pub(crate) ay: f64,
+    /// Rotation in degrees.
+    pub(crate) angle: f64,
+    /// Uniform scale factor.
+    pub(crate) scale: f64,
+    /// Evaluated node tree of the particle's child motion clip.
+    pub(crate) nodes: Vec<MotionNode>,
+}
+
 /// `Player` instance payload.
 pub(crate) struct PlayerInst {
     // Core properties.
@@ -163,6 +192,12 @@ pub(crate) struct PlayerInst {
     pub(crate) variable_values: Map<String, f64>,
     pub(crate) variable_animators: Map<String, Animator>,
     pub(crate) nodes: Vec<MotionNode>,
+    /// Live particles spawned by `LayerTypeParticle` (`type == 4`) emitters.
+    pub(crate) particles: Vec<ParticleState>,
+    /// Fractional spawn budget per emitter node index.
+    pub(crate) particle_spawn_accum: Map<usize, f64>,
+    /// Deterministic PRNG state for particle emission.
+    pub(crate) particle_rng: u64,
     /// Whether the node tree needs an evaluation before it is drawn.
     pub(crate) layers_dirty: bool,
     pub(crate) pending_events: Vec<MotionEvent>,
@@ -277,6 +312,9 @@ impl Default for PlayerInst {
             variable_values: Map::default(),
             variable_animators: Map::default(),
             nodes: Vec::new(),
+            particles: Vec::new(),
+            particle_spawn_accum: Map::default(),
+            particle_rng: 0x9E37_79B9_7F4A_7C15,
             layers_dirty: true,
             pending_events: Vec::new(),
             tinted: Map::default(),
@@ -561,6 +599,8 @@ impl PlayerInst {
         prime_timelines(&resolved.snapshot, &mut self.timelines);
         let clip = self.select_active_clip(&resolved.snapshot);
         self.nodes = build_node_tree(&resolved.snapshot, clip);
+        self.particles.clear();
+        self.particle_spawn_accum.clear();
         self.layers_dirty = true;
         // A motion activates behind the frame gate: the next progress advances
         // no clock and only presents the first pose.
@@ -762,6 +802,7 @@ impl PlayerInst {
         }
         self.advance_timelines(frames);
         self.update_layers();
+        self.step_particles(frames);
         self.step_animators(frames as f32);
         self.dispatch_events(ctx, target);
     }
@@ -808,6 +849,7 @@ impl PlayerInst {
         self.frame_tick_count += frames;
         self.advance_timelines(frames);
         self.update_layers();
+        self.step_particles(frames);
     }
 
     fn advance_timelines(&mut self, frames: f64) {
@@ -1076,6 +1118,179 @@ impl PlayerInst {
         }
     }
 
+    /// Advance live particles and spawn new ones from active `LayerTypeParticle`
+    /// (`type == 4`) emitters.
+    fn step_particles(&mut self, frames: f64) {
+        if frames <= 0.0 || self.nodes.is_empty() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.clone() else {
+            return;
+        };
+        let has_emitters = self
+            .nodes
+            .iter()
+            .any(|node| node.node_type == 4 && node.particle.is_some());
+        if !has_emitters && self.particles.is_empty() {
+            return;
+        }
+
+        // Advance and cull existing particles.
+        let mut i = 0;
+        while i < self.particles.len() {
+            let p = &mut self.particles[i];
+            p.age += frames;
+            p.vx += p.ax * frames;
+            p.vy += p.ay * frames;
+            p.x += p.vx * frames;
+            p.y += p.vy * frames;
+            let delete_outside = self
+                .nodes
+                .get(p.emitter_node)
+                .and_then(|node| node.particle.as_ref())
+                .is_some_and(|cfg| cfg.delete_outside_screen);
+            let outside = delete_outside && (p.x.abs() > 2400.0 || p.y.abs() > 2400.0);
+            if p.age >= p.lifetime || outside || p.emitter_node >= self.nodes.len() {
+                self.particles.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        // Spawn new particles for each active emitter.
+        for index in 1..self.nodes.len() {
+            if self.nodes[index].node_type != 4
+                || !self.nodes[index].draw_flag
+                || !self.nodes[index].accumulated.active
+                || self.nodes[index].accumulated.opacity <= 0.0
+            {
+                continue;
+            }
+            let Some(config) = self.nodes[index].particle.clone() else {
+                continue;
+            };
+            let Some(pf) = self.nodes[index].local.particle else {
+                continue;
+            };
+            if config.motion_list.is_empty() || config.max_num == 0 {
+                continue;
+            }
+            let cap = config.max_num.min(256);
+            let mut live_count = self
+                .particles
+                .iter()
+                .filter(|p| p.emitter_node == index)
+                .count();
+            if live_count >= cap {
+                continue;
+            }
+
+            let freq_lo = pf.freq_min.min(pf.freq_max).max(0.0);
+            let freq_hi = pf.freq_min.max(pf.freq_max).max(0.0);
+            if freq_hi <= 0.0 {
+                continue;
+            }
+            let freq = freq_lo + (freq_hi - freq_lo) * next_particle_rand(&mut self.particle_rng);
+            // `fmin`/`fmax` is emitted particles per 60 frames (per second)
+            // when >= 1.0, or per-frame probability when < 1.0.
+            let per_frame = if freq >= 1.0 { freq / 60.0 } else { freq };
+            let accum = self.particle_spawn_accum.entry(index).or_insert(0.0);
+            *accum += per_frame * frames;
+            let to_spawn = (*accum).floor().min(8.0) as usize;
+            *accum -= to_spawn as f64;
+
+            let emitter_x = self.nodes[index].accumulated.x;
+            let emitter_y = self.nodes[index].accumulated.y;
+            let emitter_angle = self.nodes[index].accumulated.angle;
+            let emitter_matrix = self.nodes[index].matrix;
+            let emitter_scale = (emitter_matrix[0].hypot(emitter_matrix[2])
+                + emitter_matrix[1].hypot(emitter_matrix[3]))
+                * 0.5;
+            let emitter_scale = if emitter_scale > 0.001 {
+                emitter_scale
+            } else {
+                1.0
+            };
+
+            for _ in 0..to_spawn {
+                if live_count >= cap {
+                    break;
+                }
+                let clip_idx = ((next_particle_rand(&mut self.particle_rng)
+                    * config.motion_list.len() as f64) as usize)
+                    .min(config.motion_list.len() - 1);
+                let clip_name = &config.motion_list[clip_idx];
+                let Some(clip) = snapshot.clip(clip_name) else {
+                    continue;
+                };
+                let lifetime = if clip.total_frames > 0.0 {
+                    clip.total_frames
+                } else {
+                    180.0
+                };
+                let rx = (next_particle_rand(&mut self.particle_rng) * 2.0 - 1.0) * pf.range_x;
+                let ry = (next_particle_rand(&mut self.particle_rng) * 2.0 - 1.0) * pf.range_y;
+                let x = emitter_x + emitter_matrix[0] * rx + emitter_matrix[1] * ry;
+                let y = emitter_y + emitter_matrix[2] * rx + emitter_matrix[3] * ry;
+
+                let speed_lo = pf.vel_min.min(pf.vel_max);
+                let speed_hi = pf.vel_min.max(pf.vel_max);
+                let mut speed =
+                    speed_lo + (speed_hi - speed_lo) * next_particle_rand(&mut self.particle_rng);
+                if config.apply_zoom_to_velocity {
+                    speed *= emitter_scale;
+                }
+                let ang_lo = pf.angle_min.min(pf.angle_max);
+                let ang_hi = pf.angle_min.max(pf.angle_max);
+                let emit_angle_deg =
+                    ang_lo + (ang_hi - ang_lo) * next_particle_rand(&mut self.particle_rng);
+                let move_rad = (emit_angle_deg + config.fly_direction).to_radians();
+                let vx = speed * move_rad.cos();
+                let vy = speed * move_rad.sin();
+                let ax = vx * config.accel_ratio * 0.01;
+                let ay = vy * config.accel_ratio * 0.01;
+
+                let z_lo = pf.zoom_min.min(pf.zoom_max);
+                let z_hi = pf.zoom_min.max(pf.zoom_max);
+                let scale =
+                    (z_lo + (z_hi - z_lo) * next_particle_rand(&mut self.particle_rng)).max(0.01);
+                let angle = if config.inherit_angle {
+                    emitter_angle + emit_angle_deg
+                } else {
+                    0.0
+                };
+
+                let nodes = build_node_tree_at(&snapshot, Some(clip), 0.0);
+                self.particles.push(ParticleState {
+                    emitter_node: index,
+                    age: 0.0,
+                    lifetime,
+                    x,
+                    y,
+                    vx,
+                    vy,
+                    ax,
+                    ay,
+                    angle,
+                    scale,
+                    nodes,
+                });
+                live_count += 1;
+            }
+        }
+
+        // Evaluate every live particle's child node tree at its current age.
+        let z_factor = self.z_factor;
+        let independent = self.independent_layer_inherit;
+        for p in &mut self.particles {
+            let emitter_opacity = self
+                .nodes
+                .get(p.emitter_node)
+                .map_or(1.0, |node| node.accumulated.opacity);
+            evaluate_particle_nodes(p, &snapshot, emitter_opacity, z_factor, independent);
+        }
+    }
+
     /// Dispatch the queued action and sync events to the script object.
     ///
     /// `target` is the retained id of the receiver. A null id means there is
@@ -1221,6 +1436,8 @@ impl PlayerInst {
             self.loop_time = clip.loop_time;
             self.frame_last_time = clip.total_frames;
             self.nodes = build_node_tree_at(&snapshot, Some(clip), self.eval_time());
+            self.particles.clear();
+            self.particle_spawn_accum.clear();
             self.layers_dirty = true;
             self.ensure_root_offsets();
         }
@@ -1834,6 +2051,7 @@ impl PlayerInst {
         let color = color_bytes(self.color.bytes);
         let affine = self.affine;
         let nodes = &self.nodes;
+        let particles = &self.particles;
         let mut tinted = std::mem::take(&mut self.tinted);
         // The pose is built as a draw list: the draws that are composited
         // onto the target, in the order they are composited. The list is
@@ -1845,6 +2063,7 @@ impl PlayerInst {
             scene,
             DrawFrame {
                 nodes,
+                particles,
                 snapshot: snapshot.as_deref(),
                 storage,
                 settings: DrawSettings {
@@ -1962,6 +2181,8 @@ struct DrawSettings {
 struct DrawFrame<'a> {
     /// The pose's node tree: the nodes the painters draw.
     nodes: &'a [MotionNode],
+    /// Live particles spawned by `LayerTypeParticle` (`type == 4`) emitters.
+    particles: &'a [ParticleState],
     snapshot: Option<&'a MotionSnapshot>,
     storage: Option<&'a Storage>,
     settings: DrawSettings,
@@ -1996,6 +2217,33 @@ fn composite_pose(
             continue;
         }
         if nearest_group(nodes, index).is_some() {
+            continue;
+        }
+        if nodes[index].node_type == 4 {
+            let particles = frame.particles;
+            for particle in particles {
+                if particle.emitter_node != index || particle.nodes.len() <= 1 {
+                    continue;
+                }
+                let mut sub = DrawFrame {
+                    nodes: &particle.nodes,
+                    particles: &[],
+                    snapshot: frame.snapshot,
+                    storage: frame.storage,
+                    settings: frame.settings,
+                    tinted: frame.tinted,
+                    missing: Vec::new(),
+                    pool: frame.pool.as_deref_mut(),
+                };
+                for p_idx in 1..particle.nodes.len() {
+                    if node_drawable(&particle.nodes[p_idx]) {
+                        let opacity = particle.nodes[p_idx].accumulated.opacity;
+                        let blend = node_blend(particle.nodes[p_idx].accumulated.blend_mode);
+                        draw_clipped_item(ops, scene, (0, 0), p_idx, &mut sub, opacity, blend);
+                    }
+                }
+                frame.missing.extend(sub.missing);
+            }
             continue;
         }
         if is_composite_group(&nodes[index]) {
@@ -3160,7 +3408,11 @@ fn prefetch_chunks(frame: &mut DrawFrame<'_>) {
         return;
     };
     let mut requests: Vec<ChunkRequest> = Vec::new();
-    for node in nodes {
+    let particle_nodes = frame
+        .particles
+        .iter()
+        .flat_map(|particle| particle.nodes.iter());
+    for node in nodes.iter().chain(particle_nodes) {
         if frame.settings.preview && node.child_owner.is_some() {
             continue;
         }
@@ -3182,6 +3434,88 @@ fn prefetch_chunks(frame: &mut DrawFrame<'_>) {
         }
     }
     snapshot.pixels.prefetch(pool, storage, &requests);
+}
+
+/// Deterministic xorshift64 PRNG returning a uniform value in `[0.0, 1.0)`.
+fn next_particle_rand(state: &mut u64) -> f64 {
+    let mut x = *state;
+    if x == 0 {
+        x = 0x9E37_79B9_7F4A_7C15;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    (x >> 11) as f64 * (1.0 / ((1u64 << 53) as f64))
+}
+
+/// Evaluates a single particle's child motion node tree at its current age and
+/// places its root at `(particle.x, particle.y)`.
+fn evaluate_particle_nodes(
+    particle: &mut ParticleState,
+    snapshot: &MotionSnapshot,
+    emitter_opacity: f64,
+    z_factor: f64,
+    independent_layer_inherit: bool,
+) {
+    if particle.nodes.is_empty() {
+        return;
+    }
+    let time = particle.age;
+    for node in &mut particle.nodes {
+        let local_time = (time - node.time_offset).max(0.0);
+        node.local = evaluate_frames(&node.frames, local_time, node.coordinate_mode);
+        node.draw_flag = true;
+    }
+    let root = &mut particle.nodes[0];
+    root.accumulated.x = particle.x;
+    root.accumulated.y = particle.y;
+    root.accumulated.z = 0.0;
+    root.accumulated.ox = 0.0;
+    root.accumulated.oy = 0.0;
+    root.accumulated.active = true;
+    root.accumulated.opacity = emitter_opacity;
+    root.accumulated.angle = particle.angle;
+    root.accumulated.scale_x = particle.scale;
+    root.accumulated.scale_y = particle.scale;
+    root.matrix = local_matrix(&root.accumulated, &root.transform_order);
+    root.draw_flag = emitter_opacity > 0.0;
+
+    for index in 1..particle.nodes.len() {
+        let parent = inherited_parent(&particle.nodes, index);
+        let local = particle.nodes[index].local.clone();
+        let parent_state = particle.nodes[parent].accumulated.clone();
+        let parent_matrix = particle.nodes[parent].matrix;
+        let transform_order = particle.nodes[index].transform_order;
+        let world_x = parent_matrix[0] * local.x + parent_matrix[1] * local.y + parent_state.x;
+        let world_y = parent_matrix[2] * local.x + parent_matrix[3] * local.y + parent_state.y;
+        let world_z = parent_state.z + local.z;
+        let root_state = particle.nodes[0].accumulated.clone();
+        let root_matrix = particle.nodes[0].matrix;
+        let (inherited, matrix) = inherited_transform(
+            &local,
+            &transform_order,
+            particle.nodes[index].inherit_flags,
+            (&parent_state, parent_matrix),
+            (&root_state, root_matrix),
+            independent_layer_inherit,
+        );
+        let node = &mut particle.nodes[index];
+        node.accumulated = inherited;
+        node.accumulated.x = world_x;
+        node.accumulated.y = world_y;
+        node.accumulated.z = world_z;
+        node.accumulated.active = parent_state.active && local.active;
+        node.accumulated.opacity = parent_state.opacity * local.opacity;
+        node.matrix = matrix;
+        node.draw_flag = parent_state.active
+            && local.active
+            && parent_state.opacity > 0.0
+            && time >= node.visible_from;
+        let geometry = icon_geometry(Some(snapshot), &node.local.src);
+        refresh_node_geometry(&mut particle.nodes, index, geometry, z_factor);
+        refresh_shape_bounds(&mut particle.nodes, index, z_factor);
+    }
 }
 
 /// The node's local 2x2 transform as `[m11, m12, m21, m22]`, composed from the
