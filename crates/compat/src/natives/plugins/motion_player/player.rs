@@ -1239,9 +1239,18 @@ impl PlayerInst {
                 } else {
                     180.0
                 };
+                let speed_lo = pf.vel_min.min(pf.vel_max);
+                let speed_hi = pf.vel_min.max(pf.vel_max);
+                let mut speed =
+                    speed_lo + (speed_hi - speed_lo) * next_particle_rand(&mut self.particle_rng);
+                if config.apply_zoom_to_velocity {
+                    speed *= emitter_scale;
+                }
                 let loop_clip = clip.loop_time >= 0.0;
                 let lifetime = if loop_clip {
-                    720.0_f64.max(clip_frames)
+                    (2200.0 / speed.max(0.5))
+                        .clamp(360.0, 1400.0)
+                        .max(clip_frames)
                 } else {
                     clip_frames.max(60.0)
                 };
@@ -1252,18 +1261,11 @@ impl PlayerInst {
                 let mut x = emitter_x + emitter_matrix[0] * lx + emitter_matrix[1] * ly;
                 let mut y = emitter_y + emitter_matrix[2] * lx + emitter_matrix[3] * ly;
 
-                let speed_lo = pf.vel_min.min(pf.vel_max);
-                let speed_hi = pf.vel_min.max(pf.vel_max);
-                let mut speed =
-                    speed_lo + (speed_hi - speed_lo) * next_particle_rand(&mut self.particle_rng);
-                if config.apply_zoom_to_velocity {
-                    speed *= emitter_scale;
-                }
                 let spread =
                     (next_particle_rand(&mut self.particle_rng) * 2.0 - 1.0) * (pf.range_x * 0.5);
                 let move_rad = (emitter_angle + config.fly_direction + spread).to_radians();
-                let vx = speed * move_rad.cos();
-                let vy = speed * move_rad.sin();
+                let vx = speed * move_rad.sin();
+                let vy = speed * move_rad.cos();
 
                 let z_lo = pf.zoom_min.min(pf.zoom_max);
                 let z_hi = pf.zoom_min.max(pf.zoom_max);
