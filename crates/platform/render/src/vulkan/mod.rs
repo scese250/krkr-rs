@@ -1040,17 +1040,13 @@ impl VulkanPipeline {
                     effects.begin_live_frame(&device, frame_index);
                 }
                 let effects = device_state.effect.as_mut();
-                {
-                    let Some(pass) = presentation.frame_pass.as_ref() else {
-                        return Err(RenderError::Framebuffer {
-                            message: "the frame target disappeared".to_owned(),
-                        });
-                    };
-                    let Some(frame) = presentation.frame_targets[frame_index].as_mut() else {
-                        return Err(RenderError::Framebuffer {
-                            message: "the frame target disappeared".to_owned(),
-                        });
-                    };
+                let needs_frame_target = scene_needs_frame_target(scene);
+                if !needs_frame_target {
+                    // Fast path: no node needs a destination snapshot or custom
+                    // effect pass, so draw directly into the swapchain render
+                    // pass and avoid the intermediate offscreen target and
+                    // second full-screen present pass.
+                    let framebuffer = framebuffers_for(&*presentation, image_index)?;
                     // SAFETY: the command buffer is recording.
                     unsafe {
                         let viewport = vk::Viewport {
@@ -1063,12 +1059,6 @@ impl VulkanPipeline {
                         };
                         device.cmd_set_viewport(command_buffer, 0, &[viewport]);
                     }
-                    frame.prepare(&device, command_buffer);
-                    let render_pass = pass.render_pass;
-                    let framebuffer = frame.framebuffer();
-                    let image = frame.image();
-                    let pipelines = &pass.pipelines;
-                    let snapshot = Some(&mut frame.snapshot);
                     draw::record_scene(
                         draw::SceneDraw {
                             pass: draw::ScenePass {
@@ -1076,63 +1066,122 @@ impl VulkanPipeline {
                                 command: command_buffer,
                                 render_pass,
                                 framebuffer,
-                                image,
+                                image: vk::Image::null(),
                                 clear,
                                 extent,
                             },
-                            pipelines,
+                            pipelines: &presentation.pipelines,
                             resources: &device_state.resources,
                             textures: &device_state.textures,
                             effects,
-                            snapshot,
+                            snapshot: None,
                             extent,
                         },
                         scene,
                         &Affine2::IDENTITY,
                     )?;
-                    frame.prepare_for_present(&device, command_buffer);
-                }
+                    // SAFETY: the command buffer is recording and `record_scene`
+                    // already ended its render pass.
+                    unsafe {
+                        device.end_command_buffer(command_buffer).map_err(|error| {
+                            device::result_error("failed to end the frame command buffer", error)
+                        })?;
+                    }
+                } else {
+                    {
+                        let Some(pass) = presentation.frame_pass.as_ref() else {
+                            return Err(RenderError::Framebuffer {
+                                message: "the frame target disappeared".to_owned(),
+                            });
+                        };
+                        let Some(frame) = presentation.frame_targets[frame_index].as_mut() else {
+                            return Err(RenderError::Framebuffer {
+                                message: "the frame target disappeared".to_owned(),
+                            });
+                        };
+                        // SAFETY: the command buffer is recording.
+                        unsafe {
+                            let viewport = vk::Viewport {
+                                x: 0.0,
+                                y: 0.0,
+                                width: extent.width as f32,
+                                height: extent.height as f32,
+                                min_depth: 0.0,
+                                max_depth: 1.0,
+                            };
+                            device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+                        }
+                        frame.prepare(&device, command_buffer);
+                        let render_pass = pass.render_pass;
+                        let framebuffer = frame.framebuffer();
+                        let image = frame.image();
+                        let pipelines = &pass.pipelines;
+                        let snapshot = Some(&mut frame.snapshot);
+                        draw::record_scene(
+                            draw::SceneDraw {
+                                pass: draw::ScenePass {
+                                    device: &device,
+                                    command: command_buffer,
+                                    render_pass,
+                                    framebuffer,
+                                    image,
+                                    clear,
+                                    extent,
+                                },
+                                pipelines,
+                                resources: &device_state.resources,
+                                textures: &device_state.textures,
+                                effects,
+                                snapshot,
+                                extent,
+                            },
+                            scene,
+                            &Affine2::IDENTITY,
+                        )?;
+                        frame.prepare_for_present(&device, command_buffer);
+                    }
 
-                // The composed frame is presented with a quad over the swapchain
-                // image.
-                let framebuffer = framebuffers_for(&*presentation, image_index)?;
-                let clear_values = [vk::ClearValue {
-                    color: vk::ClearColorValue { float32: clear },
-                }];
-                let render_pass_begin = vk::RenderPassBeginInfo::default()
-                    .render_pass(render_pass)
-                    .framebuffer(framebuffer)
-                    .render_area(render_area)
-                    .clear_values(&clear_values);
-                let Some(frame) = presentation.frame_targets[frame_index].as_ref() else {
-                    return Err(RenderError::Framebuffer {
-                        message: "the frame target disappeared".to_owned(),
-                    });
-                };
-                // SAFETY: the command buffer is recording; the render pass and
-                // framebuffer are compatible and live.
-                unsafe {
-                    device.cmd_begin_render_pass(
+                    // The composed frame is presented with a quad over the swapchain
+                    // image.
+                    let framebuffer = framebuffers_for(&*presentation, image_index)?;
+                    let clear_values = [vk::ClearValue {
+                        color: vk::ClearColorValue { float32: clear },
+                    }];
+                    let render_pass_begin = vk::RenderPassBeginInfo::default()
+                        .render_pass(render_pass)
+                        .framebuffer(framebuffer)
+                        .render_area(render_area)
+                        .clear_values(&clear_values);
+                    let Some(frame) = presentation.frame_targets[frame_index].as_ref() else {
+                        return Err(RenderError::Framebuffer {
+                            message: "the frame target disappeared".to_owned(),
+                        });
+                    };
+                    // SAFETY: the command buffer is recording; the render pass and
+                    // framebuffer are compatible and live.
+                    unsafe {
+                        device.cmd_begin_render_pass(
+                            command_buffer,
+                            &render_pass_begin,
+                            vk::SubpassContents::INLINE,
+                        );
+                    }
+                    draw::record_present(
+                        &device,
                         command_buffer,
-                        &render_pass_begin,
-                        vk::SubpassContents::INLINE,
+                        &presentation.pipelines,
+                        &device_state.resources,
+                        frame.descriptor_set,
+                        extent,
                     );
-                }
-                draw::record_present(
-                    &device,
-                    command_buffer,
-                    &presentation.pipelines,
-                    &device_state.resources,
-                    frame.descriptor_set,
-                    extent,
-                );
 
-                // SAFETY: the render pass and command buffer are recording.
-                unsafe {
-                    device.cmd_end_render_pass(command_buffer);
-                    device.end_command_buffer(command_buffer).map_err(|error| {
-                        device::result_error("failed to end the frame command buffer", error)
-                    })?;
+                    // SAFETY: the render pass and command buffer are recording.
+                    unsafe {
+                        device.cmd_end_render_pass(command_buffer);
+                        device.end_command_buffer(command_buffer).map_err(|error| {
+                            device::result_error("failed to end the frame command buffer", error)
+                        })?;
+                    }
                 }
 
                 // The frame samples textures uploaded since the previous frame.
@@ -1570,6 +1619,31 @@ impl VulkanDevice {
     ) -> Result<Self, RenderError> {
         let bundle = device::create_device(&instance_guard.instance, physical_device, target)?;
         let device = bundle.device;
+        // SAFETY: `physical_device` belongs to `instance_guard.instance`.
+        let props = unsafe {
+            instance_guard
+                .instance
+                .get_physical_device_properties(physical_device)
+        };
+        let gpu_name = props
+            .device_name_as_c_str()
+            .ok()
+            .and_then(|s| s.to_str().ok())
+            .unwrap_or("unknown");
+        let vram_mb: u64 = memory_properties.memory_heaps
+            [..memory_properties.memory_heap_count as usize]
+            .iter()
+            .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|h| h.size / (1024 * 1024))
+            .sum();
+        log::info!(
+            "platform.render: gpu={gpu_name:?} type={:?} api={}.{}.{} driver={:#x} vram_mb={vram_mb} filter={filter:?}",
+            props.device_type,
+            vk::api_version_major(props.api_version),
+            vk::api_version_minor(props.api_version),
+            vk::api_version_patch(props.api_version),
+            props.driver_version,
+        );
 
         let resources =
             match pipelines::PipelineResources::create(&device, memory_properties, filter) {
@@ -2409,6 +2483,19 @@ impl Drop for BeginTeardown<'_> {
             self.surface_loader.destroy_surface(self.surface, None);
         }
     }
+}
+
+/// Whether `scene` requires the intermediate offscreen `FrameTarget` rather
+/// than drawing directly into the swapchain render pass.
+fn scene_needs_frame_target(scene: &RenderScene) -> bool {
+    if scene.coverage.is_some() {
+        return true;
+    }
+    scene.nodes.iter().any(|node| {
+        node.visible
+            && (pipelines::dst_blend_mode(node.blend).is_some()
+                || matches!(node.content, crate::RenderContent::Effect(_)))
+    })
 }
 
 /// Returns the framebuffer for a swapchain image, or an error if stale.

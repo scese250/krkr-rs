@@ -104,10 +104,16 @@ impl ScenePass<'_> {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: self.extent,
         };
+        let clear_values = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: self.clear,
+            },
+        }];
         let render_pass_begin = vk::RenderPassBeginInfo::default()
             .render_pass(self.render_pass)
             .framebuffer(self.framebuffer)
-            .render_area(render_area);
+            .render_area(render_area)
+            .clear_values(&clear_values);
         // SAFETY: the command buffer is recording; the render pass and
         // framebuffer are compatible and live.
         unsafe {
