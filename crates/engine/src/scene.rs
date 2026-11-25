@@ -4247,10 +4247,10 @@ impl Scene {
     /// converts to a huge unsigned quantity — is clamped to the system limit.
     /// Entries are then evicted down to the new limit.
     ///
-    /// The system limit is a fixed 128 MiB: there is no physical-memory
+    /// The system limit is a fixed 64 MiB: there is no physical-memory
     /// probe, so the cap is the whole limit.
     pub fn set_graphic_cache_limit(&mut self, limit: i64) {
-        const SYSTEM_LIMIT: u64 = 128 * 1024 * 1024;
+        const SYSTEM_LIMIT: u64 = 64 * 1024 * 1024;
         self.set_decoded_image_cache_limit(match limit {
             0 => CacheLimit::Disabled,
             -1 => CacheLimit::bytes(SYSTEM_LIMIT),
@@ -4767,7 +4767,7 @@ impl Scene {
         let Some(layer_index) = self.layer_position(layer_id) else {
             return Ok(false);
         };
-        if !self.layers[layer_index].draws_dirty {
+        if !self.layers[layer_index].draws_dirty && self.surface_drawn(bitmap_id) {
             return Ok(!self.layers[layer_index].draws.is_empty());
         }
         // The list is taken out for the call, because the call writes the
@@ -6156,7 +6156,7 @@ mod tests {
     /// a value within the cap is kept as-is.
     #[test]
     fn cache_limit_clamps_to_the_system_cap() {
-        const SYSTEM_LIMIT: u64 = 128 * 1024 * 1024;
+        const SYSTEM_LIMIT: u64 = 64 * 1024 * 1024;
         let mut scene = Scene::default();
 
         // reference/cpp/core/visual/GraphicsLoaderIntf.cpp:2428-2430: -1

@@ -686,15 +686,11 @@ impl DirectoryListing {
                 .or_default()
                 .push(idx);
         }
-        let checked_at = match state {
-            DirectoryState::Present(_) => Some(std::time::Instant::now()),
-            DirectoryState::Missing | DirectoryState::PresentNoMtime => None,
-        };
         Self {
             entries,
             by_lower,
             state,
-            checked_at,
+            checked_at: None,
         }
     }
 

@@ -797,7 +797,7 @@ fn graphic_cache_limit_edges_round_trip() {
     unsafe { host.services_mut().attach_scene(&mut scene) };
     host.install(&engine).expect("install compat surface");
 
-    const CAP: i64 = 128 * 1024 * 1024;
+    const CAP: i64 = 64 * 1024 * 1024;
     assert_eq!(scene.graphic_cache_limit(), 0, "the default is disabled");
 
     for (value, expected) in [
@@ -847,7 +847,7 @@ fn graphic_cache_limit_variant_truncates_to_tjs_int() {
     unsafe { host.services_mut().attach_scene(&mut scene) };
     host.install(&engine).expect("install compat surface");
 
-    const CAP: i64 = 128 * 1024 * 1024;
+    const CAP: i64 = 64 * 1024 * 1024;
     for (value, expected) in [
         (4_294_967_360i64, 64i64),
         (1i64 << 40, 0),
