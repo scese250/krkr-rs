@@ -69,10 +69,10 @@ object RuntimeOptions {
     /**
      * The built-in native-resolution default.
      *
-     * Off draws the picture the way the plain rendering draws it; on reads
-     * every texture with a bilinear filter instead.
+     * On reads every texture with a bilinear filter so scaled screens look
+     * smooth; off point-samples textures.
      */
-    const val DEFAULT_NATIVE_RESOLUTION = "false"
+    const val DEFAULT_NATIVE_RESOLUTION = "true"
 
     /** The stored defaults, used when the settings file is missing or empty. */
     val DEFAULTS = RuntimeSettings(

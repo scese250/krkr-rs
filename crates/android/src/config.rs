@@ -124,8 +124,8 @@ pub(crate) fn resolve_log_level(value: Option<&str>) -> Result<LogLevel, ConfigE
 
 /// The rendering choice the launcher has when it published no value.
 ///
-/// The default is the plain rendering: every texture is point-sampled.
-pub(crate) const DEFAULT_NATIVE_RESOLUTION: bool = false;
+/// The default enables bilinear filtering so scaled mobile screens render smoothly.
+pub(crate) const DEFAULT_NATIVE_RESOLUTION: bool = true;
 
 /// Resolves the launcher's native-resolution choice over the built-in default.
 ///
@@ -280,8 +280,8 @@ mod tests {
         let unset = resolve_native_resolution(None).expect("defaults");
         assert_eq!(unset, DEFAULT_NATIVE_RESOLUTION);
         assert!(
-            !unset,
-            "the default draws the way the plain rendering draws"
+            unset,
+            "the default enables bilinear filtering for scaled screens"
         );
     }
 
