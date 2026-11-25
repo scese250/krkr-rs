@@ -105,15 +105,25 @@ impl Default for StagingBuffer {
 /// Host-visible staging capacity above which a buffer is eligible to shrink
 /// after sustained small uploads, so a single loading burst does not
 /// permanently pin tens of megabytes of host-visible RAM.
-const STAGING_SHRINK_THRESHOLD: vk::DeviceSize = 16 * 1024 * 1024;
+const STAGING_SHRINK_THRESHOLD: vk::DeviceSize = 8 * 1024 * 1024;
 
 /// Maximum upload size that counts toward shrinking an oversized staging
 /// buffer (hysteresis gap below [`STAGING_SHRINK_THRESHOLD`]).
-const STAGING_SHRINK_TARGET_MAX: vk::DeviceSize = 8 * 1024 * 1024;
+const STAGING_SHRINK_TARGET_MAX: vk::DeviceSize = 4 * 1024 * 1024;
 
 /// Consecutive small reserves required before shrinking an oversized staging
-/// buffer, so a multi-frame loading burst does not reallocate on every frame.
-const STAGING_SHRINK_DELAY_RESERVES: u32 = 60;
+/// buffer, so a multi-frame loading burst does not reallocate on every frame
+/// while still reclaiming oversized buffers promptly.
+const STAGING_SHRINK_DELAY_RESERVES: u32 = 8;
+
+/// Target maximum byte size per staged upload chunk.
+///
+/// Large menu-loading bursts (such as Save/Load thumbnails) can upload over
+/// 100 MiB of textures in one frame; chunking keeps each upload slot's
+/// persistently mapped staging buffer bounded to ~8 MiB instead of pinning
+/// 256+ MiB per slot in host-visible RAM, and overlaps host copies with GPU
+/// transfers across the upload ring.
+const MAX_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
 impl StagingBuffer {
     /// Destroys the staging buffer and its memory, if any.
@@ -828,8 +838,10 @@ pub(crate) struct TextureUpload<'a> {
     pub(crate) pixels: &'a [u8],
 }
 
-/// Copies a batch of sub-rectangles into their textures with one staging
-/// reserve, one command buffer and one submit, without waiting for the GPU.
+/// Copies a batch of sub-rectangles into their textures, splitting batches
+/// larger than [`MAX_UPLOAD_CHUNK_BYTES`] into multiple ring submissions so
+/// host-visible staging buffers stay bounded instead of pinning hundreds of
+/// megabytes during loading bursts.
 ///
 /// Every destination must already exist in `textures` and every `region` must
 /// have been validated against its texture. Waiting happens in [`UploadRing`]
@@ -845,49 +857,78 @@ pub(crate) fn upload_batch(
         return Ok(());
     }
 
-    let (offsets, total) = staging_layout(uploads)?;
-    // A texture repeated in one batch is only in `UNDEFINED` for its first
-    // copy; every later copy starts from the sampled layout the previous
-    // transition left behind.
-    let mut seen: Set<u64> = set_with_capacity(uploads.len());
-    let batch = StageBatch {
-        uploads,
-        offsets: &offsets,
-        total,
+    let mut total_timings = UploadTimings {
+        create_ms: 0.0,
+        stage_ms: 0.0,
+        submit_ms: 0.0,
+        wait_ms: 0.0,
     };
-    let result = submit_batch(context, ring, batch, |command_buffer, staging_buffer| {
-        for (upload, &offset) in uploads.iter().zip(&offsets) {
-            let gpu = textures
-                .get_mut(&upload.key)
+    let mut start = 0usize;
+    while start < uploads.len() {
+        let mut end = start;
+        let mut chunk_bytes = 0usize;
+        while end < uploads.len() {
+            let next_len = uploads[end].pixels.len();
+            if end > start && chunk_bytes.saturating_add(next_len) > MAX_UPLOAD_CHUNK_BYTES {
+                break;
+            }
+            chunk_bytes = chunk_bytes
+                .checked_add(next_len)
                 .ok_or_else(|| RenderError::Upload {
-                    message: "texture state disappeared during upload".to_owned(),
+                    message: "the upload batch exceeds the host address space".to_owned(),
                 })?;
-            let first_upload = !gpu.uploaded && seen.insert(upload.key);
-            record_copy(
-                context,
-                CopyRecord {
-                    command_buffer,
-                    staging_buffer,
-                    texture: gpu,
-                    region: upload.region,
-                    staging_offset: offset as vk::DeviceSize,
-                    first_upload,
-                },
-            );
+            end += 1;
         }
-        Ok(())
-    });
-
-    // The images stay sampleable if the submit failed: nothing reached the
-    // queue, so their recorded transitions never ran.
-    if result.is_ok() {
-        for upload in uploads {
+        let chunk = &uploads[start..end];
+        let (offsets, total) = staging_layout(chunk)?;
+        // A texture repeated in one chunk is only in `UNDEFINED` for its first
+        // copy; every later copy starts from the sampled layout the previous
+        // transition left behind.
+        let mut seen: Set<u64> = set_with_capacity(chunk.len());
+        let batch = StageBatch {
+            uploads: chunk,
+            offsets: &offsets,
+            total,
+        };
+        submit_batch(context, ring, batch, |command_buffer, staging_buffer| {
+            for (upload, &offset) in chunk.iter().zip(&offsets) {
+                let gpu = textures
+                    .get_mut(&upload.key)
+                    .ok_or_else(|| RenderError::Upload {
+                        message: "texture state disappeared during upload".to_owned(),
+                    })?;
+                let first_upload = !gpu.uploaded && seen.insert(upload.key);
+                record_copy(
+                    context,
+                    CopyRecord {
+                        command_buffer,
+                        staging_buffer,
+                        texture: gpu,
+                        region: upload.region,
+                        staging_offset: offset as vk::DeviceSize,
+                        first_upload,
+                    },
+                );
+            }
+            Ok(())
+        })?;
+        // The images stay sampleable if the submit failed: nothing reached the
+        // queue, so their recorded transitions never ran.
+        for upload in chunk {
             if let Some(gpu) = textures.get_mut(&upload.key) {
                 gpu.uploaded = true;
             }
         }
+        if let Some(last) = ring.last {
+            total_timings.create_ms += last.create_ms;
+            total_timings.stage_ms += last.stage_ms;
+            total_timings.submit_ms += last.submit_ms;
+            total_timings.wait_ms += last.wait_ms;
+        }
+        start = end;
     }
-    result
+    ring.last = Some(total_timings);
+    Ok(())
 }
 
 /// One upload batch's staging plan: the uploads, their staging offsets and the

@@ -595,6 +595,12 @@ impl VulkanPipeline {
                 message: "the Vulkan backend received a null render state".to_owned(),
             });
         };
+        if let VulkanState::Presenting(presenting) = &mut **vstate {
+            reap_completed_presentation_frames(
+                &mut presenting.device,
+                &mut presenting.presentation,
+            );
+        }
         vstate
             .device_mut()
             .upload_textures(&self.memory_properties, uploads)
@@ -885,17 +891,7 @@ impl VulkanPipeline {
                 )?;
                 fence_wait_ms += fence_started.elapsed().as_secs_f64() * 1000.0;
                 presentation.fences.completed(frame_index);
-                let safe_frame = presentation
-                    .frames
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| presentation.fences.slot_running(*i))
-                    .map(|(_, frame)| frame.submitted_epoch.saturating_sub(1))
-                    .min()
-                    .unwrap_or(device_state.frame_submitted_epoch);
-                device_state.frame_completed_epoch =
-                    device_state.frame_completed_epoch.max(safe_frame);
-                device_state.reap_retired();
+                reap_completed_presentation_frames(device_state, presentation);
             }
 
             let acquire_started = Instant::now();
@@ -994,6 +990,7 @@ impl VulkanPipeline {
                     )?;
                     fence_wait_ms += image_wait_started.elapsed().as_secs_f64() * 1000.0;
                     presentation.fences.completed_fence(image_fence);
+                    reap_completed_presentation_frames(device_state, presentation);
                 }
 
                 // SAFETY: the pool is not in use.
@@ -2483,6 +2480,38 @@ impl Drop for BeginTeardown<'_> {
             self.surface_loader.destroy_surface(self.surface, None);
         }
     }
+}
+
+/// Polls in-flight presentation fences without blocking, advances
+/// `frame_completed_epoch`, and destroys any retired GPU textures and render
+/// targets whose upload and frame epochs have completed.
+fn reap_completed_presentation_frames(
+    device_state: &mut VulkanDevice,
+    presentation: &mut VulkanPresentation,
+) {
+    for (index, frame) in presentation.frames.iter().enumerate() {
+        if !presentation.fences.slot_running(index) {
+            continue;
+        }
+        // SAFETY: `frame.in_flight` was created by `device_state.device`.
+        match unsafe { device_state.device.get_fence_status(frame.in_flight) } {
+            Ok(true) => presentation.fences.completed(index),
+            Ok(false) => {}
+            Err(error) => {
+                log::warn!("platform.render: failed to poll a presentation fence: {error}");
+            }
+        }
+    }
+    let safe_frame = presentation
+        .frames
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| presentation.fences.slot_running(*i))
+        .map(|(_, frame)| frame.submitted_epoch.saturating_sub(1))
+        .min()
+        .unwrap_or(device_state.frame_submitted_epoch);
+    device_state.frame_completed_epoch = device_state.frame_completed_epoch.max(safe_frame);
+    device_state.reap_retired();
 }
 
 /// Whether `scene` requires the intermediate offscreen `FrameTarget` rather
