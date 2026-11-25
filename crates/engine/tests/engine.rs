@@ -47,9 +47,9 @@ impl EngineOverlay for CountingOverlay {
         _state: &mut RenderState,
         _now_ms: u64,
         _objects: engine::ObjectCounts,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         self.refreshes.set(self.refreshes.get().saturating_add(1));
-        Ok(())
+        Ok(true)
     }
 
     fn node(&self) -> RenderNode {

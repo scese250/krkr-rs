@@ -192,7 +192,9 @@ pub trait GameFrame {
 /// once per frame and attaches [`EngineOverlay::node`] to the render tree on
 /// every projection.
 pub trait EngineOverlay {
-    /// Refreshes the overlay's contents before the frame is projected.
+    /// Refreshes the overlay's contents before the frame is projected,
+    /// returning `true` when the overlay texture changed and the surface must
+    /// be redrawn.
     ///
     /// `now_ms` is the frame clock; the overlay decides its own refresh
     /// cadence from it.
@@ -207,7 +209,7 @@ pub trait EngineOverlay {
         state: &mut RenderState,
         now_ms: u64,
         objects: ObjectCounts,
-    ) -> Result<(), String>;
+    ) -> Result<bool, String>;
 
     /// Returns the overlay node, in device/framebuffer coordinates.
     ///
@@ -1583,18 +1585,21 @@ impl Engine {
         let Some(overlay) = self.overlay.as_mut() else {
             return Ok(());
         };
-        // The overlay is drawn in device coordinates, outside the screen the
-        // scene describes, so the area it covers cannot be named. A frame with
-        // an overlay draws the whole surface.
-        self.scene.mark_dirty();
-        overlay
+        let changed = overlay
             .refresh(
                 &self.device.pipeline,
                 &mut self.device.state,
                 now_ms,
                 objects,
             )
-            .map_err(EngineError::Overlay)
+            .map_err(EngineError::Overlay)?;
+        if changed {
+            // The overlay is drawn in device coordinates, outside the screen the
+            // scene describes, so the area it covers cannot be named. A frame
+            // where the overlay updated draws the whole surface.
+            self.scene.mark_dirty();
+        }
+        Ok(())
     }
 
     /// Returns the stateless render pipeline.

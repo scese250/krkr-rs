@@ -632,8 +632,8 @@ impl EngineOverlay for ProjectionSpy {
         _state: &mut RenderState,
         _now_ms: u64,
         _objects: engine::ObjectCounts,
-    ) -> Result<(), String> {
-        Ok(())
+    ) -> Result<bool, String> {
+        Ok(true)
     }
 
     fn node(&self) -> RenderNode {

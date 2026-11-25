@@ -4872,6 +4872,7 @@ impl Scene {
         // until it is drawn again.
         let revision = self.pose_revisions.entry(bitmap_id).or_insert(0);
         *revision = revision.wrapping_add(1);
+        self.mark_dirty();
         Ok(true)
     }
 
@@ -4997,6 +4998,9 @@ impl Scene {
                     drawn: false,
                 },
             );
+            // The render tree samples the pose surface's texture handle: a
+            // newly created or resized surface changes the projected nodes.
+            self.touch_structure();
         }
         let Some(surface) = self.pose_surfaces.get(&bitmap_id) else {
             return Err(RenderError::InvalidArgument {
@@ -5061,6 +5065,7 @@ impl Scene {
         // until it is drawn again.
         let revision = self.pose_revisions.entry(dest).or_insert(0);
         *revision = revision.wrapping_add(1);
+        self.mark_dirty();
         Ok(true)
     }
 

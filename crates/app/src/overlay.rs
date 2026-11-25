@@ -136,7 +136,7 @@ impl Overlay {
         now_ms: f64,
         objects: ObjectCounts,
         host: HostMetrics,
-    ) -> Result<(), OverlayError> {
+    ) -> Result<bool, OverlayError> {
         self.frames = self.frames.saturating_add(1);
         if let Some(last) = self.last_tick_ms {
             let delta = now_ms - last;
@@ -153,7 +153,7 @@ impl Overlay {
             None => true,
         };
         if !due {
-            return Ok(());
+            return Ok(false);
         }
 
         let elapsed_ms = match self.last_refresh_ms {
@@ -217,7 +217,7 @@ impl Overlay {
             cpu_ns: host.cpu_ns,
             io: host.io,
         });
-        Ok(())
+        Ok(true)
     }
 
     /// Builds the overlay's render node.
@@ -243,7 +243,7 @@ impl EngineOverlay for Overlay {
         state: &mut RenderState,
         now_ms: u64,
         objects: ObjectCounts,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let host = HostMetrics {
             rss: platform::memory_usage(),
             cpu_ns: process_cpu_ns(),
